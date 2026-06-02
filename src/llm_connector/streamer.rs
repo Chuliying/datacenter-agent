@@ -72,6 +72,8 @@ pub fn token_stream_with_system(
             }
         };
 
+        debug!(messages = ?req.messages, "llm.generate.request_built");
+
         // Open the LLM stream. `create_stream` sets `stream: true` for us.
         let mut stream = match client.chat().create_stream(req).await {
             Ok(s) => s,
