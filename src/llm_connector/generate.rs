@@ -4,15 +4,13 @@ use anyhow::{anyhow, Context, Result};
 use async_openai::error::OpenAIError;
 use tracing::{debug, error, info};
 
-use super::{client::build_client, system_prompt::FIXED_SYSTEM_PROMPT};
+use super::client::build_client;
 use crate::model::GenerationConfig;
 
-/// Generate LLM response with default system prompt
-/// 
-/// Fire one chat completion and return the model's reply, with default
-/// system prompt [`FIXED_SYSTEM_PROMPT`] (the analytical prompt with
-/// markdown report response)
+/// Issue one chat completion and return the model's reply.
 ///
+/// The caller should also provide the system prompt.
+/// 
 /// # Errors
 ///
 /// Returns `Err` if:
@@ -21,24 +19,7 @@ use crate::model::GenerationConfig;
 /// - OpenRouter API returns a non-2xx response
 /// - response cannot be deserialized
 /// - response contains no `choice` with content.
-pub async fn generate(cfg: &GenerationConfig) -> Result<String> {
-    generate_with_system(cfg, FIXED_SYSTEM_PROMPT).await
-}
-
-/// Generate LLM response
-/// 
-/// Issue one chat completion and return the model's reply, the caller
-/// needs to provide a system prompt.
-///
-/// # Errors
-///
-/// Returns `Err` if:
-/// - request fails to build
-/// - HTTP call fails
-/// - OpenRouter API returns a non-2xx response
-/// - response cannot be deserialized
-/// - response contains no `choice` with content.
-pub async fn generate_with_system(cfg: &GenerationConfig, system: &str) -> Result<String> {
+pub async fn generate(cfg: &GenerationConfig, system: &str) -> Result<String> {
     info!(
         model = %cfg.model,
         history_len = cfg.history.len(),

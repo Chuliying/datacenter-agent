@@ -5,7 +5,6 @@ use tracing::{debug, error, info};
 use futures::{Stream, StreamExt};
 
 use super::client::build_client;
-use super::system_prompt::FIXED_SYSTEM_PROMPT;
 use crate::model::GenerationConfig;
 
 /// An OpenRouter SSE streaming frame result.
@@ -38,18 +37,22 @@ impl Drop for TerminationDetector {
     }
 }
 
-/// Stream tokens using [`FIXED_SYSTEM_PROMPT`] — the connector-owned
-/// analytical prompt. Mirrors [`super::generate`].
-pub fn token_stream(cfg: GenerationConfig) -> impl Stream<Item = LlmEvent> {
-    token_stream_with_system(cfg, FIXED_SYSTEM_PROMPT.to_string())
-}
-
-/// Stream tokens with a caller-supplied system prompt that fully replaces
-/// [`FIXED_SYSTEM_PROMPT`]. Mirrors [`super::generate_with_system`].
-pub fn token_stream_with_system(
-    cfg: GenerationConfig,
-    system: String,
-) -> impl Stream<Item = LlmEvent> {
+/// Stream the model's reply token-by-token, with a caller-supplied
+/// system prompt.
+///
+/// Like [`generate`](super::generate()) but yields the reply
+/// incrementally rather than awaiting it whole.
+/// 
+/// The returned stream emits [`LlmEvent::Token`] fragments, then
+/// a terminal [`LlmEvent::Done`] on clean completion.
+///
+/// Unlike `generate`, failures are reported in-band as
+/// [`LlmEvent::Error`] (client/request build failure, stream open
+/// failure, or a mid-stream frame error)
+/// The function never returns a `Result`.
+/// 
+/// Dropping the stream cancels the upstream OpenRouter request.
+pub fn token_stream(cfg: GenerationConfig, system: String) -> impl Stream<Item = LlmEvent> {
     async_stream::stream! {
 
         // Build the client.
