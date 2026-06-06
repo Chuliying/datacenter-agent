@@ -1,14 +1,12 @@
-//! OpenRouter LLM connector.
+//! OpenRouter LLM connector with MCP tool-calling.
 //!
-//! Two entry points:
-//! - [`generate`]: issue one chat completion and await the full
-//!   Markdown reply.
-//! - [`token_stream`]: return an `impl Stream<Item = LlmEvent>` that
-//!   yields tokens as they arrive (used by `/agent/stream`).
+//! The single entry point is the agentic loop in [`agent`]:
+//! - [`agent_stream`]: drive the tool-calling loop, streaming the final answer
+//!   token-by-token (used by `/agent/stream`).
+//! - [`generate`]: run the same loop and await the whole Markdown reply (used
+//!   by `/agent` and the greeting generator).
 
+mod agent;
 mod client;
-mod generate;
-mod streamer;
 
-pub use generate::generate;
-pub use streamer::{token_stream, LlmEvent};
+pub use agent::{agent_stream, generate, LlmEvent};
