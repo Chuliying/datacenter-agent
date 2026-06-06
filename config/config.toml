@@ -1,0 +1,38 @@
+# =====================================================================
+# eomc-agent top-level application config
+# ---------------------------------------------------------------------
+# This file is the single entry point read at startup.
+#
+# Every other config file referenced below is resolved RELATIVE TO THIS
+# FILE'S PARENT DIRECTORY, so the whole `config/` folder is a
+# self-contained, container-mountable unit.
+#
+# For example, you can mount `config/` then use `--config /.../config.toml`.
+#
+# Absolute paths are accepted too, which is handy for ad-hoc overrides.
+# =====================================================================
+
+version = 1
+
+
+# ──── Prompt guide section ───
+# Each entry binds a stable prompt id (used in code) to a Markdown file
+# that holds the actual prose. Markdown is loaded and sent to the model.
+#
+# Adding a new id here does not immediately wire it into any call path,
+# call sites look prompts up by id. Removing or renaming an id will break
+# the call site that depends on it.
+#
+# Currently implemented, good for reference:
+#   * agent_system    — analytics agent system prompt for /agent and /agent/stream.
+#   * greeting_system — greeting system prompt for /greeting.
+#   * greeting_user   — greeting user prompt for /greeting.
+
+[prompts.agent_system]
+file = "prompt_guide/agent_system.md"
+
+[prompts.greeting_system]
+file = "prompt_guide/greeting_system.md"
+
+[prompts.greeting_user]
+file = "prompt_guide/greeting_user.md"
