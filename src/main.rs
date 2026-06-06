@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     )?;
 
     // Spawn async background tasks to periodically run greeting sequences/checks.
-    greeting::spawn_greeting_tasks(state.clone(), 5);
+    greeting::spawn_greeting_tasks(state.clone(), 3);
 
     // Build the Axum routing tree populated with middleware and routes.
     let app = build_router(state);
