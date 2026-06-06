@@ -2,7 +2,7 @@
 //!
 //! Given a seeded conversation, drive a multi-turn exchange with the LLM. On
 //! each turn the model may (a) ask to call one or more tools, or (b) produce a
-//! final answer. When it asks for a tool we execute it against the `eomc-mcp`
+//! final answer. When it asks for a tool we execute it against the MCP
 //! server and feed the result back, then loop. This is the standard
 //! OpenAI-compatible tool-calling loop:
 //!

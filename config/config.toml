@@ -1,5 +1,5 @@
 # =====================================================================
-# eomc-agent top-level application config
+# datacenter-agent top-level application config
 # ---------------------------------------------------------------------
 # This file is the single entry point read at startup.
 #

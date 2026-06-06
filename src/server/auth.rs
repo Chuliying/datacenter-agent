@@ -12,7 +12,7 @@ use constant_time_eq::constant_time_eq;
 use tracing::debug;
 
 use super::error::ErrorBody;
-use super::state::AppState;
+use super::AppState;
 
 const TEAPOT_MESSAGE: &str = "I'm a teapot. We cannot brew \
 coffee for unauthenticated guests. Please present a valid bearer token in the \

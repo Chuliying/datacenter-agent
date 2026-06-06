@@ -1,0 +1,59 @@
+[package]
+name = "datacenter-agent"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+# rmcp as a CLIENT only — same crate version (0.17) as the eomc-mcp server so
+# the MCP handshake/protocol versions match exactly. HTTP-only transport.
+rmcp = { version = "0.17", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+anyhow = "1"
+chrono = "0.4"
+
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "fs",
+] }
+async-stream = "0.3"
+
+async-openai = { version = "0.40", default-features = false, features = [
+    "rustls",
+    "chat-completion",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "stream",
+] }
+dotenvy = "0.15"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = [
+    "cors",
+    "trace",
+    "compression-gzip",
+    "timeout",
+    "limit",
+    "set-header",
+] }
+http = "1"
+futures = "0.3"
+mimalloc = { version = "0.1", default-features = false }
+constant_time_eq = "0.3"
+rand = "0.8"
+
+[profile.release]
+lto = "fat"

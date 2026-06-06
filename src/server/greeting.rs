@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use tracing::{error, info, warn};
 
-use super::state::AppState;
+use super::AppState;
 use crate::llm_connector;
 
 /// Build one greeting by running the greeting prompt through the MCP loop.

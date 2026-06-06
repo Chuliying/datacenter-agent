@@ -46,7 +46,7 @@ impl McpClient {
             .await
             .with_context(|| format!("MCP initialize handshake with {url} failed"))?;
 
-        tracing::info!(%url, "connected to eomc-mcp over Streamable HTTP and completed handshake");
+        tracing::info!(%url, "connected to datacenter MCP server over HTTP and completed handshake");
         Ok(Self { service })
     }
 

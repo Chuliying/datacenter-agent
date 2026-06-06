@@ -17,7 +17,7 @@ use super::dto::{
     AgentRequest, AgentResponse, GreetingResponse, ReadyBody, ReadyChecks, StreamFrame,
 };
 use super::error::AppError;
-use super::state::AppState;
+use super::AppState;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
 

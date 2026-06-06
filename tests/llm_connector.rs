@@ -2,7 +2,7 @@
 //!
 //! Gated `#[ignore]` AND short-circuits when `OPENROUTER_API_KEY` or
 //! `DATACENTER_MCP_URL` is unset, so `cargo test` in CI without credentials / a
-//! running MCP server stays green. Run locally (with `eomc-mcp --serve` up)
+//! running MCP server stays green. Run locally (with MCP server booted up)
 //! with:
 //!
 //! ```sh
@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use eomc_agent::llm_connector;
-use eomc_agent::mcp_client::McpClient;
-use eomc_agent::model::GenerationConfig;
+use datacenter_agent::llm_connector;
+use datacenter_agent::mcp_client::McpClient;
+use datacenter_agent::model::GenerationConfig;
 
 #[tokio::test]
 #[ignore]
@@ -30,7 +30,7 @@ async fn live_generates_markdown_via_mcp() {
     let mcp_url = match std::env::var("DATACENTER_MCP_URL") {
         Ok(u) if !u.is_empty() => u,
         _ => {
-            eprintln!("skipping: DATACENTER_MCP_URL not set (start `eomc-mcp --serve`)");
+            eprintln!("skipping: DATACENTER_MCP_URL not set");
             return;
         }
     };
@@ -38,7 +38,7 @@ async fn live_generates_markdown_via_mcp() {
     // Connect to the live MCP server and discover its tools.
     let client = McpClient::connect_http(&mcp_url)
         .await
-        .expect("connect to eomc-mcp");
+        .expect("connect to datacenter MCP server");
     let mcp = client.handle();
     let tools = Arc::new(mcp.list_openrouter_tools().await.expect("list MCP tools"));
     assert!(!tools.is_empty(), "MCP server exposed no tools");

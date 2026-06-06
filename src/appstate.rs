@@ -209,7 +209,7 @@ pub fn load_global_token() -> Result<String> {
 /// Read `DATACENTER_MCP_URL`.
 pub fn load_mcp_url() -> Result<String> {
     let url = std::env::var("DATACENTER_MCP_URL").context(
-        "env_error: DATACENTER_MCP_URL missing — start `eomc-mcp --serve` and point DATACENTER_MCP_URL at its /mcp endpoint",
+        "env_error: DATACENTER_MCP_URL missing — start datacenter MCP server and point DATACENTER_MCP_URL at its /mcp endpoint",
     )?;
     if url.trim().is_empty() {
         anyhow::bail!("env_error: DATACENTER_MCP_URL is empty");

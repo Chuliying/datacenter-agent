@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 
 use super::auth::require_bearer;
 use super::handler;
-use super::state::AppState;
+use super::AppState;
 
 /// 64 KiB. Defense-in-depth above the per-field 2 000-char prompt cap.
 const REQUEST_BODY_LIMIT: usize = 64 * 1024;

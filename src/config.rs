@@ -11,7 +11,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use eomc_agent::config::AppConfig;
+//! use datacenter_agent::config::AppConfig;
 //!
 //! let app = AppConfig::load("config/config.toml")?;
 //! let agent_prompt = app.get_prompt_by_id("agent_system")?;
