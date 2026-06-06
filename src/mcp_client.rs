@@ -60,7 +60,13 @@ impl McpClient {
             .await
             .with_context(|| format!("MCP initialize handshake with {url} failed"))?;
 
-        tracing::info!(%url, "connected to datacenter MCP server over HTTP and completed handshake");
+        // Only logs a subset of fiends, avoid display full instruction.
+        let (server, version) = service
+            .peer()
+            .peer_info()
+            .map(|info| (info.server_info.name.clone(), info.server_info.version.clone()))
+            .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
+        tracing::info!(%url, %server, %version, "registered as MCP client");
         Ok(Self { service })
     }
 

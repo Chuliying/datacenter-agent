@@ -201,7 +201,7 @@ fn init_tracing(debug_flag: bool) {
             "datacenter_agent=debug,tower_http=debug,axum=debug,info,hyper=warn,h2=warn,rustls=warn",
         )
     } else {
-        EnvFilter::new("info,hyper=warn,h2=warn,rustls=warn")
+        EnvFilter::new("info,hyper=warn,h2=warn,rustls=warn,rmcp::service=warn")
     };
 
     // Initialize the global tracing registry with formatting and filters.
