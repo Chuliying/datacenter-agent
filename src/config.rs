@@ -1,8 +1,8 @@
 //! Top-level application config.
 //!
 //! Loads a single TOML manifest (`config/config.toml` by default) that
-//! points at the sub-config files (including intent-routing TOML and a set
-//! of prompt Markdown files)
+//! points at the prompt Markdown files used by the agent and greeting
+//! generators.
 //!
 //! Every relative path inside the manifest is resolved against the
 //! **parent directory of the manifest file itself**, not the process CWD.
@@ -14,8 +14,7 @@
 //! use eomc_agent::config::AppConfig;
 //!
 //! let app = AppConfig::load("config/config.toml")?;
-//! let agent_prompt = app.prompt("agent_system")?;
-//! let routing_toml = &app.routing_path;
+//! let agent_prompt = app.get_prompt_by_id("agent_system")?;
 //! ```
 
 use std::collections::BTreeMap;
@@ -78,19 +77,9 @@ fn resolve_relative(root: &Path, p: &Path) -> PathBuf {
 struct Manifest {
     /// Schema version. Currently `1`.
     version: u32,
-    /// Pointer to the intent-routing TOML.
-    routing: RoutingRef,
     /// Prompt id to Markdown file path map.
     #[serde(default)]
     prompts: BTreeMap<String, PromptRef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RoutingRef {
-    /// Path to the intent-routing TOML (relative to the manifest's
-    /// parent directory, or absolute).
-    config: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,9 +101,6 @@ pub struct AppConfig {
     /// Directory the manifest was loaded from.
     /// Useful for diagnostics and for resolving any further relative paths added later.
     pub root: PathBuf,
-    /// Absolute path to the intent-routing TOML.
-    /// Pass to [`crate::data_fetch::Router::from_config_path`].
-    pub routing_path: PathBuf,
     /// Loaded prompt bodies KV map.
     pub prompts: BTreeMap<String, String>,
 }
@@ -157,13 +143,6 @@ impl AppConfig {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // Resolve the routing path
-        let routing_path = resolve_relative(&root, &manifest.routing.config);
-        debug!(
-            routing = %routing_path.display(),
-            "app config: routing path resolved"
-        );
-
         // Load prompts
         let prompts = manifest
             .prompts
@@ -178,11 +157,7 @@ impl AppConfig {
             "app config loaded"
         );
 
-        Ok(Self {
-            root,
-            routing_path,
-            prompts,
-        })
+        Ok(Self { root, prompts })
     }
 
     /// Look up a loaded prompt body by id.

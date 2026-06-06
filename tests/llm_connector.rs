@@ -1,7 +1,7 @@
 //! Live end-to-end integration test for the MCP tool-calling loop.
 //!
 //! Gated `#[ignore]` AND short-circuits when `OPENROUTER_API_KEY` or
-//! `MCP_HTTP_URL` is unset, so `cargo test` in CI without credentials / a
+//! `DATACENTER_MCP_URL` is unset, so `cargo test` in CI without credentials / a
 //! running MCP server stays green. Run locally (with `eomc-mcp --serve` up)
 //! with:
 //!
@@ -27,10 +27,10 @@ async fn live_generates_markdown_via_mcp() {
             return;
         }
     };
-    let mcp_url = match std::env::var("MCP_HTTP_URL") {
+    let mcp_url = match std::env::var("DATACENTER_MCP_URL") {
         Ok(u) if !u.is_empty() => u,
         _ => {
-            eprintln!("skipping: MCP_HTTP_URL not set (start `eomc-mcp --serve`)");
+            eprintln!("skipping: DATACENTER_MCP_URL not set (start `eomc-mcp --serve`)");
             return;
         }
     };
