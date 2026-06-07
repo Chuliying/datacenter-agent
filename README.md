@@ -1,5 +1,9 @@
 # Datacenter agent
 
+<p align="center">
+<img src="do-you-have-agent.jpeg" width="500" />
+</p>
+
 An analytics agent that answers questions about a datacenter by orchestrating an
 LLM against live data with the power of MCP server.
 
