@@ -36,11 +36,6 @@ use datacenter_agent::config::AppConfig;
 use datacenter_agent::mcp_client::McpClient;
 use datacenter_agent::server::{build_router, greeting};
 
-// Avoid musl's default allocator due to lack of multi-threaded optimization
-#[cfg(target_env = "musl")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -206,7 +201,7 @@ fn init_tracing(debug_flag: bool) {
             "datacenter_agent=debug,tower_http=debug,axum=debug,info,hyper=warn,h2=warn,rustls=warn",
         )
     } else {
-        EnvFilter::new("info,hyper=warn,h2=warn,rustls=warn,rmcp::service=warn")
+        EnvFilter::new("info,hyper=warn,h2=warn,rustls=warn")
     };
 
     // Initialize the global tracing registry with formatting and filters.
