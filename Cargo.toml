@@ -56,8 +56,8 @@ mimalloc = { version = "0.1", default-features = false }
 constant_time_eq = "0.3"
 rand = "0.8"
 
-[target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = { version = "0.1", default-features = false }
+# [target.'cfg(target_env = "musl")'.dependencies]
+# mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 lto = "fat"
