@@ -1,0 +1,21 @@
+skill: qa
+stage: qa
+created_at: 2026-06-25T00:00:00+08:00
+status: draft
+primary_output: qa-plan.md
+inputs:
+  - docs/agent-runtime-rust-port/prd.md
+  - docs/agent-runtime-rust-port/spec/spec-overview.md
+  - docs/agent-runtime-rust-port/spec/spec-01-config-registry.md
+  - docs/agent-runtime-rust-port/spec/spec-02-input.md
+  - docs/agent-runtime-rust-port/spec/spec-03-guardrails.md
+  - docs/agent-runtime-rust-port/spec/spec-04-audit-memory.md
+  - docs/agent-runtime-rust-port/spec/spec-05-orchestrator.md
+  - docs/agent-runtime-rust-port/spec/spec-06-eval.md
+  - docs/agent-runtime-rust-port/file-structure.md
+  - Cargo.toml
+  - tests/llm_connector.rs
+research:
+  - https://doc.rust-lang.org/cargo/commands/cargo-test.html
+  - https://tokio.rs/tokio/topics/testing
+  - https://docs.rs/axum/latest/axum/
