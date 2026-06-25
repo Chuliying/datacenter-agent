@@ -27,6 +27,11 @@ use tokio::sync::Mutex;
 use crate::config::AppConfig;
 use crate::mcp_client::McpHandle;
 use crate::model::{GenerationConfig, History};
+use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
+use crate::runtime::config::RuntimeConfig;
+use crate::runtime::guardrails::answer_policy::AnswerPolicy;
+use crate::runtime::input::pipeline::InputPipeline;
+use crate::runtime::registry::BuiltinRegistry;
 
 /// Helper to parse optional env vars with a fallback.
 fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -139,10 +144,29 @@ pub struct AppState {
     ///
     /// `GET /greeting` picks one at random.
     pub greetings: Arc<Mutex<Vec<String>>>,
+    /// Optional runtime wiring, enabled only when `RUNTIME_ENABLED=true`.
+    pub runtime: Option<Arc<AppRuntime>>,
+}
+
+/// Runtime dependencies assembled at boot.
+pub struct AppRuntime {
+    /// Whether runtime route wiring is enabled.
+    pub enabled: bool,
+    /// Runtime configuration.
+    pub config: Arc<RuntimeConfig>,
+    /// Deterministic input pipeline.
+    pub input_pipeline: InputPipeline,
+    /// Answer policy.
+    pub answer_policy: Arc<dyn AnswerPolicy>,
+    /// Audit sink.
+    pub audit_sink: Arc<dyn AuditSink>,
+    /// Audit failure policy.
+    pub audit_failure_policy: AuditFailurePolicy,
 }
 
 impl AppState {
     pub fn new(
+        app_config: &AppConfig,
         mcp: McpHandle,
         tools: Arc<Vec<ChatCompletionTool>>,
         instructions: Arc<Option<String>>,
@@ -154,6 +178,7 @@ impl AppState {
             .timeout(Duration::from_secs(2))
             .build()
             .context("build /ready probe http client")?;
+        let runtime = build_runtime(app_config)?;
         Ok(Self {
             mcp,
             tools,
@@ -163,6 +188,7 @@ impl AppState {
             http,
             auth_token: Arc::new(auth_token),
             greetings: Arc::new(Mutex::new(Vec::new())),
+            runtime,
         })
     }
 
@@ -206,6 +232,31 @@ impl AppState {
             max_tokens: self.llm.max_tokens,
         }
     }
+}
+
+fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
+    let Some(refs) = app_config.runtime.as_ref() else {
+        return Ok(None);
+    };
+    let registry = BuiltinRegistry::default();
+    let config = RuntimeConfig::load(refs, &registry).context("load runtime config")?;
+    let answer_policy = registry
+        .build_answer_policy(&config)
+        .context("build runtime answer policy")?;
+    let audit_sink = registry
+        .build_audit(&config)
+        .context("build runtime audit sink")?;
+    let enabled = std::env::var("RUNTIME_ENABLED")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+    Ok(Some(Arc::new(AppRuntime {
+        enabled,
+        audit_failure_policy: config.assembly.audit_failure_policy,
+        config: Arc::new(config),
+        input_pipeline: InputPipeline::default(),
+        answer_policy,
+        audit_sink,
+    })))
 }
 
 /// Read `GLOBAL_TOKEN` from the environment.

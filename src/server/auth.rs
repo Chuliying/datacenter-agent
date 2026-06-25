@@ -41,7 +41,7 @@ pub async fn require_bearer(State(state): State<AppState>, req: Request, next: N
     // Check if the request has a valid bearer token
     if check(&state, &req) {
         // If so, continue
-        return next.run(req).await;
+        next.run(req).await
     } else {
         // If not, reject
         debug!(

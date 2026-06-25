@@ -29,6 +29,10 @@ pub struct AgentRequest {
     #[serde(default)]
     pub history: Vec<History>,
     pub prompt: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub option_id: Option<String>,
 }
 
 /// A success response for `POST /agent`.
@@ -47,7 +51,7 @@ pub struct AgentResponse {
 /// - `error`: The `data` field carries the error message.
 /// - `done`: Carries no payload, used to indicate the end of the stream.
 /// - `clear`: Carries no payload, used to suggest down stream reset current accumulated tokens.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum StreamFrame {
     /// Token event, used to stream tokens

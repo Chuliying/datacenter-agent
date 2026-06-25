@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
 
     // Construct the global shared application state with all dependencies.
     let state = AppState::new(
+        &app_config,
         mcp,
         Arc::new(tools),
         Arc::new(instructions),

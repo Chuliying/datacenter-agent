@@ -48,6 +48,7 @@ use async_openai::types::chat::{
     FunctionCall, ToolChoiceOptions,
 };
 use futures::{Stream, StreamExt};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use super::client::build_client;
@@ -66,6 +67,24 @@ pub enum LlmEvent {
     /// It indicated the previous tokens might be some intermediate thinking process,
     /// not the final answer. So the frontend can clear the answer buffer.
     Clear,
+    /// Internal-only tool call metadata. HTTP/SSE callers must not expose this
+    /// as an external stream frame.
+    ToolCalled {
+        /// Tool name.
+        name: String,
+        /// SHA-256 hash of the arguments string.
+        args_hash: String,
+    },
+    /// Internal-only tool result metadata. HTTP/SSE callers must not expose this
+    /// as an external stream frame.
+    ToolResult {
+        /// Tool name.
+        name: String,
+        /// Result byte length.
+        bytes: usize,
+        /// Whether MCP returned success.
+        ok: bool,
+    },
     /// The model produced its final answer and finished cleanly.
     Done,
     /// Terminated with an error (reported in-band, never as a `Result`).
@@ -120,6 +139,10 @@ fn parse_tool_arguments(args_str: &str) -> serde_json::Map<String, serde_json::V
         warn!(error = %e, "could not parse tool arguments; using empty object");
         serde_json::Map::new()
     })
+}
+
+fn hash_tool_arguments(args_str: &str) -> String {
+    format!("{:x}", Sha256::digest(args_str.as_bytes()))
 }
 
 /// Build one chat-completion request assistant message from streamed turn content and tool calls.
@@ -391,17 +414,26 @@ pub fn agent_stream(
 
             for tc in &pending_exec {
                 info!(turn, tool = %tc.name, args = %tc.arguments, "LLM requested tool call");
+                yield LlmEvent::ToolCalled {
+                    name: tc.name.clone(),
+                    args_hash: hash_tool_arguments(&tc.arguments),
+                };
 
                 // Tool arguments arrive as a JSON *string*, parse to an object.
                 let args = parse_tool_arguments(&tc.arguments);
 
                 // Surface failures back to the model (full error chain) rather than aborting, so
                 // it can self-correct its arguments next turn.
-                let output = match mcp.call_tool_text(&tc.name, args).await {
-                    Ok(text) => text,
-                    Err(e) => format!("ERROR: tool call failed: {e:#}"),
+                let (output, ok) = match mcp.call_tool_text(&tc.name, args).await {
+                    Ok(text) => (text, true),
+                    Err(e) => (format!("ERROR: tool call failed: {e:#}"), false),
                 };
                 info!(turn, tool = %tc.name, bytes = output.len(), "← MCP tool result");
+                yield LlmEvent::ToolResult {
+                    name: tc.name.clone(),
+                    bytes: output.len(),
+                    ok,
+                };
 
                 match build_tool_message(output, tc.id.clone()) {
                     Ok(m) => messages.push(m),
@@ -453,6 +485,7 @@ pub async fn generate(
             // Return the final answer
             LlmEvent::Done => return Ok(out),
             LlmEvent::Error(e) => return Err(anyhow!(e)),
+            LlmEvent::ToolCalled { .. } | LlmEvent::ToolResult { .. } => {}
         }
     }
     Ok(out)
@@ -508,6 +541,18 @@ mod tests {
         let invalid = "not a json";
         let parsed = parse_tool_arguments(invalid);
         assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn test_tool_argument_hash_is_stable() {
+        assert_eq!(
+            hash_tool_arguments("{\"param\":123}"),
+            hash_tool_arguments("{\"param\":123}")
+        );
+        assert_ne!(
+            hash_tool_arguments("{\"param\":123}"),
+            hash_tool_arguments("{\"param\":456}")
+        );
     }
 
     #[test]

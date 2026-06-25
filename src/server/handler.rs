@@ -20,10 +20,11 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::{Stream, StreamExt};
+use futures::{stream::BoxStream, StreamExt};
 use tracing::{error, instrument, warn, Instrument};
+use uuid::Uuid;
 
 use rand::seq::SliceRandom;
 
@@ -34,6 +35,9 @@ use super::error::AppError;
 use super::AppState;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
+use crate::runtime::audit::{AuditCtx, AuditWriter};
+use crate::runtime::orchestrator::{run_agent_turn, AgentTurnDeps, AgentTurnOutcome, LlmAgentPort};
+use crate::runtime::schema::AgentTurnInput;
 
 /// Upper bound on the user prompt, in UTF-8 characters.
 pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
@@ -120,6 +124,14 @@ pub async fn agent(
 }
 
 async fn agent_inner(state: AppState, req: AgentRequest) -> Result<Json<AgentResponse>, AppError> {
+    if state
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.enabled)
+    {
+        return agent_inner_runtime(state, req).await;
+    }
+
     let user_prompt = req.prompt.clone();
     let cfg = prepare_config(&state, req)?;
 
@@ -138,6 +150,62 @@ async fn agent_inner(state: AppState, req: AgentRequest) -> Result<Json<AgentRes
     }))
 }
 
+async fn agent_inner_runtime(
+    state: AppState,
+    req: AgentRequest,
+) -> Result<Json<AgentResponse>, AppError> {
+    let runtime = state
+        .runtime
+        .clone()
+        .ok_or_else(|| AppError::ServiceUnavailable("runtime not configured".into()))?;
+    let user_prompt = req.prompt.clone();
+    let cfg = state.generation_config(
+        &state.prompts.agent_system,
+        req.prompt.clone(),
+        req.history.clone(),
+    );
+    let agent = LlmAgentPort::new(cfg, state.tools.clone(), state.mcp.clone());
+    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
+    let request_id = Uuid::new_v4();
+    let audit_ctx = AuditCtx {
+        request_id: request_id.to_string(),
+        session_id: req.session_id.clone(),
+        route: "/agent".into(),
+        actor: None,
+    };
+    let turn_input = AgentTurnInput {
+        request_id,
+        prompt: req.prompt,
+        history: req.history,
+        session_id: req.session_id,
+        option_id: req.option_id,
+    };
+
+    let outcome = run_agent_turn(
+        turn_input,
+        &audit_ctx,
+        AgentTurnDeps {
+            runtime_config: &runtime.config,
+            input_pipeline: &runtime.input_pipeline,
+            answer_policy: runtime.answer_policy.as_ref(),
+            agent: &agent,
+            audit: &audit,
+        },
+    )
+    .await
+    .map_err(runtime_error_to_app_error)?;
+
+    match outcome {
+        AgentTurnOutcome::Final { response, .. }
+        | AgentTurnOutcome::Aborted { response }
+        | AgentTurnOutcome::Refused { copy: response, .. } => Ok(Json(AgentResponse {
+            user_prompt,
+            model_response: response,
+        })),
+        AgentTurnOutcome::Error { code, status } => Err(runtime_outcome_error(code, status)),
+    }
+}
+
 // ──── /agent/stream ───
 
 /// Server-Sent Events variant of [`agent`].
@@ -150,7 +218,7 @@ async fn agent_inner(state: AppState, req: AgentRequest) -> Result<Json<AgentRes
 pub async fn agent_stream(
     State(state): State<AppState>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+) -> Result<Response, AppError> {
     let Json(req) = req?;
 
     // Prepare logging
@@ -161,25 +229,53 @@ pub async fn agent_stream(
     );
     let _enter = span.enter();
 
+    if state
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.enabled)
+    {
+        return agent_stream_runtime(state, req).await;
+    }
+
     // Prepare configuration
     let cfg = prepare_config(&state, req)?;
 
     // Build SSE stream
-    let sse_stream =
-        llm_connector::agent_stream(cfg, state.tools.clone(), state.mcp.clone()).map(|ev| {
-            let frame = match ev {
-                llm_connector::LlmEvent::Token(t) => StreamFrame::Token { data: t },
-                llm_connector::LlmEvent::Done => StreamFrame::Done,
-                llm_connector::LlmEvent::Error(e) => StreamFrame::Error { data: e },
-                llm_connector::LlmEvent::Clear => StreamFrame::Clear,
-            };
+    let sse_stream: BoxStream<'static, Result<Event, Infallible>> =
+        llm_connector::agent_stream(cfg, state.tools.clone(), state.mcp.clone())
+            .filter_map(|ev| async move {
+                let frame = stream_frame_from_llm_event(ev)?;
+                let event = Event::default()
+                    .json_data(&frame)
+                    .expect("unexpected error: StreamFrame is always valid JSON");
+                Some(Ok::<_, Infallible>(event))
+            })
+            .boxed();
+
+    Ok(Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response())
+}
+
+async fn agent_stream_runtime(state: AppState, req: AgentRequest) -> Result<Response, AppError> {
+    let response = agent_inner_runtime(state, req).await?.0;
+    let frames = vec![
+        StreamFrame::Token {
+            data: response.model_response,
+        },
+        StreamFrame::Done,
+    ];
+    let sse_stream: BoxStream<'static, Result<Event, Infallible>> = futures::stream::iter(frames)
+        .map(|frame| {
             let event = Event::default()
                 .json_data(&frame)
                 .expect("unexpected error: StreamFrame is always valid JSON");
             Ok::<_, Infallible>(event)
-        });
-
-    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE)))
+        })
+        .boxed();
+    Ok(Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response())
 }
 
 // ──── shared prelude ───
@@ -191,18 +287,123 @@ pub async fn agent_stream(
 ///
 /// Shared by both `/agent` and `/agent/stream`.
 fn prepare_config(state: &AppState, req: AgentRequest) -> Result<GenerationConfig, AppError> {
-    // validate
-    let trimmed = req.prompt.trim();
+    validate_prompt(&req.prompt)?;
+
+    // build config
+    Ok(state.generation_config(&state.prompts.agent_system, req.prompt, req.history))
+}
+
+/// Validate the current `/agent` prompt contract.
+fn validate_prompt(prompt: &str) -> Result<(), AppError> {
+    let trimmed = prompt.trim();
     if trimmed.is_empty() {
         return Err(AppError::BadRequest("prompt must not be empty".into()));
     }
-    let char_count = req.prompt.chars().count();
+    let char_count = prompt.chars().count();
     if char_count > USER_PROMPT_LENGTH_CAP {
         return Err(AppError::BadRequest(format!(
             "prompt exceeds {USER_PROMPT_LENGTH_CAP} chars (got {char_count})"
         )));
     }
 
-    // build config
-    Ok(state.generation_config(&state.prompts.agent_system, req.prompt, req.history))
+    Ok(())
+}
+
+/// Map internal LLM stream events to the stable external SSE frame contract.
+fn stream_frame_from_llm_event(ev: llm_connector::LlmEvent) -> Option<StreamFrame> {
+    match ev {
+        llm_connector::LlmEvent::Token(t) => Some(StreamFrame::Token { data: t }),
+        llm_connector::LlmEvent::Done => Some(StreamFrame::Done),
+        llm_connector::LlmEvent::Error(e) => Some(StreamFrame::Error { data: e }),
+        llm_connector::LlmEvent::Clear => Some(StreamFrame::Clear),
+        llm_connector::LlmEvent::ToolCalled { .. } | llm_connector::LlmEvent::ToolResult { .. } => {
+            None
+        }
+    }
+}
+
+fn runtime_error_to_app_error(err: crate::runtime::error::RuntimeError) -> AppError {
+    match err {
+        crate::runtime::error::RuntimeError::InputRequired
+        | crate::runtime::error::RuntimeError::InputTooLong(_) => {
+            AppError::BadRequest(err.to_string())
+        }
+        crate::runtime::error::RuntimeError::Upstream(_) => AppError::BadGateway(err.to_string()),
+        crate::runtime::error::RuntimeError::AuditSink(_)
+        | crate::runtime::error::RuntimeError::Config(_)
+        | crate::runtime::error::RuntimeError::UnknownModule { .. }
+        | crate::runtime::error::RuntimeError::IntentNotAllowed(_)
+        | crate::runtime::error::RuntimeError::PipelineContract
+        | crate::runtime::error::RuntimeError::Internal(_)
+        | crate::runtime::error::RuntimeError::Request(_) => {
+            AppError::ServiceUnavailable(err.to_string())
+        }
+    }
+}
+
+fn runtime_outcome_error(code: String, status: u16) -> AppError {
+    match status {
+        400 => AppError::BadRequest(code),
+        502 => AppError::BadGateway(code),
+        _ => AppError::ServiceUnavailable(code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_validation_rejects_empty_prompt() {
+        let err = validate_prompt(" \n\t").expect_err("empty prompt should be rejected");
+        match err {
+            AppError::BadRequest(msg) => assert_eq!(msg, "prompt must not be empty"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_validation_preserves_existing_2000_char_cap() {
+        let at_cap = "x".repeat(USER_PROMPT_LENGTH_CAP);
+        assert!(validate_prompt(&at_cap).is_ok());
+
+        let over_cap = "x".repeat(USER_PROMPT_LENGTH_CAP + 1);
+        let err = validate_prompt(&over_cap).expect_err("prompt over cap should be rejected");
+        match err {
+            AppError::BadRequest(msg) => {
+                assert!(msg.contains("prompt exceeds 2000 chars"));
+                assert!(msg.contains("got 2001"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_mapping_preserves_external_sse_events() {
+        assert_eq!(
+            stream_frame_from_llm_event(llm_connector::LlmEvent::Token("hi".into())),
+            Some(StreamFrame::Token { data: "hi".into() })
+        );
+        assert_eq!(
+            stream_frame_from_llm_event(llm_connector::LlmEvent::Error("boom".into())),
+            Some(StreamFrame::Error {
+                data: "boom".into()
+            })
+        );
+        assert_eq!(
+            stream_frame_from_llm_event(llm_connector::LlmEvent::Clear),
+            Some(StreamFrame::Clear)
+        );
+        assert_eq!(
+            stream_frame_from_llm_event(llm_connector::LlmEvent::Done),
+            Some(StreamFrame::Done)
+        );
+        assert_eq!(
+            stream_frame_from_llm_event(llm_connector::LlmEvent::ToolCalled {
+                name: "tool".into(),
+                args_hash: "hash".into()
+            }),
+            None
+        );
+    }
 }

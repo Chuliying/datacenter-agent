@@ -64,7 +64,12 @@ impl McpClient {
         let (server, version) = service
             .peer()
             .peer_info()
-            .map(|info| (info.server_info.name.clone(), info.server_info.version.clone()))
+            .map(|info| {
+                (
+                    info.server_info.name.clone(),
+                    info.server_info.version.clone(),
+                )
+            })
             .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
         tracing::info!(%url, %server, %version, "registered as MCP client");
         Ok(Self { service })

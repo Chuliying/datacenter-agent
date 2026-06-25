@@ -1,0 +1,29 @@
+# EV Chief-of-Staff runtime intent pack.
+
+intent_allowlist = [
+  "unknown",
+  "revenue",
+  "charging",
+  "site-build",
+]
+
+[option_prefixes]
+revenue = "revenue"
+charging = "charging"
+site = "site-build"
+
+[[intents]]
+id = "unknown"
+keywords = ["未知", "其他"]
+
+[[intents]]
+id = "revenue"
+keywords = ["營收", "收入", "賺多少", "revenue"]
+
+[[intents]]
+id = "charging"
+keywords = ["充電", "度數", "電量", "charging"]
+
+[[intents]]
+id = "site-build"
+keywords = ["建置", "站點", "場站", "site"]
