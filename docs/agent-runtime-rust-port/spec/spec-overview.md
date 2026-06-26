@@ -1,6 +1,6 @@
 # Agent Runtime Rust 移植 — 技術規格（總覽 / 索引）
 
-**Story ID**: S-RUNTIME-01 ・ **Spec 版本**: v1.2.0 ・ **對應 PRD**: `docs/agent-runtime-rust-port/prd.md` @ v1.2.0
+**Story ID**: S-RUNTIME-01 ・ **Spec 版本**: v1.3.0 ・ **對應 PRD**: `docs/agent-runtime-rust-port/prd.md` @ v1.3.0
 
 > 本規格已依分期拆檔，避免單檔過大。本檔為**薄索引 + 全域內容**；各層細節（型別/契約/步驟/測試）見對應分檔。
 
@@ -15,8 +15,6 @@
 | `spec-05-orchestrator.md` | P5 | orchestrator / AgentPort / DTO / 串流契約 / 一輪 turn 資料流 / 接線 |
 | `spec-06-eval.md` | P6 | 模型/skill eval：`Evaluator` trait / fixtures / baseline / `bin/eval` |
 | `../file-structure.md` | 全期 | 嚴謹檔案結構、模組責任邊界、測試落點 |
-| `../migration-plan.md` | 全期 | 完整移植計畫、原 repo 處理、雙跑/切流/退場 |
-| `../implementation-plan.md` | 全期 | 實作 PR 順序、任務依賴、驗收命令、rollback |
 
 ---
 
@@ -27,6 +25,7 @@
 | v1.0.0 | 2026-06-25 | 初版：portable-core（L5/L6/L12/L14）TS→Rust 移植 + config 驅動 | 全 runtime | PRD v1.0.0 | AI |
 | v1.1.0 | 2026-06-25 | 依嚴格 review：registry 拔插 / AuditSink trait + 完整事件 / `RuntimeError` / 完整 classifier / orchestrator↔AgentPort 契約 / 移植缺陷修正 / Rust 獨有測試 | 全 runtime | PRD v1.1.0 | AI |
 | v1.2.0 | 2026-06-25 | 新增 eval 子系統；並依分期拆檔（overview + 6 檔）| runtime + 新 bin + 文件結構 | PRD v1.2.0 | AI |
+| v1.3.0 | 2026-06-26 | thin-proxy 移植觸發的契約同步：`intent.resolved` 升為 `/agent/stream` 正式 wire event（runtime；附加、向後相容；拒絕路徑不送）；`AgentRequest` 加 `session_id`/`option_id`、`AgentResponse` 加 `intent` | dto / handler / orchestrator + falcon thin-proxy | PRD v1.3.0 | AI |
 
 ---
 
@@ -133,7 +132,7 @@
 | `answer-policy.ts` | `runtime/guardrails/answer_policy.rs` | |
 | `session-memory.ts`/`memory-context.ts` | `runtime/memory/*` | |
 | `audit-log.ts` | `runtime/audit.rs` | secret 名重指 Rust 端 + 新增事件/seq |
-| `run-agent-turn.ts` | `runtime/orchestrator.rs` | history:[]、Clear 映射 |
+| `run-agent-turn.ts` | `runtime/orchestrator.rs` | history:[]、Clear 映射、intent.resolved 首幀升為 `/agent/stream` wire event（runtime）|
 | `evals/chief-of-staff-inputs.json`（I12）| `config/runtime/evals/*` + `runtime/eval/*` | |
 
 ### 文件

@@ -22,9 +22,9 @@
 - `tests_root`: `tests`
 - `test_glob`: `tests/**/*.rs`
 - `mockup_root`: N/A（後端服務）
-- `prd_root`: `.agent/artifacts/docs`
-- `spec_root`: `.agent/artifacts/docs`
-- `qa_root`: `.agent/artifacts/qa`
+- `prd_root`: `docs/agent-runtime-rust-port`
+- `spec_root`: `docs/agent-runtime-rust-port/spec`
+- `qa_root`: `docs/agent-runtime-rust-port/qa`
 
 ## Stack
 - `test_cmd`: `cargo test`

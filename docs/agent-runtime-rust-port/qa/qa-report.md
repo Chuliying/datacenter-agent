@@ -14,7 +14,7 @@ Local static, unit, integration, pipeline eval, replay-smoke, and `falcon-client
 |------|---------|--------|----------|
 | L1 format | `cargo fmt -- --check` | PASS | exit 0 |
 | L1 lint | `cargo clippy --all-targets --all-features -- -D warnings` | PASS | exit 0 |
-| L2/L4 tests | `cargo test` | PASS | 57 lib tests, 4 eval-bin tests, 2 runtime-contract tests; ignored live test remains opt-in |
+| L2/L4 tests | `cargo test` | PASS | 61 lib tests, 4 eval-bin tests, 3 runtime-contract tests; ignored live test remains opt-in |
 | Eval pipeline | `cargo run --bin eval -- --pipeline-only` | PASS | `passed=3, failed=0` |
 | Eval replay smoke | `cargo run --bin eval -- --response --replay config/runtime/evals/replay-smoke.json` | PASS | `passed=2, failed=0`, provenance printed |
 | Falcon endpoint forwarding | `npm test -- --run src/lib/chief-of-staff/agent-client.test.ts src/lib/chief-of-staff/agent-runtime/run-agent-turn.test.ts` | PASS | 2 files / 4 tests pass in `/Users/liying.chu/falcon-client` |
@@ -33,11 +33,15 @@ Local static, unit, integration, pipeline eval, replay-smoke, and `falcon-client
 | Observability | PASS locally | `/agent` and `/agent/stream` spans include prompt length, history length, `session_id`, and `option_id`. |
 | LLM normalizer gate | PASS locally | Tests prove high-confidence deterministic input skips the LLM normalizer and low-confidence input can be recovered before answer policy. |
 | Pipeline eval | PASS | Offline EV pack seed fixtures pass. |
+| CI offline eval | PASS local config | `.github/workflows/runtime.yml` runs mandatory offline pipeline eval and response replay smoke after fmt, clippy, and tests. |
 | Response replay | PASS smoke | `replay-smoke.json` validates response-eval mechanics; it is not a TS parity baseline. |
+| Response baseline approval guide | PASS local / baseline pending | `docs/agent-runtime-rust-port/response-baseline-guide.md` records accepted sources, JSON shape, minimum coverage, approval steps, and rejection conditions; loader tests enforce loaded-case shape constraints. |
 | Response live harness | IMPLEMENTED / not executed live | `--response --live` connects the MCP/LLM loop when required env and baseline exist; missing env returns an actionable config error. |
 | Response baseline approval | PENDING | `response-baseline.json` remains pending until recorded TS responses or approved live samples exist. |
 | Live/provider smoke | WAIVED for local PR | Requires provider credentials and live MCP; still opt-in before release. |
 | `falcon-client` endpoint flag/cutover | PASS local / staging pending | `EOMC_AGENT_BASE_URL` selects the Rust agent endpoint; `EOMC_AGENT_SERVER_MEMORY=true` stops client memory injection upstream; `session_id` / `option_id` are forwarded. Staging smoke is still pending. |
+| Rollback switch behavior | PASS local / staging pending | `RUNTIME_ENABLED` parsing is tested so unset, `false`, and `0` keep runtime routing off; staging rollback verification is still pending. |
+| Staging smoke checklist/script | PASS local / execution pending | `docs/archives/staging-smoke-checklist.md` (archived) and `scripts/staging-smoke.sh` record required env, direct `/agent` and `/agent/stream` smoke commands, and evidence to append after staging. |
 
 ## Waivers
 

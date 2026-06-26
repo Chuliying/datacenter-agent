@@ -257,4 +257,4 @@ Pass criteria: required only for releases that alter live LLM/MCP behavior; fail
 | PRD | `docs/agent-runtime-rust-port/prd.md` |
 | Spec overview | `docs/agent-runtime-rust-port/spec/spec-overview.md` |
 | File structure | `docs/agent-runtime-rust-port/file-structure.md` |
-| Migration plan | `docs/agent-runtime-rust-port/migration-plan.md` |
+| Migration plan | `docs/archives/migration-plan.md` (archived) |

@@ -4,11 +4,12 @@
 > brainstorming 盤點來源：`falcon-client/docs/plans/chief-of-staff-agent-runtime/{capability-layer-map,implementation,notes,tasks}.md`。
 > v1.1.0 依嚴格 review（subagent，2026-06-25）修訂：補上**模組可拔插 registry**、**完整 audit**、**錯誤策略**、**移植缺陷修正**。
 > v1.2.0 新增**模型/skill 評估（Eval）子系統**：獨立於確定性測試的第二條驗證軸（fixtures-in-pack + response baseline + LLM-judge + CI gate）。
+> v1.3.0（2026-06-26）falcon **thin-proxy 移植觸發的契約同步**：`intent.resolved` 升為 `/agent/stream` 正式 wire event（runtime 模式、附加、向後相容；拒絕路徑不送）；`AgentRequest` 加 `session_id`/`option_id`、`AgentResponse` 加 `intent`。
 
 ## 後設資料
 - Slug：`agent-runtime-rust-port`
 - 階段（Stage）：docs
-- 版本：v1.2.0
+- 版本：v1.3.0
 - 建立日期：2026-06-25
 - 狀態：draft
 - 目標 repo：`datacenter-agent`（Rust，axum + rmcp + async-openai）
@@ -35,7 +36,7 @@
 
 runtime 本身領域無關；falcon-client 的 EV 充電那套內容＋預設模組組裝，當作**第一個能力包（capability pack）**，證明「換 config 即換垂直應用、且可增減模組」。
 
-整合方式：在 handler 與既有 agent loop 之間，加入一個移植自 `run-agent-turn` 的 Rust orchestrator，依 config 組裝出的 pipeline 串起 input → audit → answer-policy 決策 → session memory →（現有）LLM/MCP loop → 回寫 memory + audit。對外 wire 契約（SSE 的 token/done/error/clear）維持不變。
+整合方式：在 handler 與既有 agent loop 之間，加入一個移植自 `run-agent-turn` 的 Rust orchestrator，依 config 組裝出的 pipeline 串起 input → audit → answer-policy 決策 → session memory →（現有）LLM/MCP loop → 回寫 memory + audit。對外 wire 契約以 `token/done/error/clear` 為基底維持相容；runtime 串流另**附加** `intent.resolved` 首幀（thin-proxy 後前端串流 intent 的來源；附加、向後相容）。
 
 ## 使用者故事（User Stories）
 
@@ -70,7 +71,7 @@ runtime 本身領域無關；falcon-client 的 EV 充電那套內容＋預設模
 20. 作為合規負責人，我要 `AuditSink` 是 trait、可由 config 選 sink，且定義 append-only/排序語意與寫入失敗策略（fail-open/fail-closed；tamper 立場至少明述），這樣 audit 本身也可插拔且可信。
 
 ### 契約 / 品質
-21. 作為 API 使用方，我要既有 SSE wire 契約（token/done/error/clear）與 `/agent` JSON 契約不變，現有 client 持續可用。
+21. 作為 API 使用方，我要既有 SSE wire 契約（token/done/error/clear）與 `/agent` JSON 契約保持相容、現有 client 持續可用；runtime 串流可**附加** `intent.resolved` 首幀（向後相容，舊 client 忽略未知 event）。
 22. 作為 API 使用方，我要拒絕與提示用既有 frame 表達（拒絕文字當 token 串出、提示當開頭 token），不需新增事件型別；**語意拒絕回 200、結構性拒絕回 400** 的規則明定。
 23. 作為操作者，我要 runtime 正確處理 Rust 獨有的 `LlmEvent::Clear`（清空答案 buffer），工具迴圈 preamble 不被當答案保存。
 24. 作為開發者，我要 intent 表示為對 config allowlist 驗證過的 `String`（非編譯期 enum），且 config 載入時驗證：每個 `option_prefixes` 值與 `[[intent]].id` 都在 allowlist、`unknown` 必須存在、keywords 非空、id 不重複。
@@ -121,7 +122,7 @@ runtime 本身領域無關；falcon-client 的 EV 充電那套內容＋預設模
 - 換垂直應用 = 換 `config/runtime/*`；不動 Rust。
 
 ### 行為契約
-- **Wire 不變。** 拒絕 → 拒絕文字當 `Token` + `Done`（非串流 → `model_response` = 拒絕文字，HTTP 200）。提示 → disclaimer 當開頭 `Token`。**結構性拒絕（空/超長）回 400**。
+- **Wire 相容 + runtime 附加 `intent.resolved`。** 既有 `token/done/error/clear` 不變；runtime 串流於 intent 解析後、任何 token 前送一次 `intent.resolved`（拒絕路徑不送 → 前端落回 root topic）。拒絕 → 拒絕文字當 `Token` + `Done`（非串流 → `model_response` = 拒絕文字，HTTP 200）。提示 → disclaimer 當開頭 `Token`。**結構性拒絕（空/超長）回 400**。
 - **`LlmEvent::Clear`**：orchestrator 清空 buffer；audit 記 `answer.cleared`，只保最終答案。
 - **記憶權威** server 端：有 `session_id` → 讀寫 store、折進 prompt、upstream `history: []`；無 → 退回 client `history`。`option_id` 只作為本 turn 的分類/audit 訊號，不進 server memory key。
 

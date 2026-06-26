@@ -65,13 +65,15 @@ pub struct AgentRequest {
 }
 ```
 
-## 串流契約（不變）
+## 串流契約（runtime 模式：新增 intent.resolved 首幀）
 ```text
+data: {"event":"intent.resolved","data":{"intent":"revenue","candidateIntents":["revenue"]}}  // intent 解析後、任何 token 前送一次；拒絕路徑不送
 data: {"event":"token","data":"今年"}
 data: {"event":"clear"}            // 工具迴圈 preamble → 清 buffer（Rust-only）→ audit AnswerCleared
 data: {"event":"token","data":"今年累計營收為…"}
 data: {"event":"done"}
 ```
+> `intent.resolved` 為 thin-proxy 移植後**新增的 wire event**：falcon 薄代理化、砍掉本地 TS pipeline 後，串流 intent 權威收斂到 Rust，前端直接消費此事件選 topic branch。附加且向後相容（舊 client 忽略未知 event）。DTO 見 `dto.rs::StreamFrame::IntentResolved`（`#[serde(rename="intent.resolved")]`、data camelCase）；smoke 見 `tests/runtime_contract.rs::stream_frame_intent_resolved_serializes_for_frontend`。**legacy 非-runtime 路徑**（`stream_frame_from_llm_event`）仍為 `token|clear|done|error`，不送 intent。
 
 ## 一輪 turn 資料流
 ```text
@@ -83,9 +85,9 @@ AgentRequest (prompt, history, session_id, option_id)
     ↓ audit: InputNormalized
     ↓ optional LLM normalizer（若 [runtime.llm_normalizer].enabled 且命中低信心/灰區條件）
     ↓ AnswerPolicy::decide:
-        Refuse      → audit: Refused → 串 refusal token + done（HTTP 200，不呼叫 LLM）
-        Disclaimer  → 先送 disclaimer token，再續行
-        Answer      → 續行
+        Refuse      → audit: Refused → 串 refusal token + done（HTTP 200，不呼叫 LLM；不送 intent.resolved → 前端落回 root topic）
+        Disclaimer  → （串流）emit intent.resolved 首幀 → 先送 disclaimer token，再續行
+        Answer      → （串流）emit intent.resolved 首幀 → 續行
     ↓ memory（若 [runtime.memory].enabled 且有 session_id）: sessions.get → build_memory_context → audit: MemoryContext
         → server-memory：prompt=折入記憶、upstream history=[]；無 session 或 memory disabled：history=client history
     ↓ AgentPort.stream → llm_connector agent loop（現有）
