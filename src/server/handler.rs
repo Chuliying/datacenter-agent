@@ -29,7 +29,8 @@ use uuid::Uuid;
 use rand::seq::SliceRandom;
 
 use super::dto::{
-    AgentRequest, AgentResponse, GreetingResponse, ReadyBody, ReadyChecks, StreamFrame,
+    AgentRequest, AgentResponse, GreetingResponse, IntentResolvedData, ReadyBody, ReadyChecks,
+    StreamFrame,
 };
 use super::error::AppError;
 use super::AppState;
@@ -37,7 +38,9 @@ use crate::appstate::AppRuntime;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
 use crate::runtime::audit::{AuditCtx, AuditWriter};
-use crate::runtime::orchestrator::{run_agent_turn, AgentTurnDeps, AgentTurnOutcome, LlmAgentPort};
+use crate::runtime::orchestrator::{
+    run_agent_turn, AgentTurnDeps, AgentTurnOutcome, LlmAgentPort, TurnEvent,
+};
 use crate::runtime::schema::AgentTurnInput;
 
 /// Upper bound on the user prompt, in UTF-8 characters.
@@ -146,6 +149,7 @@ async fn agent_inner(state: AppState, req: AgentRequest) -> Result<Json<AgentRes
     Ok(Json(AgentResponse {
         user_prompt,
         model_response: md,
+        intent: "unknown".into(),
     }))
 }
 
@@ -191,18 +195,40 @@ async fn agent_inner_runtime(
             sessions: runtime.sessions.as_deref(),
             agent: &agent,
             audit: &audit,
+            // REST aggregates the outcome; live events are dropped.
+            emit: &|_event| {},
         },
     )
     .await
     .map_err(runtime_error_to_app_error)?;
 
+    agent_response_from_outcome(outcome, user_prompt).map(Json)
+}
+
+/// Map a runtime turn outcome onto the external `/agent` response contract.
+///
+/// `Final` carries the resolved intent; `Refused`/`Aborted` collapse to
+/// `"unknown"` (no topic branch). `Error` maps to a host HTTP error.
+fn agent_response_from_outcome(
+    outcome: AgentTurnOutcome,
+    user_prompt: String,
+) -> Result<AgentResponse, AppError> {
     match outcome {
-        AgentTurnOutcome::Final { response, .. }
-        | AgentTurnOutcome::Aborted { response }
-        | AgentTurnOutcome::Refused { copy: response, .. } => Ok(Json(AgentResponse {
+        AgentTurnOutcome::Final { response, intent } => Ok(AgentResponse {
             user_prompt,
             model_response: response,
-        })),
+            intent,
+        }),
+        AgentTurnOutcome::Refused { copy, .. } => Ok(AgentResponse {
+            user_prompt,
+            model_response: copy,
+            intent: "unknown".into(),
+        }),
+        AgentTurnOutcome::Aborted { response } => Ok(AgentResponse {
+            user_prompt,
+            model_response: response,
+            intent: "unknown".into(),
+        }),
         AgentTurnOutcome::Error { code, status } => Err(runtime_outcome_error(code, status)),
     }
 }
@@ -257,24 +283,95 @@ pub async fn agent_stream(
 }
 
 async fn agent_stream_runtime(state: AppState, req: AgentRequest) -> Result<Response, AppError> {
-    let response = agent_inner_runtime(state, req).await?.0;
-    let frames = vec![
-        StreamFrame::Token {
-            data: response.model_response,
-        },
-        StreamFrame::Done,
-    ];
-    let sse_stream: BoxStream<'static, Result<Event, Infallible>> = futures::stream::iter(frames)
-        .map(|frame| {
-            let event = Event::default()
-                .json_data(&frame)
-                .expect("unexpected error: StreamFrame is always valid JSON");
-            Ok::<_, Infallible>(event)
-        })
-        .boxed();
+    let runtime = state
+        .runtime
+        .clone()
+        .ok_or_else(|| AppError::ServiceUnavailable("runtime not configured".into()))?;
+    let cfg = state.generation_config(
+        &state.prompts.agent_system,
+        req.prompt.clone(),
+        req.history.clone(),
+    );
+    let agent = LlmAgentPort::new(cfg, state.tools.clone(), state.mcp.clone());
+    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
+    let request_id = Uuid::new_v4();
+    let audit_ctx = AuditCtx {
+        request_id: request_id.to_string(),
+        session_id: req.session_id.clone(),
+        route: "/agent/stream".into(),
+        actor: None,
+    };
+    let turn_input = AgentTurnInput {
+        request_id,
+        prompt: req.prompt,
+        history: req.history,
+        session_id: req.session_id,
+        option_id: req.option_id,
+    };
+
+    // Single orchestration: the turn runs in a task, emitting live events into a
+    // channel; the SSE stream drains them in real time. Same `run_agent_turn`
+    // the REST path uses — only the injected sink differs.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamFrame>();
+    let turn = tokio::spawn(async move {
+        let emit = move |event: TurnEvent| {
+            let _ = tx.send(turn_event_to_stream_frame(event));
+        };
+        let deps = AgentTurnDeps {
+            runtime_config: &runtime.config,
+            input_pipeline: &runtime.input_pipeline,
+            answer_policy: runtime.answer_policy.as_ref(),
+            llm_normalizer: runtime.llm_normalizer.as_deref(),
+            sessions: runtime.sessions.as_deref(),
+            agent: &agent,
+            audit: &audit,
+            emit: &emit,
+        };
+        run_agent_turn(turn_input, &audit_ctx, deps).await
+    });
+
+    let sse_stream = async_stream::stream! {
+        while let Some(frame) = rx.recv().await {
+            yield Ok::<_, Infallible>(sse_event(frame));
+        }
+        // Channel closed → the turn finished. Surface a hard runtime error (one
+        // that returned `Err` instead of emitting) as a terminal error frame.
+        if let Ok(Err(err)) = turn.await {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
+                data: err.to_string(),
+            }));
+        }
+    };
+
     Ok(Sse::new(sse_stream)
         .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
         .into_response())
+}
+
+/// Serialize a stream frame into an SSE event.
+fn sse_event(frame: StreamFrame) -> Event {
+    Event::default()
+        .json_data(&frame)
+        .expect("unexpected error: StreamFrame is always valid JSON")
+}
+
+/// Map an internal turn event onto the external SSE frame contract.
+fn turn_event_to_stream_frame(event: TurnEvent) -> StreamFrame {
+    match event {
+        TurnEvent::IntentResolved {
+            intent,
+            candidate_intents,
+        } => StreamFrame::IntentResolved {
+            data: IntentResolvedData {
+                intent,
+                candidate_intents,
+            },
+        },
+        TurnEvent::Token { data } => StreamFrame::Token { data },
+        TurnEvent::Clear => StreamFrame::Clear,
+        TurnEvent::Done => StreamFrame::Done,
+        TurnEvent::Error { data } => StreamFrame::Error { data },
+    }
 }
 
 // ──── shared prelude ───
@@ -426,6 +523,74 @@ mod tests {
 
         let enabled = app_runtime(true);
         assert!(should_use_runtime(Some(&enabled)));
+    }
+
+    #[test]
+    fn agent_response_carries_final_intent() {
+        let outcome = AgentTurnOutcome::Final {
+            response: "ans".into(),
+            intent: "revenue".into(),
+        };
+        let resp = agent_response_from_outcome(outcome, "prompt".into())
+            .expect("final outcome maps to a response");
+        assert_eq!(resp.user_prompt, "prompt");
+        assert_eq!(resp.model_response, "ans");
+        assert_eq!(resp.intent, "revenue");
+    }
+
+    #[test]
+    fn agent_response_refusal_reports_unknown_intent() {
+        let outcome = AgentTurnOutcome::Refused {
+            reason: "off_topic".into(),
+            copy: "sorry".into(),
+        };
+        let resp = agent_response_from_outcome(outcome, "prompt".into())
+            .expect("refusal maps to a response");
+        assert_eq!(resp.model_response, "sorry");
+        assert_eq!(resp.intent, "unknown");
+    }
+
+    #[test]
+    fn agent_response_aborted_reports_unknown_intent() {
+        let outcome = AgentTurnOutcome::Aborted {
+            response: "partial".into(),
+        };
+        let resp = agent_response_from_outcome(outcome, "prompt".into())
+            .expect("aborted maps to a response");
+        assert_eq!(resp.model_response, "partial");
+        assert_eq!(resp.intent, "unknown");
+    }
+
+    #[test]
+    fn turn_event_maps_to_external_stream_frame() {
+        assert_eq!(
+            turn_event_to_stream_frame(TurnEvent::IntentResolved {
+                intent: "revenue".into(),
+                candidate_intents: vec!["revenue".into()],
+            }),
+            StreamFrame::IntentResolved {
+                data: IntentResolvedData {
+                    intent: "revenue".into(),
+                    candidate_intents: vec!["revenue".into()],
+                },
+            }
+        );
+        assert_eq!(
+            turn_event_to_stream_frame(TurnEvent::Token { data: "hi".into() }),
+            StreamFrame::Token { data: "hi".into() }
+        );
+        assert_eq!(
+            turn_event_to_stream_frame(TurnEvent::Clear),
+            StreamFrame::Clear
+        );
+        assert_eq!(
+            turn_event_to_stream_frame(TurnEvent::Done),
+            StreamFrame::Done
+        );
+        assert_eq!(
+            turn_event_to_stream_frame(TurnEvent::Error { data: "e".into() }),
+            StreamFrame::Error { data: "e".into() }
+        );
     }
 
     fn app_runtime(enabled: bool) -> AppRuntime {

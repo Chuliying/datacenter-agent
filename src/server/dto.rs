@@ -40,6 +40,11 @@ pub struct AgentRequest {
 pub struct AgentResponse {
     pub user_prompt: String,
     pub model_response: String,
+    /// Intent selected by the runtime input pipeline.
+    ///
+    /// `"unknown"` when the runtime is disabled (legacy loop) or the turn was
+    /// refused/aborted before an intent could be resolved.
+    pub intent: String,
 }
 
 /// One frame on the `POST /agent/stream` SSE wire.
@@ -62,6 +67,21 @@ pub enum StreamFrame {
     Error { data: String },
     /// Clear event, used to suggest down stream reset current accumulated tokens.
     Clear,
+    /// Intent resolved event, emitted once before any token so the host can
+    /// pick the answer topic branch. Mirrors the frontend `intent.resolved`
+    /// event shape (`data: { intent, candidateIntents }`).
+    #[serde(rename = "intent.resolved")]
+    IntentResolved { data: IntentResolvedData },
+}
+
+/// Payload for the [`StreamFrame::IntentResolved`] event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IntentResolvedData {
+    /// Resolved intent.
+    pub intent: String,
+    /// Candidate intents considered by the pipeline.
+    pub candidate_intents: Vec<String>,
 }
 
 // ──── /greeting ───

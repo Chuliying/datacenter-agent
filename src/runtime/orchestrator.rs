@@ -66,6 +66,75 @@ pub enum AgentTurnOutcome {
     },
 }
 
+/// Result of the synchronous prelude of a turn, before any token is streamed.
+///
+/// Lets a streaming host resolve the intent (and emit `intent.resolved`)
+/// before opening the token stream, while keeping audit/memory side effects
+/// identical to [`run_agent_turn`].
+#[derive(Debug)]
+pub enum StreamPlan {
+    /// Pre-stream error (e.g. invalid prompt). Audit already written.
+    Error {
+        /// Stable error code.
+        code: String,
+        /// HTTP-ish status for host mapping.
+        status: u16,
+    },
+    /// Semantic refusal. Audit + memory already written.
+    Refused {
+        /// Refusal reason.
+        reason: String,
+        /// Refusal copy.
+        copy: String,
+    },
+    /// Proceed to stream the agent response.
+    Proceed {
+        /// Turn start instant, for duration accounting.
+        started: Instant,
+        /// Text to prepend before agent tokens (disclaimer, or empty).
+        prefix: String,
+        /// Memory-augmented agent input.
+        agent_input: AgentTurnInput,
+        /// Normalized input, carrying the resolved intent. Boxed to keep the
+        /// enum small (the other variants are tiny).
+        normalized: Box<NormalizedInput>,
+    },
+}
+
+/// Externally observable event from one turn.
+///
+/// Emitted live by [`run_agent_turn`] through the injected sink. The streaming
+/// host turns these into SSE frames; the REST host injects a no-op sink and
+/// reads the aggregated [`AgentTurnOutcome`] instead. Single orchestration,
+/// two consumption styles — no second frame loop, no drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEvent {
+    /// Resolved intent, emitted once before any token.
+    IntentResolved {
+        /// Selected intent.
+        intent: String,
+        /// Candidate intents considered by the pipeline.
+        candidate_intents: Vec<String>,
+    },
+    /// A token fragment of the answer.
+    Token {
+        /// Token text.
+        data: String,
+    },
+    /// Clear the accumulated answer buffer.
+    Clear,
+    /// Stream finished cleanly.
+    Done,
+    /// Terminal error.
+    Error {
+        /// Error code/message.
+        data: String,
+    },
+}
+
+/// Injected event sink. REST passes a no-op; streaming pushes to SSE.
+pub type TurnEmit<'a> = &'a (dyn Fn(TurnEvent) + Send + Sync);
+
 /// Runtime dependencies for one turn.
 #[derive(Clone, Copy)]
 pub struct AgentTurnDeps<'a> {
@@ -83,6 +152,8 @@ pub struct AgentTurnDeps<'a> {
     pub agent: &'a dyn AgentPort,
     /// Audit writer.
     pub audit: &'a AuditWriter,
+    /// Live event sink (REST: no-op; stream: SSE).
+    pub emit: TurnEmit<'a>,
 }
 
 /// Adapter from the existing LLM/MCP loop into runtime frames.
@@ -130,6 +201,54 @@ pub async fn run_agent_turn(
     audit_ctx: &AuditCtx,
     deps: AgentTurnDeps<'_>,
 ) -> RuntimeResult<AgentTurnOutcome> {
+    match plan_stream_turn(input, audit_ctx, deps).await? {
+        StreamPlan::Error { code, status } => {
+            (deps.emit)(TurnEvent::Error { data: code.clone() });
+            Ok(AgentTurnOutcome::Error { code, status })
+        }
+        StreamPlan::Refused { reason, copy } => {
+            (deps.emit)(TurnEvent::Token { data: copy.clone() });
+            (deps.emit)(TurnEvent::Done);
+            Ok(AgentTurnOutcome::Refused { reason, copy })
+        }
+        StreamPlan::Proceed {
+            started,
+            prefix,
+            agent_input,
+            normalized,
+        } => {
+            (deps.emit)(TurnEvent::IntentResolved {
+                intent: normalized.intent.clone(),
+                candidate_intents: normalized.candidate_intents.clone(),
+            });
+            let mut response = String::new();
+            if !prefix.is_empty() {
+                response.push_str(&prefix);
+                (deps.emit)(TurnEvent::Token { data: prefix });
+            }
+            stream_agent_response(
+                agent_input,
+                audit_ctx,
+                deps,
+                started,
+                &normalized,
+                &mut response,
+            )
+            .await
+        }
+    }
+}
+
+/// Run the synchronous prelude of a turn: audit, validate, normalize, resolve
+/// intent, and apply the answer policy — stopping just before the token stream.
+///
+/// Shared by [`run_agent_turn`] (which then aggregates the stream) and the
+/// streaming host (which emits `intent.resolved` then forwards tokens).
+pub async fn plan_stream_turn(
+    input: AgentTurnInput,
+    audit_ctx: &AuditCtx,
+    deps: AgentTurnDeps<'_>,
+) -> RuntimeResult<StreamPlan> {
     let started = Instant::now();
     deps.audit
         .write(
@@ -152,7 +271,7 @@ pub async fn run_agent_turn(
                 },
             )
             .await?;
-        return Ok(AgentTurnOutcome::Error {
+        return Ok(StreamPlan::Error {
             code: runtime_error_code(&err).to_string(),
             status: 400,
         });
@@ -210,33 +329,26 @@ pub async fn run_agent_turn(
                     },
                 )
                 .await?;
-            Ok(AgentTurnOutcome::Refused { reason, copy })
+            Ok(StreamPlan::Refused { reason, copy })
         }
         AnswerDecision::Disclaimer(disclaimer) => {
-            let mut response = disclaimer_copy(&disclaimer);
+            let prefix = disclaimer_copy(&disclaimer);
             let agent_input = apply_memory_context(input, audit_ctx, deps, &normalized).await?;
-            stream_agent_response(
-                agent_input,
-                audit_ctx,
-                deps,
+            Ok(StreamPlan::Proceed {
                 started,
-                &normalized,
-                &mut response,
-            )
-            .await
+                prefix,
+                agent_input,
+                normalized: Box::new(normalized),
+            })
         }
         AnswerDecision::Answer => {
-            let mut response = String::new();
             let agent_input = apply_memory_context(input, audit_ctx, deps, &normalized).await?;
-            stream_agent_response(
-                agent_input,
-                audit_ctx,
-                deps,
+            Ok(StreamPlan::Proceed {
                 started,
-                &normalized,
-                &mut response,
-            )
-            .await
+                prefix: String::new(),
+                agent_input,
+                normalized: Box::new(normalized),
+            })
         }
     }
 }
@@ -253,12 +365,16 @@ async fn stream_agent_response(
     let mut stream = deps.agent.stream_turn(input).await?;
     while let Some(frame) = stream.next().await {
         match frame {
-            AgentTurnFrame::Token { data } => response.push_str(&data),
+            AgentTurnFrame::Token { data } => {
+                response.push_str(&data);
+                (deps.emit)(TurnEvent::Token { data });
+            }
             AgentTurnFrame::Clear => {
                 response.clear();
                 deps.audit
                     .write(audit_ctx, AuditEvent::AnswerCleared)
                     .await?;
+                (deps.emit)(TurnEvent::Clear);
             }
             AgentTurnFrame::ToolCalled { name, args_hash } => {
                 deps.audit
@@ -297,12 +413,14 @@ async fn stream_agent_response(
                         },
                     )
                     .await?;
+                (deps.emit)(TurnEvent::Done);
                 return Ok(AgentTurnOutcome::Final {
                     response: response.clone(),
                     intent: normalized.intent.clone(),
                 });
             }
             AgentTurnFrame::Error { data } if response.is_empty() => {
+                (deps.emit)(TurnEvent::Error { data: data.clone() });
                 deps.audit
                     .write(
                         audit_ctx,
@@ -656,6 +774,7 @@ mod tests {
                 sessions: None,
                 agent: &agent,
                 audit: &audit,
+                emit: &|_event| {},
             },
         )
         .await
@@ -698,6 +817,7 @@ mod tests {
                 sessions,
                 agent: &agent,
                 audit: &audit,
+                emit: &|_event| {},
             },
         )
         .await
@@ -736,6 +856,7 @@ mod tests {
                 sessions: None,
                 agent: &agent,
                 audit: &audit,
+                emit: &|_event| {},
             },
         )
         .await
@@ -1019,6 +1140,149 @@ mod tests {
                 .last()
                 .map(|turn| turn.user_summary.as_str()),
             Some("營收 收入 這個月呢")
+        );
+    }
+
+    async fn plan_with_fake(input: AgentTurnInput) -> StreamPlan {
+        let cfg = runtime_config();
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy;
+        let agent = FakeAgentPort {
+            frames: Vec::new(),
+            calls: Arc::new(Mutex::new(0)),
+            last_input: Arc::new(Mutex::new(None)),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink, AuditFailurePolicy::FailClosed);
+        plan_stream_turn(
+            input,
+            &audit_ctx(),
+            AgentTurnDeps {
+                runtime_config: &cfg,
+                input_pipeline: &pipeline,
+                answer_policy: &policy,
+                llm_normalizer: None,
+                sessions: None,
+                agent: &agent,
+                audit: &audit,
+                emit: &|_event| {},
+            },
+        )
+        .await
+        .expect("plan should run")
+    }
+
+    #[tokio::test]
+    async fn plan_resolves_intent_and_proceeds_for_answerable_input() {
+        let plan = plan_with_fake(turn_input("營收 收入 賺多少")).await;
+        match plan {
+            StreamPlan::Proceed {
+                prefix, normalized, ..
+            } => {
+                assert_eq!(normalized.intent, "revenue");
+                assert_eq!(prefix, "");
+            }
+            other => panic!("expected proceed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_carries_disclaimer_prefix() {
+        let plan = plan_with_fake(turn_input("營收 充電")).await;
+        match plan {
+            StreamPlan::Proceed { prefix, .. } => {
+                assert!(prefix.starts_with("（以下為初步判讀"));
+            }
+            other => panic!("expected proceed with disclaimer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_off_topic_input() {
+        let plan = plan_with_fake(turn_input("未知 其他")).await;
+        assert!(matches!(plan, StreamPlan::Refused { .. }));
+    }
+
+    async fn emit_sequence_for(
+        input: AgentTurnInput,
+        frames: Vec<AgentTurnFrame>,
+    ) -> Vec<TurnEvent> {
+        let cfg = runtime_config();
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy;
+        let agent = FakeAgentPort {
+            frames,
+            calls: Arc::new(Mutex::new(0)),
+            last_input: Arc::new(Mutex::new(None)),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink, AuditFailurePolicy::FailClosed);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<TurnEvent>::new()));
+        let captured = events.clone();
+        let emit = move |event: TurnEvent| captured.lock().unwrap().push(event);
+        run_agent_turn(
+            input,
+            &audit_ctx(),
+            AgentTurnDeps {
+                runtime_config: &cfg,
+                input_pipeline: &pipeline,
+                answer_policy: &policy,
+                llm_normalizer: None,
+                sessions: None,
+                agent: &agent,
+                audit: &audit,
+                emit: &emit,
+            },
+        )
+        .await
+        .expect("turn should run");
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    #[tokio::test]
+    async fn streams_intent_resolved_then_tokens_then_done() {
+        let events = emit_sequence_for(
+            turn_input("營收 收入 賺多少"),
+            vec![
+                AgentTurnFrame::Token {
+                    data: "hello".into(),
+                },
+                AgentTurnFrame::Done,
+            ],
+        )
+        .await;
+
+        assert!(
+            matches!(events.first(), Some(TurnEvent::IntentResolved { intent, .. }) if intent == "revenue"),
+            "first event must be intent.resolved, got {:?}",
+            events.first()
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::Token { data } if data == "hello")));
+        assert_eq!(events.last(), Some(&TurnEvent::Done));
+    }
+
+    #[tokio::test]
+    async fn rest_consumes_same_orchestration_with_noop_emit() {
+        // REST path: same run_agent_turn, emit is a no-op, outcome still aggregates.
+        let (outcome, _, _) = run_with_fake_agent(
+            turn_input("營收 收入 賺多少"),
+            vec![
+                AgentTurnFrame::Token {
+                    data: "hello".into(),
+                },
+                AgentTurnFrame::Done,
+            ],
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            AgentTurnOutcome::Final {
+                response: "hello".into(),
+                intent: "revenue".into(),
+            }
         );
     }
 }
