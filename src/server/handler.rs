@@ -178,6 +178,7 @@ async fn agent_inner_runtime(
     };
     let turn_input = AgentTurnInput {
         request_id,
+        raw_input: req.prompt.clone(),
         prompt: req.prompt,
         history: req.history,
         session_id: req.session_id,
@@ -303,6 +304,7 @@ async fn agent_stream_runtime(state: AppState, req: AgentRequest) -> Result<Resp
     };
     let turn_input = AgentTurnInput {
         request_id,
+        raw_input: req.prompt.clone(),
         prompt: req.prompt,
         history: req.history,
         session_id: req.session_id,

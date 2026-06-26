@@ -10,8 +10,11 @@ use crate::model::History;
 pub struct AgentTurnInput {
     /// Runtime request id.
     pub request_id: Uuid,
-    /// Raw prompt text.
+    /// Prompt sent to the agent (may be memory-augmented during the turn).
     pub prompt: String,
+    /// Original user input, preserved across memory augmentation so memory
+    /// summaries record the raw turn rather than the augmented prompt.
+    pub raw_input: String,
     /// Client-provided history fallback.
     pub history: Vec<History>,
     /// Optional server-side memory session id.

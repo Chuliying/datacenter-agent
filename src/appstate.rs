@@ -258,9 +258,7 @@ fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
     let audit_sink = registry
         .build_audit(&config)
         .context("build runtime audit sink")?;
-    let enabled = std::env::var("RUNTIME_ENABLED")
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false);
+    let enabled = runtime_enabled_from_env(std::env::var("RUNTIME_ENABLED").ok().as_deref());
     Ok(Some(Arc::new(AppRuntime {
         enabled,
         audit_failure_policy: config.assembly.audit_failure_policy,
@@ -271,6 +269,12 @@ fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
         sessions,
         audit_sink,
     })))
+}
+
+fn runtime_enabled_from_env(value: Option<&str>) -> bool {
+    value
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
 }
 
 /// Read `GLOBAL_TOKEN` from the environment.
@@ -294,4 +298,19 @@ pub fn load_mcp_url() -> Result<String> {
         anyhow::bail!("env_error: DATACENTER_MCP_URL is empty");
     }
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_enabled_env_defaults_off_for_rollback() {
+        for value in [None, Some(""), Some("false"), Some("0"), Some("TRUE ")] {
+            assert!(!runtime_enabled_from_env(value));
+        }
+        for value in [Some("true"), Some("TRUE"), Some("1")] {
+            assert!(runtime_enabled_from_env(value));
+        }
+    }
 }

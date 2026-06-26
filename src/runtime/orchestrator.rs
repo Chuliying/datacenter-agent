@@ -31,10 +31,6 @@ pub trait AgentPort: Send + Sync {
     ) -> RuntimeResult<BoxStream<'static, AgentTurnFrame>>;
 }
 
-/// Runtime orchestrator placeholder.
-#[derive(Debug, Default)]
-pub struct RuntimeOrchestrator;
-
 /// Outcome of one runtime-owned turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentTurnOutcome {
@@ -68,9 +64,8 @@ pub enum AgentTurnOutcome {
 
 /// Result of the synchronous prelude of a turn, before any token is streamed.
 ///
-/// Lets a streaming host resolve the intent (and emit `intent.resolved`)
-/// before opening the token stream, while keeping audit/memory side effects
-/// identical to [`run_agent_turn`].
+/// Carries the resolved intent so the caller can emit `intent.resolved` ahead
+/// of the token stream, while keeping audit/memory side effects in one place.
 #[derive(Debug)]
 pub enum StreamPlan {
     /// Pre-stream error (e.g. invalid prompt). Audit already written.
@@ -242,8 +237,9 @@ pub async fn run_agent_turn(
 /// Run the synchronous prelude of a turn: audit, validate, normalize, resolve
 /// intent, and apply the answer policy — stopping just before the token stream.
 ///
-/// Shared by [`run_agent_turn`] (which then aggregates the stream) and the
-/// streaming host (which emits `intent.resolved` then forwards tokens).
+/// The shared prelude for [`run_agent_turn`]: it runs this, emits
+/// `intent.resolved`, then streams/aggregates tokens. Exposed for hosts that
+/// want the pre-stream split without re-deriving the audit/memory side effects.
 pub async fn plan_stream_turn(
     input: AgentTurnInput,
     audit_ctx: &AuditCtx,
@@ -333,7 +329,7 @@ pub async fn plan_stream_turn(
         }
         AnswerDecision::Disclaimer(disclaimer) => {
             let prefix = disclaimer_copy(&disclaimer);
-            let agent_input = apply_memory_context(input, audit_ctx, deps, &normalized).await?;
+            let agent_input = apply_memory_context(input, audit_ctx, deps).await?;
             Ok(StreamPlan::Proceed {
                 started,
                 prefix,
@@ -342,7 +338,7 @@ pub async fn plan_stream_turn(
             })
         }
         AnswerDecision::Answer => {
-            let agent_input = apply_memory_context(input, audit_ctx, deps, &normalized).await?;
+            let agent_input = apply_memory_context(input, audit_ctx, deps).await?;
             Ok(StreamPlan::Proceed {
                 started,
                 prefix: String::new(),
@@ -419,7 +415,12 @@ async fn stream_agent_response(
                     intent: normalized.intent.clone(),
                 });
             }
-            AgentTurnFrame::Error { data } if response.is_empty() => {
+            AgentTurnFrame::Error { data } => {
+                // Any upstream error frame is a failure — regardless of partial
+                // output. Never persisted to memory, never reported as
+                // completed (parity with TS source + spec-05 error table).
+                // Partial output is salvaged only on a clean stream truncation
+                // (the stream ends with no Done/Error frame, handled below).
                 (deps.emit)(TurnEvent::Error { data: data.clone() });
                 deps.audit
                     .write(
@@ -435,24 +436,6 @@ async fn stream_agent_response(
                     status: 502,
                 });
             }
-            AgentTurnFrame::Error { .. } => {
-                append_memory_turn_if_enabled(&memory_input, deps.sessions, normalized, response)
-                    .await?;
-                deps.audit
-                    .write(
-                        audit_ctx,
-                        AuditEvent::ResponseCompleted {
-                            response_hash: hash_identifier(response),
-                            response_chars: response.chars().count(),
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            status: "aborted".to_string(),
-                        },
-                    )
-                    .await?;
-                return Ok(AgentTurnOutcome::Aborted {
-                    response: response.clone(),
-                });
-            }
         }
     }
 
@@ -465,7 +448,6 @@ async fn apply_memory_context(
     mut input: AgentTurnInput,
     audit_ctx: &AuditCtx,
     deps: AgentTurnDeps<'_>,
-    _normalized: &NormalizedInput,
 ) -> RuntimeResult<AgentTurnInput> {
     let Some(session_id) = input.session_id.clone() else {
         return Ok(input);
@@ -547,7 +529,7 @@ async fn append_memory_turn_if_enabled(
             &scope,
             SessionMemoryTurn {
                 turn_id: input.request_id.to_string(),
-                user_summary: memory_user_summary(&input.prompt),
+                user_summary: input.raw_input.clone(),
                 answer_summary: response.to_string(),
                 intent: Some(normalized.intent.clone()),
                 metric: normalized.slots.metric.clone(),
@@ -566,13 +548,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
-}
-
-fn memory_user_summary(prompt: &str) -> String {
-    prompt
-        .rsplit_once("Current user input:\n")
-        .map(|(_, current)| current.to_string())
-        .unwrap_or_else(|| prompt.to_string())
 }
 
 fn llm_event_to_turn_frame(event: LlmEvent) -> AgentTurnFrame {
@@ -732,6 +707,7 @@ mod tests {
     fn turn_input(prompt: &str) -> AgentTurnInput {
         AgentTurnInput {
             request_id: Uuid::nil(),
+            raw_input: prompt.to_string(),
             prompt: prompt.to_string(),
             history: Vec::new(),
             session_id: None,
@@ -1027,32 +1003,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_error_empty_buffer_fails_but_partial_buffer_aborts() {
-        let (failed, _, _) = run_with_fake_agent(
-            turn_input("營收 收入 賺多少"),
+    async fn upstream_error_always_fails_truncation_aborts() {
+        // An error frame is a failure regardless of partial output.
+        for frames in [
             vec![AgentTurnFrame::Error {
                 data: "upstream down".into(),
             }],
-        )
-        .await;
-        assert_eq!(
-            failed,
-            AgentTurnOutcome::Error {
-                code: "upstream_error".into(),
-                status: 502,
-            }
-        );
-
-        let (aborted, _, _) = run_with_fake_agent(
-            turn_input("營收 收入 賺多少"),
             vec![
                 AgentTurnFrame::Token {
                     data: "partial".into(),
                 },
                 AgentTurnFrame::Error {
-                    data: "client gone".into(),
+                    data: "upstream down".into(),
                 },
             ],
+        ] {
+            let (outcome, _, _) = run_with_fake_agent(turn_input("營收 收入 賺多少"), frames).await;
+            assert_eq!(
+                outcome,
+                AgentTurnOutcome::Error {
+                    code: "upstream_error".into(),
+                    status: 502,
+                }
+            );
+        }
+
+        // A clean truncation (stream ends with no Done/Error frame) salvages the
+        // partial output as an abort.
+        let (aborted, _, _) = run_with_fake_agent(
+            turn_input("營收 收入 賺多少"),
+            vec![AgentTurnFrame::Token {
+                data: "partial".into(),
+            }],
         )
         .await;
         assert_eq!(
