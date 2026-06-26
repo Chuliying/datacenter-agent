@@ -24,3 +24,4 @@ keyword_short_weight = 1
 
 [memory]
 max_turns = 5
+max_memory_context_chars = 1200

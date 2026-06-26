@@ -1,7 +1,7 @@
 //! Runtime turn orchestrator.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_openai::types::chat::ChatCompletionTool;
 use async_trait::async_trait;
@@ -13,7 +13,10 @@ use super::error::{RuntimeError, RuntimeResult};
 use super::guardrails::answer_policy::{AnswerDecision, AnswerPolicy};
 use super::guardrails::input_guard::validate_prompt;
 use super::input::pipeline::InputPipeline;
-use super::schema::{AgentTurnFrame, AgentTurnInput};
+use super::llm_normalizer::LlmInputNormalizer;
+use super::memory::context::build_session_memory_context;
+use super::memory::store::{SessionMemoryScope, SessionMemoryStore, SessionMemoryTurn};
+use super::schema::{AgentTurnFrame, AgentTurnInput, NormalizedInput};
 use crate::llm_connector::{self, LlmEvent};
 use crate::mcp_client::McpHandle;
 use crate::model::GenerationConfig;
@@ -64,6 +67,7 @@ pub enum AgentTurnOutcome {
 }
 
 /// Runtime dependencies for one turn.
+#[derive(Clone, Copy)]
 pub struct AgentTurnDeps<'a> {
     /// Runtime config.
     pub runtime_config: &'a RuntimeConfig,
@@ -71,6 +75,10 @@ pub struct AgentTurnDeps<'a> {
     pub input_pipeline: &'a InputPipeline,
     /// Answer policy.
     pub answer_policy: &'a dyn AnswerPolicy,
+    /// Optional LLM-backed input normalizer.
+    pub llm_normalizer: Option<&'a dyn LlmInputNormalizer>,
+    /// Optional server-side memory store.
+    pub sessions: Option<&'a dyn SessionMemoryStore>,
     /// Agent transport.
     pub agent: &'a dyn AgentPort,
     /// Audit writer.
@@ -150,11 +158,16 @@ pub async fn run_agent_turn(
         });
     }
 
-    let normalized = deps.input_pipeline.run_with_config(
+    let mut normalized = deps.input_pipeline.run_with_config(
         deps.runtime_config,
         &input.prompt,
         input.option_id.as_deref(),
     )?;
+    if normalized.confidence < deps.runtime_config.thresholds.confidence.answer_normal {
+        if let Some(normalizer) = deps.llm_normalizer {
+            normalized = normalizer.normalize(normalized).await?;
+        }
+    }
     deps.audit
         .write(
             audit_ctx,
@@ -177,6 +190,7 @@ pub async fn run_agent_turn(
     match deps.answer_policy.decide(&normalized) {
         AnswerDecision::Refuse(reason) => {
             let copy = refusal_copy(&reason);
+            append_memory_turn_if_enabled(&input, deps.sessions, &normalized, &copy).await?;
             deps.audit
                 .write(
                     audit_ctx,
@@ -200,24 +214,26 @@ pub async fn run_agent_turn(
         }
         AnswerDecision::Disclaimer(disclaimer) => {
             let mut response = disclaimer_copy(&disclaimer);
+            let agent_input = apply_memory_context(input, audit_ctx, deps, &normalized).await?;
             stream_agent_response(
-                input,
+                agent_input,
                 audit_ctx,
                 deps,
                 started,
-                &normalized.intent,
+                &normalized,
                 &mut response,
             )
             .await
         }
         AnswerDecision::Answer => {
             let mut response = String::new();
+            let agent_input = apply_memory_context(input, audit_ctx, deps, &normalized).await?;
             stream_agent_response(
-                input,
+                agent_input,
                 audit_ctx,
                 deps,
                 started,
-                &normalized.intent,
+                &normalized,
                 &mut response,
             )
             .await
@@ -230,9 +246,10 @@ async fn stream_agent_response(
     audit_ctx: &AuditCtx,
     deps: AgentTurnDeps<'_>,
     started: Instant,
-    intent: &str,
+    normalized: &NormalizedInput,
     response: &mut String,
 ) -> RuntimeResult<AgentTurnOutcome> {
+    let memory_input = input.clone();
     let mut stream = deps.agent.stream_turn(input).await?;
     while let Some(frame) = stream.next().await {
         match frame {
@@ -267,6 +284,8 @@ async fn stream_agent_response(
                     .await?;
             }
             AgentTurnFrame::Done => {
+                append_memory_turn_if_enabled(&memory_input, deps.sessions, normalized, response)
+                    .await?;
                 deps.audit
                     .write(
                         audit_ctx,
@@ -280,7 +299,7 @@ async fn stream_agent_response(
                     .await?;
                 return Ok(AgentTurnOutcome::Final {
                     response: response.clone(),
-                    intent: intent.to_string(),
+                    intent: normalized.intent.clone(),
                 });
             }
             AgentTurnFrame::Error { data } if response.is_empty() => {
@@ -299,6 +318,8 @@ async fn stream_agent_response(
                 });
             }
             AgentTurnFrame::Error { .. } => {
+                append_memory_turn_if_enabled(&memory_input, deps.sessions, normalized, response)
+                    .await?;
                 deps.audit
                     .write(
                         audit_ctx,
@@ -320,6 +341,120 @@ async fn stream_agent_response(
     Ok(AgentTurnOutcome::Aborted {
         response: response.clone(),
     })
+}
+
+async fn apply_memory_context(
+    mut input: AgentTurnInput,
+    audit_ctx: &AuditCtx,
+    deps: AgentTurnDeps<'_>,
+    _normalized: &NormalizedInput,
+) -> RuntimeResult<AgentTurnInput> {
+    let Some(session_id) = input.session_id.clone() else {
+        return Ok(input);
+    };
+    let Some(sessions) = deps.sessions else {
+        return Ok(input);
+    };
+    let scope = SessionMemoryScope {
+        session_id,
+        actor_id: None,
+    };
+    let Some(memory) = sessions.get(&scope).await else {
+        deps.audit
+            .write(
+                audit_ctx,
+                AuditEvent::MemoryContext {
+                    used_turn_count: 0,
+                    dropped_reason: None,
+                },
+            )
+            .await?;
+        input.history.clear();
+        return Ok(input);
+    };
+    match build_session_memory_context(
+        &memory,
+        deps.runtime_config
+            .thresholds
+            .memory
+            .max_memory_context_chars,
+    ) {
+        Some(context) => {
+            deps.audit
+                .write(
+                    audit_ctx,
+                    AuditEvent::MemoryContext {
+                        used_turn_count: memory.recent_turns.len(),
+                        dropped_reason: None,
+                    },
+                )
+                .await?;
+            input.prompt = format!("{context}\n\nCurrent user input:\n{}", input.prompt);
+            input.history.clear();
+        }
+        None => {
+            deps.audit
+                .write(
+                    audit_ctx,
+                    AuditEvent::MemoryContext {
+                        used_turn_count: 0,
+                        dropped_reason: Some("budget_exhausted".into()),
+                    },
+                )
+                .await?;
+            input.history.clear();
+        }
+    }
+    Ok(input)
+}
+
+async fn append_memory_turn_if_enabled(
+    input: &AgentTurnInput,
+    sessions: Option<&dyn SessionMemoryStore>,
+    normalized: &NormalizedInput,
+    response: &str,
+) -> RuntimeResult<()> {
+    let Some(session_id) = input.session_id.as_ref() else {
+        return Ok(());
+    };
+    let Some(sessions) = sessions else {
+        return Ok(());
+    };
+    let scope = SessionMemoryScope {
+        session_id: session_id.clone(),
+        actor_id: None,
+    };
+    sessions
+        .append_turn(
+            &scope,
+            SessionMemoryTurn {
+                turn_id: input.request_id.to_string(),
+                user_summary: memory_user_summary(&input.prompt),
+                answer_summary: response.to_string(),
+                intent: Some(normalized.intent.clone()),
+                metric: normalized.slots.metric.clone(),
+                asset: normalized.slots.asset.clone(),
+                time_range_label: normalized.slots.time_range.clone(),
+                option_id: input.option_id.clone(),
+                created_at_ms: now_ms(),
+            },
+        )
+        .await;
+    Ok(())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn memory_user_summary(prompt: &str) -> String {
+    prompt
+        .rsplit_once("Current user input:\n")
+        .map(|(_, current)| current.to_string())
+        .unwrap_or_else(|| prompt.to_string())
 }
 
 fn llm_event_to_turn_frame(event: LlmEvent) -> AgentTurnFrame {
@@ -365,8 +500,12 @@ mod tests {
 
     use super::*;
     use crate::config::AppConfig;
+    use crate::model::History;
     use crate::runtime::audit::{AuditFailurePolicy, AuditRecord, AuditSink};
     use crate::runtime::guardrails::answer_policy::RuleAnswerPolicy;
+    use crate::runtime::memory::store::{
+        InMemorySessionStore, SessionMemoryStore, SessionMemoryTurn,
+    };
     use crate::runtime::registry::BuiltinRegistry;
 
     #[test]
@@ -417,15 +556,17 @@ mod tests {
     struct FakeAgentPort {
         frames: Vec<AgentTurnFrame>,
         calls: Arc<Mutex<usize>>,
+        last_input: Arc<Mutex<Option<AgentTurnInput>>>,
     }
 
     #[async_trait]
     impl AgentPort for FakeAgentPort {
         async fn stream_turn(
             &self,
-            _input: AgentTurnInput,
+            input: AgentTurnInput,
         ) -> RuntimeResult<BoxStream<'static, AgentTurnFrame>> {
             *self.calls.lock().await += 1;
+            *self.last_input.lock().await = Some(input);
             Ok(stream::iter(self.frames.clone()).boxed())
         }
     }
@@ -443,6 +584,22 @@ mod tests {
                 .await
                 .push(AuditRecord::from_event(ctx, seq, event));
             Ok(())
+        }
+    }
+
+    struct FakeNormalizer {
+        calls: Arc<Mutex<usize>>,
+        intent: String,
+        confidence: f32,
+    }
+
+    #[async_trait]
+    impl LlmInputNormalizer for FakeNormalizer {
+        async fn normalize(&self, mut input: NormalizedInput) -> RuntimeResult<NormalizedInput> {
+            *self.calls.lock().await += 1;
+            input.intent = self.intent.clone();
+            input.confidence = self.confidence;
+            Ok(input)
         }
     }
 
@@ -484,6 +641,7 @@ mod tests {
         let agent = FakeAgentPort {
             frames,
             calls: calls.clone(),
+            last_input: Arc::new(Mutex::new(None)),
         };
         let audit_sink = Arc::new(CapturingAuditSink::default());
         let audit = AuditWriter::new(audit_sink.clone(), AuditFailurePolicy::FailClosed);
@@ -494,6 +652,8 @@ mod tests {
                 runtime_config: &cfg,
                 input_pipeline: &pipeline,
                 answer_policy: &policy,
+                llm_normalizer: None,
+                sessions: None,
                 agent: &agent,
                 audit: &audit,
             },
@@ -501,6 +661,86 @@ mod tests {
         .await
         .expect("turn should run");
         (outcome, audit_sink, calls)
+    }
+
+    async fn run_with_sessions(
+        input: AgentTurnInput,
+        sessions: Option<&dyn SessionMemoryStore>,
+    ) -> (
+        AgentTurnOutcome,
+        Arc<Mutex<Option<AgentTurnInput>>>,
+        Arc<CapturingAuditSink>,
+    ) {
+        let cfg = runtime_config();
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy;
+        let last_input = Arc::new(Mutex::new(None));
+        let agent = FakeAgentPort {
+            frames: vec![
+                AgentTurnFrame::Token {
+                    data: "answer".into(),
+                },
+                AgentTurnFrame::Done,
+            ],
+            calls: Arc::new(Mutex::new(0)),
+            last_input: last_input.clone(),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink.clone(), AuditFailurePolicy::FailClosed);
+        let outcome = run_agent_turn(
+            input,
+            &audit_ctx(),
+            AgentTurnDeps {
+                runtime_config: &cfg,
+                input_pipeline: &pipeline,
+                answer_policy: &policy,
+                llm_normalizer: None,
+                sessions,
+                agent: &agent,
+                audit: &audit,
+            },
+        )
+        .await
+        .expect("turn should run");
+        (outcome, last_input, audit_sink)
+    }
+
+    async fn run_with_normalizer(
+        input: AgentTurnInput,
+        normalizer: &dyn LlmInputNormalizer,
+    ) -> (AgentTurnOutcome, Arc<Mutex<usize>>) {
+        let cfg = runtime_config();
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy;
+        let calls = Arc::new(Mutex::new(0));
+        let agent = FakeAgentPort {
+            frames: vec![
+                AgentTurnFrame::Token {
+                    data: "answer".into(),
+                },
+                AgentTurnFrame::Done,
+            ],
+            calls: calls.clone(),
+            last_input: Arc::new(Mutex::new(None)),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink, AuditFailurePolicy::FailClosed);
+        let outcome = run_agent_turn(
+            input,
+            &audit_ctx(),
+            AgentTurnDeps {
+                runtime_config: &cfg,
+                input_pipeline: &pipeline,
+                answer_policy: &policy,
+                llm_normalizer: Some(normalizer),
+                sessions: None,
+                agent: &agent,
+                audit: &audit,
+            },
+        )
+        .await
+        .expect("turn should run");
+        (outcome, calls)
     }
 
     #[tokio::test]
@@ -581,6 +821,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_normalizer_not_called_for_high_confidence_input() {
+        let normalizer_calls = Arc::new(Mutex::new(0));
+        let normalizer = FakeNormalizer {
+            calls: normalizer_calls.clone(),
+            intent: "unknown".into(),
+            confidence: 0.99,
+        };
+
+        let (outcome, agent_calls) =
+            run_with_normalizer(turn_input("營收 收入 賺多少"), &normalizer).await;
+
+        assert_eq!(*normalizer_calls.lock().await, 0);
+        assert_eq!(*agent_calls.lock().await, 1);
+        assert!(matches!(
+            outcome,
+            AgentTurnOutcome::Final {
+                intent,
+                ..
+            } if intent == "revenue"
+        ));
+    }
+
+    #[tokio::test]
+    async fn llm_normalizer_can_recover_low_confidence_before_policy() {
+        let normalizer_calls = Arc::new(Mutex::new(0));
+        let normalizer = FakeNormalizer {
+            calls: normalizer_calls.clone(),
+            intent: "revenue".into(),
+            confidence: 0.9,
+        };
+
+        let (outcome, agent_calls) = run_with_normalizer(turn_input("zzzz"), &normalizer).await;
+
+        assert_eq!(*normalizer_calls.lock().await, 1);
+        assert_eq!(*agent_calls.lock().await, 1);
+        assert!(matches!(
+            outcome,
+            AgentTurnOutcome::Final {
+                intent,
+                ..
+            } if intent == "revenue"
+        ));
+    }
+
+    #[tokio::test]
     async fn rejected_request_is_audited() {
         let (outcome, audit, calls) = run_with_fake_agent(turn_input("   "), Vec::new()).await;
 
@@ -654,6 +939,86 @@ mod tests {
             AgentTurnOutcome::Aborted {
                 response: "partial".into(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_disabled_uses_client_history() {
+        let mut input = turn_input("營收 收入 賺多少");
+        input.session_id = Some("s1".into());
+        input.history = vec![History {
+            user_prompt: "previous".into(),
+            model_response: "old answer".into(),
+        }];
+
+        let (_, last_input, _) = run_with_sessions(input, None).await;
+        let sent = last_input
+            .lock()
+            .await
+            .clone()
+            .expect("agent input should be captured");
+
+        assert_eq!(sent.history.len(), 1);
+        assert_eq!(sent.prompt, "營收 收入 賺多少");
+    }
+
+    #[tokio::test]
+    async fn memory_enabled_injects_context_and_clears_upstream_history() {
+        let store = InMemorySessionStore::new(5);
+        let scope = SessionMemoryScope {
+            session_id: "s1".into(),
+            actor_id: None,
+        };
+        store
+            .append_turn(
+                &scope,
+                SessionMemoryTurn {
+                    turn_id: "prior".into(),
+                    user_summary: "上個月營收".into(),
+                    answer_summary: "100 元".into(),
+                    intent: Some("revenue".into()),
+                    metric: Some("revenue".into()),
+                    asset: None,
+                    time_range_label: None,
+                    option_id: None,
+                    created_at_ms: 1,
+                },
+            )
+            .await;
+        let mut input = turn_input("營收 收入 這個月呢");
+        input.session_id = Some("s1".into());
+        input.history = vec![History {
+            user_prompt: "client history".into(),
+            model_response: "should not be sent".into(),
+        }];
+
+        let (_, last_input, audit) = run_with_sessions(input, Some(&store)).await;
+        let sent = last_input
+            .lock()
+            .await
+            .clone()
+            .expect("agent input should be captured");
+
+        assert!(sent.history.is_empty());
+        assert!(sent.prompt.contains("Session memory"));
+        assert!(sent.prompt.contains("上個月營收"));
+        assert!(sent
+            .prompt
+            .ends_with("Current user input:\n營收 收入 這個月呢"));
+        assert!(audit.records.lock().await.iter().any(|record| matches!(
+            record.event,
+            AuditEvent::MemoryContext {
+                used_turn_count: 1,
+                dropped_reason: None
+            }
+        )));
+        let memory = store.get(&scope).await.expect("memory should remain");
+        assert_eq!(
+            memory
+                .recent_turns
+                .last()
+                .map(|turn| turn.user_summary.as_str()),
+            Some("營收 收入 這個月呢")
         );
     }
 }

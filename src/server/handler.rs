@@ -33,6 +33,7 @@ use super::dto::{
 };
 use super::error::AppError;
 use super::AppState;
+use crate::appstate::AppRuntime;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
 use crate::runtime::audit::{AuditCtx, AuditWriter};
@@ -119,16 +120,14 @@ pub async fn agent(
         "agent",
         prompt_len = req.prompt.chars().count(),
         history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
     );
     agent_inner(state, req).instrument(span).await
 }
 
 async fn agent_inner(state: AppState, req: AgentRequest) -> Result<Json<AgentResponse>, AppError> {
-    if state
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.enabled)
-    {
+    if should_use_runtime(state.runtime.as_deref()) {
         return agent_inner_runtime(state, req).await;
     }
 
@@ -188,6 +187,8 @@ async fn agent_inner_runtime(
             runtime_config: &runtime.config,
             input_pipeline: &runtime.input_pipeline,
             answer_policy: runtime.answer_policy.as_ref(),
+            llm_normalizer: runtime.llm_normalizer.as_deref(),
+            sessions: runtime.sessions.as_deref(),
             agent: &agent,
             audit: &audit,
         },
@@ -226,14 +227,12 @@ pub async fn agent_stream(
         "agent-stream",
         prompt_len = req.prompt.chars().count(),
         history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
     );
     let _enter = span.enter();
 
-    if state
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.enabled)
-    {
+    if should_use_runtime(state.runtime.as_deref()) {
         return agent_stream_runtime(state, req).await;
     }
 
@@ -322,6 +321,10 @@ fn stream_frame_from_llm_event(ev: llm_connector::LlmEvent) -> Option<StreamFram
     }
 }
 
+fn should_use_runtime(runtime: Option<&AppRuntime>) -> bool {
+    runtime.is_some_and(|runtime| runtime.enabled)
+}
+
 fn runtime_error_to_app_error(err: crate::runtime::error::RuntimeError) -> AppError {
     match err {
         crate::runtime::error::RuntimeError::InputRequired
@@ -352,6 +355,13 @@ fn runtime_outcome_error(code: String, status: u16) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::config::AppConfig;
+    use crate::runtime::audit::AuditFailurePolicy;
+    use crate::runtime::config::RuntimeConfig;
+    use crate::runtime::input::pipeline::InputPipeline;
+    use crate::runtime::registry::BuiltinRegistry;
 
     #[test]
     fn prompt_validation_rejects_empty_prompt() {
@@ -405,5 +415,44 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn runtime_route_selection_is_default_off_and_flagged_on() {
+        assert!(!should_use_runtime(None));
+
+        let disabled = app_runtime(false);
+        assert!(!should_use_runtime(Some(&disabled)));
+
+        let enabled = app_runtime(true);
+        assert!(should_use_runtime(Some(&enabled)));
+    }
+
+    fn app_runtime(enabled: bool) -> AppRuntime {
+        let app_config = AppConfig::load("config/config.toml").expect("app config should load");
+        let refs = app_config
+            .runtime
+            .expect("runtime refs should be configured");
+        let registry = BuiltinRegistry::default();
+        let config = RuntimeConfig::load(&refs, &registry).expect("runtime config should load");
+        let answer_policy = registry
+            .build_answer_policy(&config)
+            .expect("answer policy should build");
+        let llm_normalizer = registry
+            .build_llm_normalizer(&config)
+            .expect("LLM normalizer should build");
+        let sessions = registry.build_memory(&config).expect("memory should build");
+        let audit_sink = registry.build_audit(&config).expect("audit should build");
+
+        AppRuntime {
+            enabled,
+            config: Arc::new(config),
+            input_pipeline: InputPipeline::default(),
+            answer_policy,
+            llm_normalizer,
+            sessions,
+            audit_sink,
+            audit_failure_policy: AuditFailurePolicy::FailOpen,
+        }
     }
 }

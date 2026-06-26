@@ -94,6 +94,8 @@ pub struct ClassifierTuning {
 pub struct MemoryLimits {
     /// Maximum remembered turns.
     pub max_turns: usize,
+    /// Maximum memory context chars injected into a prompt.
+    pub max_memory_context_chars: usize,
 }
 
 /// Runtime threshold pack.
@@ -376,6 +378,7 @@ mod tests {
         );
         assert!(cfg.thresholds.confidence.answer_normal > cfg.thresholds.confidence.answer_gray);
         assert_eq!(cfg.thresholds.classifier.option_match_confidence, 0.95);
+        assert_eq!(cfg.thresholds.memory.max_memory_context_chars, 1200);
         assert_eq!(cfg.injection.version, 1);
         assert!(cfg.metric_aliases.contains_key("營收"));
         assert!(cfg.asset_allowlist.contains("站點"));

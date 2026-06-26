@@ -31,6 +31,8 @@ use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::guardrails::answer_policy::AnswerPolicy;
 use crate::runtime::input::pipeline::InputPipeline;
+use crate::runtime::llm_normalizer::LlmInputNormalizer;
+use crate::runtime::memory::store::SessionMemoryStore;
 use crate::runtime::registry::BuiltinRegistry;
 
 /// Helper to parse optional env vars with a fallback.
@@ -158,6 +160,10 @@ pub struct AppRuntime {
     pub input_pipeline: InputPipeline,
     /// Answer policy.
     pub answer_policy: Arc<dyn AnswerPolicy>,
+    /// Optional LLM-backed input normalizer.
+    pub llm_normalizer: Option<Arc<dyn LlmInputNormalizer>>,
+    /// Optional server-side session memory store.
+    pub sessions: Option<Arc<dyn SessionMemoryStore>>,
     /// Audit sink.
     pub audit_sink: Arc<dyn AuditSink>,
     /// Audit failure policy.
@@ -243,6 +249,12 @@ fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
     let answer_policy = registry
         .build_answer_policy(&config)
         .context("build runtime answer policy")?;
+    let llm_normalizer = registry
+        .build_llm_normalizer(&config)
+        .context("build runtime LLM normalizer")?;
+    let sessions = registry
+        .build_memory(&config)
+        .context("build runtime session memory")?;
     let audit_sink = registry
         .build_audit(&config)
         .context("build runtime audit sink")?;
@@ -255,6 +267,8 @@ fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
         config: Arc::new(config),
         input_pipeline: InputPipeline::default(),
         answer_policy,
+        llm_normalizer,
+        sessions,
         audit_sink,
     })))
 }
