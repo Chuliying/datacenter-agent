@@ -1,5 +1,7 @@
 # Agent Runtime Rust 移植 — PRD
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/`](../reference/index.md)。本檔為原始移植產出，僅供溯源，不代表目前 contract。
+
 > 來源：本文件由 `to-prd` 依「falcon-client agent-runtime → datacenter-agent」的 brainstorming 對話與兩個 repo 的實際程式碼盤點 **彙整（synthesis）** 而成，未另行訪談。
 > brainstorming 盤點來源：`falcon-client/docs/plans/chief-of-staff-agent-runtime/{capability-layer-map,implementation,notes,tasks}.md`。
 > v1.1.0 依嚴格 review（subagent，2026-06-25）修訂：補上**模組可拔插 registry**、**完整 audit**、**錯誤策略**、**移植缺陷修正**。
@@ -23,7 +25,7 @@
 
 另一邊，`falcon-client` 已用 TypeScript 落地一整套可驗證的 agent-runtime portable core：input engineering（L5）、guardrails（L6，含 prompt-injection 偵測與回答前 answer-policy）、session memory（L12）、redacted audit（L14），並附完整單元測試。但這套能力卡在 Next.js 前端 repo、是 TypeScript，且 intent／詞庫硬綁 EV 充電營運 BI 領域，無法直接服務「機房分析」或其他垂直應用。
 
-兩個 repo 的能力是**互補**的，但中間隔著語言（TS↔Rust）與領域（EV 充電↔通用）兩道牆。集團的目標不是只做一個 bot，而是要把 `datacenter-agent` 變成**可複用、可治理、領域無關的 LLM SaaS runtime 平台**——任何垂直應用（Chief of Staff、datacenter agent、HR/Legal/Finance…）都能靠 config **選擇並組裝**自己的模組與內容，接上同一個 runtime。
+兩個 repo 的能力是**互補**的，但中間隔著語言（TS↔Rust）與領域（EV 充電↔通用）兩道牆。集團的目標是把 `datacenter-agent` 變成**可複用、可治理、領域無關的 LLM SaaS runtime 平台**——任何垂直應用（Chief of Staff、datacenter agent、HR/Legal/Finance…）都能靠 config **選擇並組裝**自己的模組與內容，接上同一個 runtime。
 
 ## 解決方案（Solution）
 

@@ -1,5 +1,7 @@
 # Agent Runtime Rust 移植 — 技術規格（總覽 / 索引）
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md)。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **Story ID**: S-RUNTIME-01 ・ **Spec 版本**: v1.3.0 ・ **對應 PRD**: `docs/agent-runtime-rust-port/prd.md` @ v1.3.0
 
 > 本規格已依分期拆檔，避免單檔過大。本檔為**薄索引 + 全域內容**；各層細節（型別/契約/步驟/測試）見對應分檔。
@@ -29,13 +31,13 @@
 
 ---
 
-## ⚠️ Gate 0 前置檢查結果（manifest 缺口揭露）
+## 注意：Gate 0 前置檢查結果（manifest 缺口揭露）
 
 | 檢查項目 | 結果 |
 |---------|------|
-| Project Manifest（`.agent/project-manifest.md`）| ❌ 不存在 — repo 尚未 onboard 到 shared skills |
-| Guardrails（`.agent/guardrails.md`）| ❌ 不存在 |
-| System Context / Architecture Map | ❌ 無 manifest 指向；改以**實際讀過的程式碼**為依據（非臆測）|
+| Project Manifest（`.agent/project-manifest.md`）| 不存在 — repo 尚未 onboard 到 shared skills |
+| Guardrails（`.agent/guardrails.md`）| 不存在 |
+| System Context / Architecture Map | 無 manifest 指向；改以**實際讀過的程式碼**為依據（非臆測）|
 | API Reference | N/A — 本案不接外部 API，契約即本 repo `dto.rs` + ported TS schema |
 
 **決策（依 spec skill Step 0 選項 c）**：標記 `Architecture Map Missing` risk 並繼續。所有型別/行為依據均來自實際讀取的原始碼，不靠 manifest 推斷。manifest/guardrails 正式 onboarding 列為後續任務（Flow I）。
@@ -156,5 +158,5 @@
 - [x] 有具體測試案例（移植 + Rust 獨有 + eval）
 - [x] 參考既有 in-repo 實作（≥4）
 - [x] 版本歷史已填 v1.2.0
-- [ ] ⚠️ Environment：manifest `environment_rules` 不存在（Gate 0 risk，已揭露）
-- [ ] ⚠️ Tech Research：本輪未跑 `search_web`（純內部移植，行為以 TS 來源為 SSOT；移植缺陷已逐條標非 verbatim）
+- [ ] 注意：Environment：manifest `environment_rules` 不存在（Gate 0 risk，已揭露）
+- [ ] 注意：Tech Research：本輪未跑 `search_web`（純內部移植，行為以 TS 來源為 SSOT；移植缺陷已逐條標非 verbatim）
