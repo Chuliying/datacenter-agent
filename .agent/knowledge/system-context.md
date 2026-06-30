@@ -1,115 +1,66 @@
 # datacenter-agent — System Context
 
-## 專案概述
+> This file is an agent-facing orientation layer, not an independent architecture source.  
+> **Canonical documentation**：[`docs/reference/index.md`](../../docs/reference/index.md)  
+> **Target product + build status**：[`docs/reference/prd.md`](../../docs/reference/prd.md)  
+> **Current implementation contract**：[`docs/reference/spec/spec.md`](../../docs/reference/spec/spec.md)  
+> **Current test evidence/gaps**：[`docs/reference/tests/qa-plan.md`](../../docs/reference/tests/qa-plan.md)
 
-`datacenter-agent` 是一個 Rust 寫的 HTTP analytics API 服務。它透過 MCP（Model Context Protocol）連接到 datacenter 的 MCP server，取得 live 工具，再把工具呼叫轉給 LLM（OpenRouter），讓使用者可以用自然語言查詢資料中心的即時資料。
+## Project
 
-## 技術棧
+`datacenter-agent` is a Rust HTTP analytics API. It connects to a datacenter MCP server with rmcp and uses an OpenRouter/OpenAI-compatible LLM tool-calling loop to answer natural-language questions.
 
-| 層級 | 技術 |
-|---|---|
-| 語言 | Rust (Edition 2021) |
-| HTTP 框架 | axum 0.8 |
-| 非同步執行期 | tokio（multi-thread） |
-| MCP client | rmcp 0.17（HTTP transport） |
-| LLM | async-openai 0.40（OpenRouter API，支援 tool calling） |
-| HTTP client | reqwest 0.13（rustls） |
-| Middleware | tower + tower-http（CORS、tracing、gzip、timeout、rate limit） |
-| 設定 | TOML（`config/config.toml`） + dotenv |
-| CLI | clap 4（derive + env fallback） |
-| Logging | tracing + tracing-subscriber（env-filter） |
-| Allocator | mimalloc |
-| 建置 | Cargo（release: `lto = "fat"`） |
+## Current architecture
 
-## 專案架構
+```text
+main / AppState
+  ├─ MCP client + discovered tools
+  ├─ LLM defaults + immutable PromptBank
+  ├─ bearer token + greeting cache
+  └─ optional AppRuntime (built from config even when runtime routing is disabled)
 
-```
-datacenter-agent/
-├── src/
-│   ├── main.rs              # 啟動流程：CLI 解析 → 載入 config → 連接 MCP → 建立 AppState → 啟動 axum
-│   ├── lib.rs               # lib crate root，re-export 各模組
-│   ├── appstate.rs          # AppState / LlmDefaults / PromptBank / token/url 載入
-│   ├── config.rs            # AppConfig（TOML 反序列化）、prompt 路徑解析
-│   ├── model.rs             # 資料模型（DTO 等）
-│   ├── mcp_client.rs        # McpClient：連線、list_openrouter_tools、handle、shutdown
-│   ├── llm_connector/       # LLM 呼叫邏輯（tool-calling loop、stream）
-│   └── server/
-│       ├── mod.rs           # build_router 組裝 axum Router + middleware
-│       ├── route.rs         # 路由定義（/agent, /agent/stream, /greeting, /health, /ready）
-│       ├── handler.rs       # 路由 handler 實作
-│       ├── auth.rs          # Bearer token 驗證（constant_time_eq，418 on fail）
-│       ├── dto.rs           # Request/Response DTO
-│       ├── error.rs         # 錯誤型別與 IntoResponse
-│       └── greeting.rs      # greeting 背景任務（spawn_greeting_tasks）
-├── config/
-│   ├── config.toml          # 頂層設定，prompt id → Markdown 路徑對應
-│   └── prompt_guide/        # 實際 prompt Markdown 檔案
-│       ├── agent_system.md
-│       ├── greeting_system.md
-│       └── greeting_user.md
-├── tests/                   # 整合測試
-├── docs/                    # 設計文件、migration plan、spec
-├── .agent/                  # AI 開發流程設定
-│   ├── project-manifest.md
-│   ├── guardrails.md
-│   ├── knowledge/           # 本目錄
-│   └── skills/
-│       ├── _shared/         # submodule: agent-playbook
-│       └── project/         # 專案 domain skills
-├── Cargo.toml
-└── .env.example
+axum Router
+  ├─ all five routes require bearer; failure is 418
+  ├─ trace + very-permissive CORS + compression
+  ├─ 120s handler-future timeout + security headers + 64KiB body limit
+  └─ /agent and /agent/stream
+       ├─ legacy llm_connector (default)
+       └─ runtime run_agent_turn (RUNTIME_ENABLED=true/1)
 ```
 
-## 核心設計決策
+The runtime is partial, not a completed config-only platform. Current wiring and maturity are maintained in the [reference root](../../docs/reference/index.md#8-runtime-成熟度總覽).
 
-### MCP 整合
-- 使用 `rmcp` crate 的 HTTP transport（不用 stdio），版本鎖定 0.17 以確保 handshake 相容性
-- 啟動時透過 `list_openrouter_tools()` 取得工具清單，轉為 OpenRouter tool schema 後直接傳給 LLM
-- `DATACENTER_MCP_URL` 指向本地或遠端 MCP server
+## Stack
 
-### 認證
-- 單一 `GLOBAL_TOKEN`，所有非 probe 路由都需要 `Authorization: Bearer <token>`
-- 使用 `constant_time_eq` 防止 timing attack
-- 418 (I'm a teapot) 作為 auth 失敗回應（刻意混淆）
-
-### Prompt 系統
-- `config.toml` 把 prompt id 對應到 Markdown 檔案
-- 所有路徑相對於 `config.toml` 所在目錄，支援 container 掛載
-- 啟動時載入到 `PromptBank`，之後 immutable 共享
-
-### Greeting 系統
-- 啟動時 spawn 3 個背景任務，各自跑完整的 tool-calling loop 產出 data-aware greeting
-- `/greeting` 路由從預先產出的 greeting 中隨機選一個回傳
-
-### Streaming
-- `/agent/stream` 回傳 SSE（Server-Sent Events）token stream
-- `async-stream` + `futures` 實作非同步 streaming
-
-## 環境變數
-
-| 變數 | 說明 |
+| Area | Current dependency |
 |---|---|
-| `OPENROUTER_API_KEY` | OpenRouter API 金鑰 |
-| `OPENROUTER_BASE_URL` | API 基底 URL |
-| `OPENROUTER_MODEL` | 模型名稱（必須支援 tool calling） |
-| `OPENROUTER_APP_URL` | 回報給 OpenRouter 的 app URL |
-| `OPENROUTER_APP_TITLE` | 回報給 OpenRouter 的 app 名稱 |
-| `OPENROUTER_MAX_TOKENS` | LLM 最大 token |
-| `OPENROUTER_TEMPERATURE` | LLM temperature |
-| `DATACENTER_MCP_URL` | MCP server endpoint（含路徑，如 `/mcp`） |
-| `HOST` | 綁定 host（預設 `0.0.0.0`） |
-| `PORT` | 綁定 port（預設 `8080`） |
-| `GLOBAL_TOKEN` | 全域認證 token |
-| `RUST_LOG` | log filter（覆蓋 `--debug`） |
+| Language | Rust 2021 |
+| HTTP / async | axum 0.8.9 / tokio 1.52.3 |
+| MCP | rmcp 0.17.0 HTTP client |
+| LLM | async-openai 0.40.3 / OpenRouter |
+| HTTP client | reqwest 0.13.4 |
+| Middleware | tower / tower-http: trace, CORS, compression, timeout, headers, body limit; **no rate-limit middleware** |
+| Config | TOML + dotenvy |
+| Logging | tracing / tracing-subscriber |
 
-## API Endpoints
+## Important current facts
 
-| Route | 說明 |
-|---|---|
-| `POST /agent` | 一次性 LLM 回答（完整 tool-calling loop） |
-| `POST /agent/stream` | SSE token stream |
-| `GET /greeting` | 隨機預產 greeting |
-| `GET /health` | liveness probe |
-| `GET /ready` | readiness probe |
+- `/health`, `/ready`, `/greeting`, `/agent`, `/agent/stream` all require bearer; `auth::check` has no path exemption.
+- Legacy prompt cap is 2000 chars; runtime EV-pack cap is 4000.
+- Runtime SSE validates inside a spawned task, so structural errors are HTTP 200 + SSE error frame.
+- `InputPipeline` hard-codes normalize→intent→slots and does not dispatch `input_stages`.
+- `InjectionDetector` is validated at startup but is dormant on the request path.
+- Rule answer thresholds 0.5/0.7 are hard-coded.
+- Runtime SSE uses an unbounded channel and has no explicit disconnect cancellation.
+- Memory production scope has `actor_id=None`; audit redaction helper is not applied by stdout sink.
+- Eval can report failures while returning process exit 0.
 
-非 probe 路由均需 Bearer token。
+Do not copy these facts into new planning documents. Link the canonical pages, and update those pages when code changes.
+
+## Environment names
+
+See [`.env.example`](../../.env.example) and `src/appstate.rs`/`src/main.rs` for defaults. Relevant names include `OPENROUTER_*`, `GLOBAL_TOKEN`, `DATACENTER_MCP_URL`, `RUNTIME_ENABLED`, `HOST`, `PORT`, and `RUST_LOG`. Never record secret values in documentation or logs.
+
+## Development boundaries
+
+Read [`.agent/guardrails.md`](../guardrails.md) and [`.agent/project-manifest.md`](../project-manifest.md). Future code work must be derived from the [plan-sync implementation](../artifacts/plan/2026-06-29-runtime-correctness/implementation.md), not inferred from historical migration docs.

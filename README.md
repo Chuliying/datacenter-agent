@@ -7,19 +7,27 @@
 An analytics agent that answers questions about a datacenter by orchestrating an
 LLM against live data with the power of MCP server.
 
+> 📚 **System reference docs** (architecture, every endpoint and module, with source anchors): [`docs/reference/index.md`](docs/reference/index.md).
+
 ## Endpoints
 
 - `/agent`: one-shot answer
-- `/agent/stream`: SSE oken stream
+- `/agent/stream`: SSE token stream
 - `/greeting`: a random pre-generated, data-aware welcome message
 - `/health`: liveness probe
 - `/ready`: readiness probe
 
-All non-probe routes require a bearer token, see Authentication section below.
+All routes, including `/health` and `/ready`, currently require a bearer token. See [the endpoint contract](docs/reference/endpoints/index.md) for middleware and probe caveats.
 
 ## Authentication
 
 A single `GLOBAL_TOKEN` loaded at startup gates every request via an `Authorization: Bearer <token>` header, provides basic safety so the upstream LLM API key won't be abused by some random weirdos.
+
+The current failure response is `418 I'm a teapot`. The target authentication/CORS/probe policy is tracked, with build status, in the [runtime platform PRD](docs/reference/prd.md).
+
+## Runtime status
+
+The config-driven runtime exists but is disabled by default unless `RUNTIME_ENABLED=true` (or `1`). It is currently **partial**: orchestration, policy, memory and audit seams are wired, while configurable stage dispatch, request-path injection detection, reliable SSE cancellation and evaluator gating still have gaps. The [system reference](docs/reference/index.md) is the current implementation truth; the [PRD](docs/reference/prd.md) describes the completed target and marks unfinished requirements.
 
 ## Config & modularized system prompts
 
