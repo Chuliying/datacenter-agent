@@ -146,7 +146,8 @@ pub struct AppState {
     ///
     /// `GET /greeting` picks one at random.
     pub greetings: Arc<Mutex<Vec<String>>>,
-    /// Optional runtime wiring, enabled only when `RUNTIME_ENABLED=true`.
+    /// Runtime wiring. Active by default (cutover); `RUNTIME_ENABLED=false`
+    /// rolls a request back to the legacy direct path.
     pub runtime: Option<Arc<AppRuntime>>,
 }
 
@@ -271,10 +272,18 @@ fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
     })))
 }
 
+/// Resolve the runtime route flag with cutover semantics.
+///
+/// The Rust runtime is now the default streaming authority, so an unset (or
+/// otherwise non-falsey) `RUNTIME_ENABLED` keeps it on. The flag is a rollback
+/// escape hatch: only an explicit `false`/`0` (case- and whitespace-insensitive)
+/// reverts a request to the legacy direct path.
 fn runtime_enabled_from_env(value: Option<&str>) -> bool {
-    value
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false)
+    match value.map(str::trim) {
+        Some("0") => false,
+        Some(rollback) if rollback.eq_ignore_ascii_case("false") => false,
+        _ => true,
+    }
 }
 
 /// Read `GLOBAL_TOKEN` from the environment.
@@ -305,12 +314,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_enabled_env_defaults_off_for_rollback() {
-        for value in [None, Some(""), Some("false"), Some("0"), Some("TRUE ")] {
-            assert!(!runtime_enabled_from_env(value));
-        }
-        for value in [Some("true"), Some("TRUE"), Some("1")] {
+    fn runtime_enabled_env_defaults_on_with_explicit_rollback() {
+        // Cutover default: unset, empty, or any non-falsey value runs the runtime.
+        for value in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("TRUE"),
+            Some("1"),
+            Some("TRUE "),
+        ] {
             assert!(runtime_enabled_from_env(value));
+        }
+        // Rollback escape hatch: only explicit false/0 reverts to the legacy path.
+        for value in [Some("false"), Some("FALSE"), Some(" false "), Some("0")] {
+            assert!(!runtime_enabled_from_env(value));
         }
     }
 }
