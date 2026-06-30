@@ -11,3 +11,10 @@ env
 
 # Archived planning/process docs — kept on disk, out of version control
 docs/archives/
+
+# Local working scratch — never commit
+scratchpad/
+
+# Compose files carry live secrets (API keys, GLOBAL_TOKEN, VPN creds) — keep local-only
+compose*.yaml
+compose*.yml
