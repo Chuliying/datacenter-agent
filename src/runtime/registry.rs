@@ -106,7 +106,7 @@ impl BuiltinRegistry {
     /// Build the configured answer policy.
     pub fn build_answer_policy(&self, cfg: &RuntimeConfig) -> RuntimeResult<Arc<dyn AnswerPolicy>> {
         self.require_answer_policy(&cfg.assembly.answer_policy_backend, "runtime.answer_policy")?;
-        Ok(Arc::new(RuleAnswerPolicy))
+        Ok(Arc::new(RuleAnswerPolicy::new(&cfg.thresholds.confidence)))
     }
 
     /// Build the optional LLM normalizer.

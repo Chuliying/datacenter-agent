@@ -201,8 +201,10 @@ pub struct RuntimeConfig {
     pub thresholds: Thresholds,
     /// Input limits.
     pub input: InputConfig,
-    /// Injection rules.
-    pub injection: InjectionRuleSet,
+    /// Compiled prompt-injection detector. Authoritative source of injection
+    /// rules at runtime; the raw pattern pack is consumed at load and not
+    /// retained, so there is nothing to drift out of sync with.
+    pub injection_detector: InjectionDetector,
     /// Runtime module assembly.
     pub assembly: Assembly,
     /// Ordered input stage ids.
@@ -224,6 +226,9 @@ impl RuntimeConfig {
         let lexicon_pack: LexiconPack = read_toml(&refs.lexicon)?;
         let thresholds: Thresholds = read_toml(&refs.thresholds)?;
         let injection: InjectionRuleSet = read_toml(&refs.injection)?;
+        let injection_detector =
+            InjectionDetector::new(injection.version, injection.patterns.clone())
+                .map_err(|err| RuntimeError::Config(format!("invalid injection pattern: {err}")))?;
         let audit_failure_policy = parse_audit_failure_policy(&refs.audit_failure_policy)?;
 
         let assembly = Assembly {
@@ -251,7 +256,7 @@ impl RuntimeConfig {
             asset_allowlist: lexicon_pack.asset_allowlist,
             input: thresholds.input.clone(),
             thresholds,
-            injection,
+            injection_detector,
             input_stages: assembly.input_stages.clone(),
             assembly,
         };
@@ -290,9 +295,6 @@ impl RuntimeConfig {
                 return Err(RuntimeError::IntentNotAllowed(target.clone()));
             }
         }
-        InjectionDetector::new(self.injection.version, self.injection.patterns.clone())
-            .map_err(|err| RuntimeError::Config(format!("invalid injection pattern: {err}")))?;
-
         for stage in &self.assembly.input_stages {
             registry.require_input_stage(stage, "runtime.pipeline")?;
         }
@@ -379,7 +381,7 @@ mod tests {
         assert!(cfg.thresholds.confidence.answer_normal > cfg.thresholds.confidence.answer_gray);
         assert_eq!(cfg.thresholds.classifier.option_match_confidence, 0.95);
         assert_eq!(cfg.thresholds.memory.max_memory_context_chars, 1200);
-        assert_eq!(cfg.injection.version, 1);
+        assert_eq!(cfg.injection_detector.version(), 1);
         assert!(cfg.metric_aliases.contains_key("營收"));
         assert!(cfg.asset_allowlist.contains("站點"));
     }
@@ -418,14 +420,25 @@ mod tests {
 
     #[test]
     fn rejects_invalid_injection_regex() {
-        let refs = default_runtime_refs();
-        let registry = BuiltinRegistry::default();
-        let mut cfg = RuntimeConfig::load(&refs, &registry).expect("runtime config should load");
-        cfg.injection.patterns.push("(".to_string());
+        // The injection pack is validated at load by compiling the detector;
+        // there is no post-load mutation hook because the raw rules are not
+        // retained. Point the injection ref at a pack with a bad pattern.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let bad_path =
+            std::env::temp_dir().join(format!("runtime-bad-injection-{nanos}-{:?}.toml", std::thread::current().id()));
+        std::fs::write(&bad_path, "version = 1\npatterns = [\"(\"]\n")
+            .expect("temp injection pack should write");
 
-        let err = cfg
-            .validate(&registry)
-            .expect_err("invalid regex should fail");
+        let mut refs = default_runtime_refs();
+        refs.injection = bad_path.clone();
+        let registry = BuiltinRegistry::default();
+
+        let err =
+            RuntimeConfig::load(&refs, &registry).expect_err("invalid injection regex should fail");
+        std::fs::remove_file(&bad_path).ok();
 
         assert!(
             matches!(err, RuntimeError::Config(ref msg) if msg.contains("invalid injection pattern"))

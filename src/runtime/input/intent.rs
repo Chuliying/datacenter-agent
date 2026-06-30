@@ -1,4 +1,4 @@
-//! Intent classification skeleton.
+//! Lexicon + option-path intent classification.
 
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::schema::{IntentSource, RuntimeWarning};

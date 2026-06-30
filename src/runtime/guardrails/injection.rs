@@ -1,4 +1,4 @@
-//! Prompt injection detection skeleton.
+//! Prompt injection detection: versioned regex rule pack.
 
 use regex::Regex;
 
