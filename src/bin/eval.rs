@@ -17,6 +17,7 @@ fn main() {
 
     match run(mode) {
         Ok(report) => {
+            let failed = report.failed;
             println!(
                 "eval completed: passed={}, failed={}, latency_ms={}, tokens={}, refusals={}, fallbacks={}",
                 report.passed,
@@ -31,6 +32,9 @@ fn main() {
             }
             for regression in report.regressions {
                 println!("regression: {regression}");
+            }
+            if failed > 0 {
+                std::process::exit(1);
             }
         }
         Err(err) => {

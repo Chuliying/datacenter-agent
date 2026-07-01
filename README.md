@@ -27,7 +27,7 @@ The current failure response is `418 I'm a teapot`. The target authentication/CO
 
 ## Runtime status
 
-The config-driven runtime is the default streaming authority (cutover); set `RUNTIME_ENABLED=false` (or `0`) to roll a request back to the legacy direct path. Request-path injection detection and config-driven answer thresholds are now wired, while configurable stage dispatch, reliable SSE cancellation and evaluator gating still have gaps. The [system reference](docs/reference/index.md) is the current implementation truth; the [PRD](docs/reference/prd.md) describes the completed target and marks unfinished requirements.
+The config-driven runtime is the default streaming authority (cutover); set `RUNTIME_ENABLED=false` (or `0`) to roll a request back to the legacy direct path. Request-path injection detection, config-driven answer thresholds, and regression exit gating are wired, while configurable stage dispatch, reliable SSE cancellation, and evaluator implementations still have gaps. The [system reference](docs/reference/index.md) is the current implementation truth; the [PRD](docs/reference/prd.md) describes the completed target and marks unfinished requirements.
 
 ## Config & modularized system prompts
 

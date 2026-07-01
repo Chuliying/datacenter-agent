@@ -45,11 +45,11 @@ use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestToolMessageArgs, ChatCompletionTool, ChatCompletionToolChoiceOption,
     ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    FunctionCall, ToolChoiceOptions,
+    FinishReason, FunctionCall, ToolChoiceOptions,
 };
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use super::client::build_client;
 use crate::mcp_client::McpHandle;
@@ -116,6 +116,19 @@ struct ResolvedToolCall {
     arguments: String,
 }
 
+fn tool_calls_are_complete(accum: &BTreeMap<u32, ToolSlot>) -> bool {
+    accum.values().all(|slot| {
+        slot.id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && slot
+                .name
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            && parse_tool_arguments(&slot.arguments).is_ok()
+    })
+}
+
 /// Re-assemble the completed tool calls (drop any chunk that never
 /// received an id + name since it can't be executed).
 fn assemble_tool_calls(accum: BTreeMap<u32, ToolSlot>) -> Vec<ResolvedToolCall> {
@@ -134,15 +147,35 @@ fn assemble_tool_calls(accum: BTreeMap<u32, ToolSlot>) -> Vec<ResolvedToolCall> 
 /// Parsing the tool arguments
 ///
 /// Tool arguments arrive as a JSON *string*, parse to an object.
-fn parse_tool_arguments(args_str: &str) -> serde_json::Map<String, serde_json::Value> {
-    serde_json::from_str(args_str).unwrap_or_else(|e| {
-        warn!(error = %e, "could not parse tool arguments; using empty object");
-        serde_json::Map::new()
-    })
+fn parse_tool_arguments(
+    args_str: &str,
+) -> serde_json::Result<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str(args_str)
 }
 
 fn hash_tool_arguments(args_str: &str) -> String {
     format!("{:x}", Sha256::digest(args_str.as_bytes()))
+}
+
+fn validate_turn_finish(
+    finish_reason: Option<FinishReason>,
+    has_tool_calls: bool,
+) -> Result<bool, &'static str> {
+    match (finish_reason, has_tool_calls) {
+        (Some(FinishReason::Stop), false) => Ok(true),
+        (Some(FinishReason::ToolCalls | FinishReason::FunctionCall), true) => Ok(false),
+        (None, _) => Err("upstream stream ended without a finish reason"),
+        (Some(FinishReason::Length), _) => Err("upstream response truncated at token limit"),
+        (Some(FinishReason::ContentFilter), _) => {
+            Err("upstream response blocked by content filter")
+        }
+        (Some(FinishReason::ToolCalls | FinishReason::FunctionCall), false) => {
+            Err("upstream ended with an incomplete tool call")
+        }
+        (Some(FinishReason::Stop), true) => {
+            Err("upstream returned tool calls with stop finish reason")
+        }
+    }
 }
 
 /// Build one chat-completion request assistant message from streamed turn content and tool calls.
@@ -311,6 +344,7 @@ pub fn agent_stream(
             // Per-turn accumulators: streamed answer text + tool-call chunks.
             let mut content_buf = String::new();
             let mut accum: BTreeMap<u32, ToolSlot> = BTreeMap::new();
+            let mut finish_reason = None;
 
             // Iterate on received frames.
             while let Some(frame) = stream.next().await {
@@ -364,7 +398,8 @@ pub fn agent_stream(
                         }
 
                         // Terminate the accumulation if stream end successfully.
-                        if choice.finish_reason.is_some() {
+                        if let Some(reason) = choice.finish_reason {
+                            finish_reason = Some(reason);
                             break;
                         }
                     }
@@ -377,10 +412,23 @@ pub fn agent_stream(
                 }
             }
 
+            if !tool_calls_are_complete(&accum) {
+                guard.completed = true;
+                yield LlmEvent::Error("upstream ended with an incomplete tool call".to_string());
+                return;
+            }
             let pending_exec = assemble_tool_calls(accum);
+            let is_final = match validate_turn_finish(finish_reason, !pending_exec.is_empty()) {
+                Ok(is_final) => is_final,
+                Err(message) => {
+                    guard.completed = true;
+                    yield LlmEvent::Error(message.to_string());
+                    return;
+                }
+            };
 
             // No tool calls -> the streamed content was the final answer.
-            if pending_exec.is_empty() {
+            if is_final {
                 if !called_any_tool {
                     debug!("model answered without calling any tool (no related tools or history-satisfied)");
                 }
@@ -420,7 +468,15 @@ pub fn agent_stream(
                 };
 
                 // Tool arguments arrive as a JSON *string*, parse to an object.
-                let args = parse_tool_arguments(&tc.arguments);
+                let args = match parse_tool_arguments(&tc.arguments) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        error!(error = %err, tool = %tc.name, "invalid completed tool arguments");
+                        guard.completed = true;
+                        yield LlmEvent::Error("upstream returned invalid tool arguments".to_string());
+                        return;
+                    }
+                };
 
                 // Surface failures back to the model (full error chain) rather than aborting, so
                 // it can self-correct its arguments next turn.
@@ -535,12 +591,11 @@ mod tests {
     #[test]
     fn test_parse_tool_arguments() {
         let valid = "{\"param\": 123}";
-        let parsed = parse_tool_arguments(valid);
+        let parsed = parse_tool_arguments(valid).expect("valid arguments should parse");
         assert_eq!(parsed.get("param"), Some(&serde_json::Value::from(123)));
 
         let invalid = "not a json";
-        let parsed = parse_tool_arguments(invalid);
-        assert!(parsed.is_empty());
+        assert!(parse_tool_arguments(invalid).is_err());
     }
 
     #[test]
@@ -553,6 +608,74 @@ mod tests {
             hash_tool_arguments("{\"param\":123}"),
             hash_tool_arguments("{\"param\":456}")
         );
+    }
+
+    #[test]
+    fn provider_turn_requires_an_explicit_compatible_finish_reason() {
+        assert_eq!(
+            validate_turn_finish(Some(FinishReason::Stop), false),
+            Ok(true)
+        );
+        assert_eq!(
+            validate_turn_finish(Some(FinishReason::ToolCalls), true),
+            Ok(false)
+        );
+        assert!(validate_turn_finish(None, false).is_err());
+        assert!(validate_turn_finish(Some(FinishReason::Length), false).is_err());
+        assert!(validate_turn_finish(Some(FinishReason::ToolCalls), false).is_err());
+    }
+
+    #[test]
+    fn every_streamed_tool_call_must_be_complete() {
+        let mut accum = BTreeMap::new();
+        accum.insert(
+            0,
+            ToolSlot {
+                id: Some("complete".into()),
+                name: Some("query".into()),
+                arguments: "{}".into(),
+            },
+        );
+        accum.insert(
+            1,
+            ToolSlot {
+                id: Some("partial".into()),
+                name: None,
+                arguments: "{".into(),
+            },
+        );
+
+        assert!(!tool_calls_are_complete(&accum));
+    }
+
+    #[test]
+    fn tool_call_with_truncated_arguments_is_incomplete() {
+        let mut accum = BTreeMap::new();
+        accum.insert(
+            0,
+            ToolSlot {
+                id: Some("call".into()),
+                name: Some("query".into()),
+                arguments: "{".into(),
+            },
+        );
+
+        assert!(!tool_calls_are_complete(&accum));
+    }
+
+    #[test]
+    fn tool_call_requires_nonblank_identity() {
+        let mut accum = BTreeMap::new();
+        accum.insert(
+            0,
+            ToolSlot {
+                id: Some(" ".into()),
+                name: Some("query".into()),
+                arguments: "{}".into(),
+            },
+        );
+
+        assert!(!tool_calls_are_complete(&accum));
     }
 
     #[test]

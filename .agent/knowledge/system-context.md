@@ -17,15 +17,15 @@ main / AppState
   ├─ MCP client + discovered tools
   ├─ LLM defaults + immutable PromptBank
   ├─ bearer token + greeting cache
-  └─ optional AppRuntime (built from config even when runtime routing is disabled)
+  └─ optional AppRuntime (built only when runtime routing is active)
 
 axum Router
   ├─ all five routes require bearer; failure is 418
   ├─ trace + very-permissive CORS + compression
   ├─ 120s handler-future timeout + security headers + 64KiB body limit
   └─ /agent and /agent/stream
-       ├─ legacy llm_connector (default)
-       └─ runtime run_agent_turn (RUNTIME_ENABLED=true/1)
+       ├─ runtime run_agent_turn (default)
+       └─ legacy llm_connector (explicit RUNTIME_ENABLED=false/0 rollback)
 ```
 
 The runtime is partial, not a completed config-only platform. Current wiring and maturity are maintained in the [reference root](../../docs/reference/index.md#8-runtime-成熟度總覽).
@@ -48,12 +48,12 @@ The runtime is partial, not a completed config-only platform. Current wiring and
 - `/health`, `/ready`, `/greeting`, `/agent`, `/agent/stream` all require bearer; `auth::check` has no path exemption.
 - Legacy prompt cap is 2000 chars; runtime EV-pack cap is 4000.
 - Runtime SSE validates inside a spawned task, so structural errors are HTTP 200 + SSE error frame.
-- `InputPipeline` hard-codes normalize→intent→slots and does not dispatch `input_stages`.
-- `InjectionDetector` is validated at startup but is dormant on the request path.
-- Rule answer thresholds 0.5/0.7 are hard-coded.
+- `InputPipeline` hard-codes normalize→injection→intent→slots and does not dispatch `input_stages`.
+- `InjectionDetector` runs on requests and memory context; injection refusals are not persisted.
+- Rule answer thresholds come from the runtime confidence config.
 - Runtime SSE uses an unbounded channel and has no explicit disconnect cancellation.
 - Memory production scope has `actor_id=None`; audit redaction helper is not applied by stdout sink.
-- Eval can report failures while returning process exit 0.
+- Eval exits nonzero when a report contains failures.
 
 Do not copy these facts into new planning documents. Link the canonical pages, and update those pages when code changes.
 

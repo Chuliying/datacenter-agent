@@ -17,6 +17,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/datacenter-agent /usr/local/bin/datacenter-agent
+COPY config ./config
 
 USER app
 

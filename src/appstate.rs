@@ -242,9 +242,22 @@ impl AppState {
 }
 
 fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
-    let Some(refs) = app_config.runtime.as_ref() else {
+    let runtime_flag = std::env::var("RUNTIME_ENABLED").ok();
+    build_runtime_for_flag(app_config, runtime_flag.as_deref())
+}
+
+fn build_runtime_for_flag(
+    app_config: &AppConfig,
+    runtime_flag: Option<&str>,
+) -> Result<Option<Arc<AppRuntime>>> {
+    let enabled = runtime_enabled_from_env(runtime_flag);
+    if !enabled {
         return Ok(None);
-    };
+    }
+    let refs = app_config
+        .runtime
+        .as_ref()
+        .context("runtime enabled but [runtime] config missing")?;
     let registry = BuiltinRegistry::default();
     let config = RuntimeConfig::load(refs, &registry).context("load runtime config")?;
     let answer_policy = registry
@@ -259,7 +272,6 @@ fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
     let audit_sink = registry
         .build_audit(&config)
         .context("build runtime audit sink")?;
-    let enabled = runtime_enabled_from_env(std::env::var("RUNTIME_ENABLED").ok().as_deref());
     Ok(Some(Arc::new(AppRuntime {
         enabled,
         audit_failure_policy: config.assembly.audit_failure_policy,
@@ -329,6 +341,34 @@ mod tests {
         // Rollback escape hatch: only explicit false/0 reverts to the legacy path.
         for value in [Some("false"), Some("FALSE"), Some(" false "), Some("0")] {
             assert!(!runtime_enabled_from_env(value));
+        }
+    }
+
+    #[test]
+    fn explicit_rollback_skips_invalid_runtime_config() {
+        let mut app_config = AppConfig::load("config/config.toml").expect("app config should load");
+        app_config
+            .runtime
+            .as_mut()
+            .expect("runtime refs should exist")
+            .intents = app_config.root.join("runtime/missing-intents.toml");
+        let result = build_runtime_for_flag(&app_config, Some("false"));
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn default_cutover_requires_runtime_config() {
+        let mut app_config = AppConfig::load("config/config.toml").expect("app config should load");
+        app_config.runtime = None;
+
+        let result = build_runtime_for_flag(&app_config, None);
+
+        match result {
+            Err(err) => assert!(err
+                .to_string()
+                .contains("runtime enabled but [runtime] config missing")),
+            Ok(_) => panic!("default cutover must not silently fall back to legacy"),
         }
     }
 }

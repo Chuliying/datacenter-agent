@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_route_selection_is_default_off_and_flagged_on() {
+    fn runtime_route_selection_requires_built_enabled_runtime() {
         assert!(!should_use_runtime(None));
 
         let disabled = app_runtime(false);

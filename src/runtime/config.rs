@@ -427,8 +427,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let bad_path =
-            std::env::temp_dir().join(format!("runtime-bad-injection-{nanos}-{:?}.toml", std::thread::current().id()));
+        let bad_path = std::env::temp_dir().join(format!(
+            "runtime-bad-injection-{nanos}-{:?}.toml",
+            std::thread::current().id()
+        ));
         std::fs::write(&bad_path, "version = 1\npatterns = [\"(\"]\n")
             .expect("temp injection pack should write");
 
