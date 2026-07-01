@@ -1,0 +1,21 @@
+[
+  {
+    "id": "revenue-overview",
+    "prompt": "近三個月的整體營收概況如何？",
+    "expected_intent": "revenue",
+    "expected_metric": "revenue"
+  },
+  {
+    "id": "charging-option-path",
+    "prompt": "本月狀況",
+    "option_id": "charging.monthly",
+    "expected_intent": "charging"
+  },
+  {
+    "id": "site-build-ranking",
+    "prompt": "近六個月站點建置 top 5",
+    "expected_intent": "site-build",
+    "expected_asset": "站點",
+    "expected_rank_limit": 5
+  }
+]

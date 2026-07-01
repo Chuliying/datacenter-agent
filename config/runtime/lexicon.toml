@@ -1,0 +1,15 @@
+# EV Chief-of-Staff runtime lexicon pack.
+
+asset_allowlist = [
+  "站點",
+  "場站",
+  "充電樁",
+  "充電槍",
+]
+
+[metric_aliases]
+"營收" = "revenue"
+"收入" = "revenue"
+"充電量" = "energy"
+"度數" = "energy"
+"利用率" = "utilization"

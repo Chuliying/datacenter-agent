@@ -1,0 +1,14 @@
+skill: qa
+stage: qa
+created_at: "2026-06-30T11:40:46+08:00"
+status: validated
+primary_output: qa-report.md
+inputs:
+  - docs/agent-runtime-rust-port/prd.md
+  - docs/agent-runtime-rust-port/spec/spec-02-input.md
+  - docs/agent-runtime-rust-port/qa/qa-plan.md
+  - src/runtime/input/pipeline.rs
+  - src/runtime/orchestrator.rs
+  - src/server/handler.rs
+  - /Users/liying.chu/falcon-client/src/app/api/chief-of-staff/nodes/stream/route.ts
+  - /Users/liying.chu/falcon-client/src/app/api/chief-of-staff/nodes/route.ts

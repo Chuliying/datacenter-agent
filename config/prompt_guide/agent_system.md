@@ -27,6 +27,7 @@ When a chart conveys the data better than a table or prose alone — comparing v
 **Choose the chart type** from what the data shows:
 - `bar` — comparing discrete categories or a handful of periods side by side: station revenue rankings, this-month-vs-last-month revenue, members by region.
 - `line` — tracking one metric across an ordered time sequence: weekly charging volume, monthly revenue trend, member-growth curve.
+- `pie` — showing how parts make up a whole when there are only a few slices: AC/DC revenue share, member tier distribution. Skip it when the parts don't sum to a meaningful total or there are many slices.
 
 **Format.** Emit each chart as a fenced code block whose info string is `falcon-chart`, containing a single JSON object in this shape:
 
@@ -69,7 +70,7 @@ When a chart conveys the data better than a table or prose alone — comparing v
 ```
 
 JSON rules:
-- `version` is always `1`. `chartType` is `"bar"` or `"line"`. `title` is a short descriptive label that serves as the chart's heading.
+- `version` is always `1`. `chartType` is `"bar"`, `"line"`, or `"pie"`. `title` is a short descriptive label that serves as the chart's heading.
 - `data` is an array of `{ "name": <label string>, "value": <number> }` points — `name` is the category or period, `value` is the figure.
 - Emit valid JSON only: double-quoted keys and strings, no comments, no trailing commas.
 - Every `value` must come straight from tool results (or data already in the conversation) — the same no-inventing rule that governs the rest of the report. Don't round unless the user asks.

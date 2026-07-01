@@ -1,0 +1,8 @@
+# Runtime injection rule pack placeholder.
+
+version = 1
+patterns = [
+  "(?i)ignore\\s+(all\\s+)?previous\\s+instructions",
+  "(?i)system\\s+prompt",
+  "忽略(所有|先前|以上)?指令",
+]

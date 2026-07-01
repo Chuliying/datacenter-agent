@@ -1,3 +1,13 @@
 target/
+.git/
+.agent/
+.agents/
+.claude/
+.codex/
 .DS_Store
 .env
+.env.*
+env
+compose*.yaml
+compose*.yml
+scratchpad/

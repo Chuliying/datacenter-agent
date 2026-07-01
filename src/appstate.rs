@@ -27,6 +27,13 @@ use tokio::sync::Mutex;
 use crate::config::AppConfig;
 use crate::mcp_client::McpHandle;
 use crate::model::{GenerationConfig, History};
+use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
+use crate::runtime::config::RuntimeConfig;
+use crate::runtime::guardrails::answer_policy::AnswerPolicy;
+use crate::runtime::input::pipeline::InputPipeline;
+use crate::runtime::llm_normalizer::LlmInputNormalizer;
+use crate::runtime::memory::store::SessionMemoryStore;
+use crate::runtime::registry::BuiltinRegistry;
 
 /// Helper to parse optional env vars with a fallback.
 fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -139,10 +146,34 @@ pub struct AppState {
     ///
     /// `GET /greeting` picks one at random.
     pub greetings: Arc<Mutex<Vec<String>>>,
+    /// Runtime wiring. Active by default (cutover); `RUNTIME_ENABLED=false`
+    /// rolls a request back to the legacy direct path.
+    pub runtime: Option<Arc<AppRuntime>>,
+}
+
+/// Runtime dependencies assembled at boot.
+pub struct AppRuntime {
+    /// Whether runtime route wiring is enabled.
+    pub enabled: bool,
+    /// Runtime configuration.
+    pub config: Arc<RuntimeConfig>,
+    /// Deterministic input pipeline.
+    pub input_pipeline: InputPipeline,
+    /// Answer policy.
+    pub answer_policy: Arc<dyn AnswerPolicy>,
+    /// Optional LLM-backed input normalizer.
+    pub llm_normalizer: Option<Arc<dyn LlmInputNormalizer>>,
+    /// Optional server-side session memory store.
+    pub sessions: Option<Arc<dyn SessionMemoryStore>>,
+    /// Audit sink.
+    pub audit_sink: Arc<dyn AuditSink>,
+    /// Audit failure policy.
+    pub audit_failure_policy: AuditFailurePolicy,
 }
 
 impl AppState {
     pub fn new(
+        app_config: &AppConfig,
         mcp: McpHandle,
         tools: Arc<Vec<ChatCompletionTool>>,
         instructions: Arc<Option<String>>,
@@ -154,6 +185,7 @@ impl AppState {
             .timeout(Duration::from_secs(2))
             .build()
             .context("build /ready probe http client")?;
+        let runtime = build_runtime(app_config)?;
         Ok(Self {
             mcp,
             tools,
@@ -163,6 +195,7 @@ impl AppState {
             http,
             auth_token: Arc::new(auth_token),
             greetings: Arc::new(Mutex::new(Vec::new())),
+            runtime,
         })
     }
 
@@ -208,6 +241,83 @@ impl AppState {
     }
 }
 
+fn build_runtime(app_config: &AppConfig) -> Result<Option<Arc<AppRuntime>>> {
+    let runtime_flag = std::env::var("RUNTIME_ENABLED").ok();
+    build_runtime_for_flag(app_config, runtime_flag.as_deref())
+}
+
+fn build_runtime_for_flag(
+    app_config: &AppConfig,
+    runtime_flag: Option<&str>,
+) -> Result<Option<Arc<AppRuntime>>> {
+    let enabled = runtime_enabled_from_env(runtime_flag);
+    if !enabled {
+        return Ok(None);
+    }
+    let refs = app_config
+        .runtime
+        .as_ref()
+        .context("runtime enabled but [runtime] config missing")?;
+    let registry = BuiltinRegistry::default();
+    let config = RuntimeConfig::load(refs, &registry).context("load runtime config")?;
+    let answer_policy = registry
+        .build_answer_policy(&config)
+        .context("build runtime answer policy")?;
+    let llm_normalizer = registry
+        .build_llm_normalizer(&config)
+        .context("build runtime LLM normalizer")?;
+    let sessions = registry
+        .build_memory(&config)
+        .context("build runtime session memory")?;
+    let audit_sink = registry
+        .build_audit(&config)
+        .context("build runtime audit sink")?;
+    Ok(Some(Arc::new(AppRuntime {
+        enabled,
+        audit_failure_policy: config.assembly.audit_failure_policy,
+        config: Arc::new(config),
+        input_pipeline: InputPipeline::default(),
+        answer_policy,
+        llm_normalizer,
+        sessions,
+        audit_sink,
+    })))
+}
+
+/// Recognized rollback (falsey) spellings for `RUNTIME_ENABLED`, matched
+/// case-insensitively after trimming.
+const RUNTIME_DISABLED_VALUES: &[&str] = &["false", "0", "no", "off", "disabled"];
+
+/// Resolve the runtime route flag with cutover semantics.
+///
+/// The Rust runtime is now the default streaming authority, so an unset (or
+/// otherwise unrecognized) `RUNTIME_ENABLED` keeps it on. The flag is a
+/// rollback escape hatch: only an explicit, recognized falsey spelling (see
+/// [`RUNTIME_DISABLED_VALUES`]) reverts a request to the legacy direct path.
+/// An unrecognized non-empty value is almost certainly an operator typo
+/// during an incident, not an intentional value, so it is logged loudly
+/// rather than silently treated as "enabled".
+fn runtime_enabled_from_env(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("") => true,
+        Some(v)
+            if RUNTIME_DISABLED_VALUES
+                .iter()
+                .any(|d| v.eq_ignore_ascii_case(d)) =>
+        {
+            false
+        }
+        Some(v) => {
+            tracing::warn!(
+                value = v,
+                "RUNTIME_ENABLED has an unrecognized value; treating as enabled (not a rollback). \
+                 Expected one of {RUNTIME_DISABLED_VALUES:?} to roll back to the legacy path."
+            );
+            true
+        }
+    }
+}
+
 /// Read `GLOBAL_TOKEN` from the environment.
 ///
 /// Errors out on missing or empty so misconfiguration never silently accepts traffic.
@@ -229,4 +339,76 @@ pub fn load_mcp_url() -> Result<String> {
         anyhow::bail!("env_error: DATACENTER_MCP_URL is empty");
     }
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_enabled_env_defaults_on_with_explicit_rollback() {
+        // Cutover default: unset, empty, or any non-falsey value runs the runtime.
+        for value in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("TRUE"),
+            Some("1"),
+            Some("TRUE "),
+        ] {
+            assert!(runtime_enabled_from_env(value));
+        }
+        // Rollback escape hatch: recognized falsey spellings revert to the legacy path.
+        for value in [
+            Some("false"),
+            Some("FALSE"),
+            Some(" false "),
+            Some("0"),
+            Some("no"),
+            Some("off"),
+            Some("disabled"),
+            Some("OFF"),
+        ] {
+            assert!(!runtime_enabled_from_env(value));
+        }
+    }
+
+    #[test]
+    fn runtime_enabled_env_treats_unrecognized_typo_as_enabled_not_rollback() {
+        // An operator typo during an incident (e.g. "flase") must not be
+        // mistaken for a successful rollback: it stays enabled (loudly
+        // logged), rather than silently disabling the runtime OR silently
+        // staying enabled with no signal that the rollback failed.
+        for value in [Some("flase"), Some("nope"), Some("disable")] {
+            assert!(runtime_enabled_from_env(value));
+        }
+    }
+
+    #[test]
+    fn explicit_rollback_skips_invalid_runtime_config() {
+        let mut app_config = AppConfig::load("config/config.toml").expect("app config should load");
+        app_config
+            .runtime
+            .as_mut()
+            .expect("runtime refs should exist")
+            .intents = app_config.root.join("runtime/missing-intents.toml");
+        let result = build_runtime_for_flag(&app_config, Some("false"));
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn default_cutover_requires_runtime_config() {
+        let mut app_config = AppConfig::load("config/config.toml").expect("app config should load");
+        app_config.runtime = None;
+
+        let result = build_runtime_for_flag(&app_config, None);
+
+        match result {
+            Err(err) => assert!(err
+                .to_string()
+                .contains("runtime enabled but [runtime] config missing")),
+            Ok(_) => panic!("default cutover must not silently fall back to legacy"),
+        }
+    }
 }
