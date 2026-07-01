@@ -1,24 +1,25 @@
 # datacenter-agent 現況測試與 Coverage
 
-**QA 版本**：v1.2.0  
-**對應 Target PRD**：[`../prd.md`](../prd.md) v1.2.0  
-**對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.2.0  
+**QA 版本**：v1.3.0
+**對應 Target PRD**：[`../prd.md`](../prd.md) v1.3.0
+**對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.3.0
 **狀態**：Current test inventory；不是未實作測試的完成聲明  
 **Source**：[`src/**` module tests](../../../src/lib.rs)、[`tests/runtime_contract.rs`](../../../tests/runtime_contract.rs)、[`tests/llm_connector.rs`](../../../tests/llm_connector.rs)、[`.github/workflows/runtime.yml`](../../../.github/workflows/runtime.yml)
 
 > 本頁區分「test fn 存在」、「test 被一般 CI 執行」與「test 真正證明某個 production contract」。未覆蓋項目明確列為 gap，不以讀碼或 middleware 名稱冒充測試。
 
-## 1. 2026-06-29 可重現快照
+## 1. 2026-06-30 可重現快照
 
 | Command | Result |
 |---|---|
-| `cargo build --locked` | exit 0 |
-| `cargo clippy --locked --all-targets -- -D warnings` | exit 0 |
-| `cargo test --locked -- --list` | exit 0；80 items |
-| `cargo test --locked` | 78 passed、0 failed、2 ignored |
-| `cargo run --locked --bin eval -- --pipeline-only` | reported passed=3、failed=0；exit 0 |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo check` | exit 0 |
+| `cargo clippy -- -D warnings` | exit 0 |
+| `cargo test` | 92 passed、0 failed、2 ignored |
+| `cargo run --bin eval -- --pipeline-only` | reported passed=3、failed=0；exit 0 |
 | response replay smoke | reported passed=2、failed=0；exit 0 |
-| synthetic failing replay | reported passed=0、failed=1；**仍 exit 0** |
+| synthetic failing replay | `tests/eval_cli.rs` 驗證 reported failed=1 時 process exit nonzero |
+| `docker build -t datacenter-agent:blocker-fix .` + config presence check | exit 0；final image 含 top-level、prompt、runtime config |
 
 兩個 ignored 項目：外部 LLM/MCP live test，以及一個 doc test。一般 `cargo test` 不執行 live test。
 
@@ -38,16 +39,16 @@
 | AC | Current contract | Automated evidence | Coverage verdict |
 |---|---|---|---|
 | AC-001 | legacy cap 2000；runtime cap 4000；runtime SSE error frame | legacy helper test + runtime input_guard 4000/4001/2001 tests | **partial**：沒有 Router-level REST/SSE status test |
-| AC-002 | runtime intent.resolved → token → done | `orchestrator::streams_intent_resolved_then_tokens_then_done` | **partial**：fake AgentPort；不覆蓋真 provider truncation |
-| AC-003 | flag 預設 off；true/1 on；startup 仍載 runtime config | `handler::runtime_route_selection_is_default_off_and_flagged_on`、`appstate::runtime_enabled_env_defaults_off_for_rollback` | **partial**：沒有 invalid config + flag false startup test |
+| AC-002 | runtime intent.resolved → token → done | `orchestrator::streams_intent_resolved_then_tokens_then_done` | **partial**：fake AgentPort；真 provider transport test仍缺 |
+| AC-003 | runtime 預設 on；false/0 rollback 且壞 config 不阻擋 legacy | `appstate::runtime_enabled_env_defaults_on_with_explicit_rollback`、`explicit_rollback_skips_invalid_runtime_config` | **covered at component level** |
 | AC-004 | config 可調部分領域資料/元件，但不是任意 stage dispatch | config/registry tests | **partial**：builder existence 不等於 production request wiring |
 | AC-005 | config 真正 dispatch stages/guardrails/extractors/evaluators | builder/config unit tests | **missing/partial**：stage order ignored、evaluators noop |
-| AC-006 | injection request path + config policy thresholds | detector與consumer isolated unit tests | **missing**：無production warning producer；0.5/0.7硬編 |
+| AC-006 | injection request path + config policy thresholds | pipeline producer、orchestrator refusal/no-upstream/no-memory、policy config tests | **partial**：Router-level REST/SSE與numeric validation仍缺 |
 | AC-007 | trusted actor memory scope與正確summary/budget contract | memory store/context unit tests | **missing/partial**：production actor None、full text、無tenant E2E |
 | AC-008 | central audit redaction與所有terminal audit | audit helper/failure-policy tests | **missing/partial**：redaction無production caller、cancel/aborted terminal缺 |
-| AC-009 | eval failure使process/CI nonzero | synthetic replay reported failed=1 | **failed contract**：process仍exit 0 |
+| AC-009 | eval failure使process/CI nonzero | `tests/eval_cli.rs::reported_regression_exits_nonzero` | **covered** |
 | AC-010 | decided auth/CORS/probe contract | code inspection only | **decision/test gap**：418、very-permissive、無deployment profile |
-| AC-011 | runtime disabled隔離invalid runtime config | env parser/handler branch unit tests | **missing**：AppState仍先load config |
+| AC-011 | runtime disabled隔離invalid runtime config | `appstate::explicit_rollback_skips_invalid_runtime_config` | **covered** |
 | AC-012 | 每個完成claim有contract test與truthful docs | test inventory/doc link review | **partial**：沒有CI-enforcedclaim/status gate |
 | AC-013 | Final LLM 無 MCP/DB/RAG access，只消費 validated Evidence Pack | none | **missing**：current LLM直接持有tools + McpHandle；相關types/modules不存在 |
 
@@ -76,11 +77,12 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 | TC | Source | Evidence boundary |
 |---|---|---|
-| TC-U20 | `injection::versioned_detector_matches_zh_and_en_injection` | detector 單元；**不證明 request wiring** |
-| TC-U21 | `answer_policy::refuses_prompt_injection_warning` | 人工 warning consumer；**不證明 warning producer** |
-| TC-U22 | `answer_policy::refuses_unknown_or_low_confidence_off_scope` | hard-coded policy threshold |
-| TC-U23 | `answer_policy::adds_disclaimer_for_gray_confidence` | hard-coded policy threshold |
-| TC-U24 | `answer_policy::answers_when_confidence_is_clear` | hard-coded policy threshold |
+| TC-U20 | `injection::versioned_detector_matches_zh_and_en_injection` | detector 單元 |
+| TC-U21 | `pipeline::detects_prompt_injection_and_warns` + `orchestrator::prompt_injection_is_refused_without_calling_upstream` | production producer→policy→zero-upstream |
+| TC-U21b | `orchestrator::prompt_injection_refusal_is_not_persisted_to_memory` | rejected attack 不寫 memory |
+| TC-U22 | `answer_policy::refuses_unknown_or_low_confidence_off_scope` | config-backed policy threshold |
+| TC-U23 | `answer_policy::adds_disclaimer_for_gray_confidence` | config-backed policy threshold |
+| TC-U24 | `answer_policy::answers_when_confidence_is_clear` | config-backed policy threshold |
 
 ### 4.3 Config / registry
 
@@ -101,9 +103,10 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | TC-U40 | `memory::store::append_caps_at_max_turns` | turn retention cap |
 | TC-U41 | `memory::store::clear_then_get_is_none` | clear semantics |
 | TC-U42 | `memory::store::key_isolates_by_actor` | store 支援 actor；production actor_id 仍 None |
-| TC-U43 | `memory::context::memory_sanitizes_system_like_content` | 少數固定 phrase |
+| TC-U43 | `memory::context::memory_sanitizes_system_like_content` | detector-based whole-field filtering 基本案例 |
 | TC-U44 | `memory::context::memory_budget_exhausted_drops` | 超限整段 drop，不是 truncate |
 | TC-U45 | `memory::context::memory_injected_on_followup` | context formatting |
+| TC-U46 | `memory::context::memory_sanitizes_every_configured_injection_variant` | memory sanitizer 與 detector 規則一致 |
 
 ### 4.5 Eval / connector utilities
 
@@ -113,15 +116,19 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | TC-U51 | `eval::runner::replay_mode_reads_artifact_without_network` | replay offline |
 | TC-U52 | `eval::runner::replay_mode_reports_response_regressions` | report 計數；不證明 process exit |
 | TC-U53 | 3 個 `eval::baseline` validation tests | baseline schema |
-| TC-U54 | 4 個 `bin/eval` parse tests | CLI argument parse；不證明 failed report exit |
+| TC-U54 | 4 個 `bin/eval` parse tests | CLI argument parse |
+| TC-I11 | `tests/eval_cli.rs::reported_regression_exits_nonzero` | failed report 的 process exit contract |
+| TC-I12 | `tests/deployment_contract.rs::dockerfile_runtime_stage_copies_default_config_tree` | final runtime stage 的 COPY/CMD 與 source config tree 靜態契約；另有 local image build evidence |
 | TC-U55 | 3 個 `llm_connector::agent` assemble/parse/hash tests | utility functions |
+| TC-U56 | `llm_connector::agent` finish/tool completeness tests | finish reason、truncated JSON、blank identity、partial multi-call classification；helpers 接 production loop |
 
 ### 4.6 Handler / orchestrator / public contract
 
 | TC | Source | Evidence boundary |
 |---|---|---|
 | TC-U03 | `handler::stream_mapping_preserves_external_sse_events` | legacy event mapping/filter |
-| TC-U04 | `handler::runtime_route_selection_is_default_off_and_flagged_on` | handler branch only |
+| TC-U04 | `handler::runtime_route_selection_requires_built_enabled_runtime` | handler branch selection |
+| TC-U04b | `appstate::runtime_enabled_env_defaults_on_with_explicit_rollback` + `explicit_rollback_skips_invalid_runtime_config` | cutover + startup rollback |
 | TC-U05 | 3 個 `agent_response_*` tests | outcome→REST response |
 | TC-C01 | `handler::turn_event_maps_to_external_stream_frame` | runtime event mapping |
 | TC-I01 | `orchestrator::streams_intent_resolved_then_tokens_then_done` | fake AgentPort ordering |
@@ -142,7 +149,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 |---|---|---|
 | TC-E01 | `tests/llm_connector.rs::live_generates_markdown_via_mcp` | test fn 存在、`#[ignore]`；一般 CI 不執行 |
 | TC-E02 | `scripts/staging-smoke.sh` | script；只檢查基本 response keys/event allowlist，不覆蓋全部 AC |
-| TC-E03 | eval CLI command | command 可跑；因 failed report 仍 exit 0，不能視為可靠 regression gate |
+| TC-E03 | eval CLI command | reported failure exit nonzero；evaluator quality scope仍有限 |
 | TC-B05 | Router middleware reference | 不是 test；body >64 KiB 最終 status 未固定 |
 | TC-CT01 | auth 418 讀碼 | 沒有 HTTP characterization test |
 | TC-CT02 | legacy intent unknown 讀碼/handler mapping | 沒有 Router-level characterization test |
@@ -159,7 +166,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | body >64 KiB | Router rejects before handler; exact final mapping not pinned | none | gap |
 | history omitted | `[]` | crate integration test | covered |
 | memory max turns | oldest removed | store test | covered |
-| provider partial EOF | desired core outcome is Aborted, live adapter may emit Done | fake test only | **correctness gap** |
+| provider partial EOF | missing/incompatible finish reason emits Error | finish-state unit contract；真 transport test缺 | partial |
 | slow/disconnected SSE client | no bounded backpressure/cancel guarantee | none | **reliability gap** |
 
 ## 7. Error matrix
@@ -170,11 +177,11 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | invalid auth | read code only | Router oneshot 418/body/header |
 | upstream error | fake orchestrator test | real LlmAgentPort EOF/transport combinations |
 | off-scope refusal | orchestrator fake | route-level REST/SSE contract |
-| injection refusal | detector + consumer isolated unit tests | production producer and E2E |
-| config invalid | config unit tests | flag false startup behavior |
+| injection refusal | producer→consumer→zero-upstream/no-memory component tests | Router-level REST/SSE |
+| config invalid | config unit tests + flag false invalid-ref startup regression | staging rollback smoke |
 | audit sink fail | fail-open/fail-closed unit tests | handler external mapping |
 | MCP semantic error | none across adapter boundary | `is_error=true` → model/audit outcome |
-| eval regression | runner counts failure | process nonzero exit |
+| eval regression | runner counts failure + process nonzero integration | richer evaluator semantics |
 | Evidence Pack invalid/stale/tampered | none | schema、digest、freshness、classification、citation validation |
 | capability/tool denied | none | gateway allowlist/scope/argument/cost policy與zero-execution assertion |
 | indirect injection in evidence | none | untrusted-data boundary、Prompt Builder escaping/delimiters、Final LLM no-tool isolation |
@@ -186,12 +193,12 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 1. Router oneshot suite：auth scope、418 envelope、JSON rejection、64 KiB、REST/SSE prompt caps。
 2. Runtime SSE lifecycle：bounded backpressure、disconnect cancellation、JoinError、terminal frame。
-3. LLM adapter：EOF without finish reason、explicit finish、transport error、tool-call truncation。
+3. LLM adapter transport integration：EOF without finish reason、explicit finish、transport error、tool-call truncation（finish-state unit contract已有）。
 4. MCP semantic result：`is_error` 保留到 `ToolResult.ok=false` 與 audit。
-5. Runtime startup：flag false + invalid runtime config 的明確產品決策。
-6. Injection request path 與 answer thresholds config wiring（若實作）。
+5. Runtime startup staging smoke：flag false + invalid runtime config。
+6. Injection/answer policy Router-level REST/SSE contract + confidence numeric validation。
 7. Audit redaction、actor extraction、memory tenant isolation。
-8. Eval binary process test：reported failure 必須 nonzero。
+8. Eval evaluator semantics：讓 config IDs 對應真實 evaluator，不以 noop 冒充。
 9. Evidence Pack unit contract：required fields、version、digest、size/token budget、freshness/expiry、classification、partial/conflict states。
 10. Capability Gateway component tests：allowed/denied tool、scope、argument schema、credential non-disclosure、timeout/cost limit、audit。
 11. Prompt Builder golden tests：Skill Package + Evidence Pack + schema + memory deterministic composition，external content明確標untrusted。
@@ -205,14 +212,17 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 目前可誠實宣稱：
 
-- build/clippy/fmt/test 通過。
+- check/clippy/fmt/test 通過（2026-06-30 fresh run）。
 - 所有被 qa-plan 引用的 Rust test fn 都存在。
 - deterministic pipeline/replay smoke 目前無 reported failure。
+- eval reported regression 會使 process nonzero。
+- injection refusal 不呼叫 upstream、不寫 memory，memory sanitizer 使用相同 detector + normalization。
+- 明確 false/0 rollback 可略過損壞的 runtime capability config。
 
 目前不可宣稱：
 
-- eval regression gate 可靠。
-- injection、redaction、config-only pluggability 已 E2E 生效。
+- 完整 config-selected evaluator quality gate 已落地。
+- audit redaction、config-only pluggability 已 E2E 生效。
 - 所有 route status/limits/timeouts 已有 contract test。
 - live LLM/MCP 與 deployment probes 已驗收。
 - Evidence Pack、Capability Gateway、Prompt Builder、Final LLM isolation或Output Validator已實作。

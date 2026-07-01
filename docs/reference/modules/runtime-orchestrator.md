@@ -21,9 +21,9 @@
 
 ## 流程（runtime 模式）
 1. 結構防護 `validate_prompt`（空／超長 → pre-stream `Error`）。此為 orchestrator 的獨立前置步，**不在** input pipeline 內。
-2. [input pipeline](./runtime-input.md) `run_with_config`：實際只跑 `normalize → intent → slots`。注意：config 的 `input_stages = [normalize, input_guard, injection, intent, slots]` 是**宣告性 metadata**，pipeline 目前**未**據其分派；`injection` 偵測未在此執行（見 [guardrails](./runtime-guardrails.md)）。
+2. [input pipeline](./runtime-input.md) `run_with_config`：實際跑 `normalize → injection guard → intent → slots`（`injection` 偵測已接入此階段，命中時附加 `prompt_injection_detected` warning，見 [guardrails](./runtime-guardrails.md)）。注意：config 的 `input_stages` 仍是**宣告性 metadata**，pipeline 目前依然**未**依其動態分派階段順序——順序是寫死的，不是資料驅動的。
 3. 可選 [llm_normalizer](./runtime-llm-normalizer.md) 補強低信心。
-4. [answer policy](./runtime-guardrails.md) 決策：拒絕／提示／放行。
+4. [answer policy](./runtime-guardrails.md) 決策：拒絕／提示／放行。injection warning 會被 answer policy 轉成 `Refuse("prompt_injection")`，在呼叫上游 LLM 前攔截；該類拒絕不會寫入 session memory。
 5. [session memory](./runtime-memory.md) 注入 context。
 6. 經 `AgentPort` 跑 LLM/MCP 迴圈，逐幀 `emit`（`Clear` → 清答案 buffer）。
 7. 回寫 memory + 寫 [audit](./runtime-audit.md) 各決策點。
@@ -33,7 +33,7 @@
 
 ## 已知 terminal gaps
 
-- `LlmAgentPort` 依賴 connector 的 Done/Error；connector natural EOF without finish reason 可能誤 emit Done。
+- `LlmAgentPort` 依賴 connector 的 Done/Error；connector 會把 natural EOF、length/content-filter 與不相容 finish reason 轉成 Error。
 - `stream_agent_response` 收到 frames 全部結束且沒有 terminal frame時回 `Aborted`，但 `Aborted` return path 沒有 completed/failed terminal audit。
 - SSE host drop/disconnect 不會明確取消 producer task。
 - `TurnEvent` 沒有獨立 `Cancelled`/`Aborted` variant。

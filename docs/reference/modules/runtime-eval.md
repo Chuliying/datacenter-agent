@@ -15,6 +15,6 @@
 
 ## CLI exit contract
 
-`run(mode)` 回 Err 時 CLI exit 1。`EvalReport.failed > 0` 時只印 `regression:`，main 正常 return，process exit 0。實測 synthetic replay 可得到 `passed=0, failed=1` 但 exit 0，因此 workflow 的 eval steps 目前不是可靠 regression gate。
+`run(mode)` 回 Err 或 `EvalReport.failed > 0` 時 CLI exit 1。integration test 以 synthetic failing replay 固定 process nonzero，workflow 的 eval steps 可阻擋 reported regression。
 
 目前可宣稱 fixtures/replay mechanics 存在；不可宣稱已實作 LLM judge、grounding 或 hallucination evaluation。Target 見 [PRD FR-010](../prd.md)；工作見 [plan I06](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)。

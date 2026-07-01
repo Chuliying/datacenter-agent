@@ -1,7 +1,7 @@
 # datacenter-agent 現況技術規格
 
-**Spec 版本**：v1.2.0  
-**對應 Target PRD**：[`../prd.md`](../prd.md) v1.2.0  
+**Spec 版本**：v1.3.0
+**對應 Target PRD**：[`../prd.md`](../prd.md) v1.3.0
 **狀態**：Current-state contract  
 **Source**：[`src/server/dto.rs`](../../../src/server/dto.rs)、[`src/server/route.rs`](../../../src/server/route.rs)、[`src/server/handler.rs`](../../../src/server/handler.rs)、[`src/runtime/orchestrator.rs`](../../../src/runtime/orchestrator.rs)、[`src/runtime/config.rs`](../../../src/runtime/config.rs)
 
@@ -14,6 +14,8 @@
 | v1.0.0 | 2026-06-29 | 初版現況快照 | v1.0.0 |
 | v1.1.0 | 2026-06-29 | 校正雙路徑、SSE、runtime wiring 與 failure modes | v1.1.0 |
 | v1.2.0 | 2026-06-29 | 對照 target Capability/Evidence architecture，記錄現況直接 LLM→MCP gap | v1.2.0 |
+| v1.3.0 | 2026-06-30 | 同步 runtime default cutover、rollback-before-config、injection/memory、provider terminal 與 eval process gate | v1.3.0 |
+| v1.3.1 | 2026-07-01 | 全文逐條對照程式碼複核，內容確認與現況一致，無需修正；容器化封裝（`Dockerfile`／`chore(docker)` commit）屬部署範疇，不在本 spec（HTTP/runtime contract）涵蓋範圍內 | v1.3.0 |
 
 ## 1. 系統邊界
 
@@ -25,7 +27,7 @@ HTTP client
       └─ runtime: run_agent_turn → LlmAgentPort → llm_connector → OpenRouter → MCP
 ```
 
-startup 由 `main.rs` 載入 top-level config、連 MCP、建立 AppState、啟動 Router。`AppState::new` 無論 runtime flag 是否開啟，都會在有 runtime refs 時呼叫 `build_runtime` 並載入 runtime config。
+startup 由 `main.rs` 載入 top-level config、連 MCP、建立 AppState、啟動 Router。`AppState::new` 預設組裝 runtime；明確 `RUNTIME_ENABLED=false/0` 時在讀 capability config 前跳過 runtime build。
 
 ## 2. HTTP contract
 
@@ -97,7 +99,7 @@ data: {"event":"error","data":"..."}
 
 ### 3.1 Route selection
 
-`runtime_enabled_from_env` 只把 case-insensitive `true` 或字串 `1` 視為啟用；其他值與未設均為 false。handler 的 `should_use_runtime` 需要 `AppRuntime` 存在且 `enabled=true`。
+`runtime_enabled_from_env` 只有 trim 後 case-insensitive `false` 或字串 `0` 視為 rollback；其他值與未設均啟用 runtime。rollback 時 `AppRuntime` 為 None，handler 走 legacy；runtime enabled 但 top-level `[runtime]` 缺失則 startup fail，不靜默降級。
 
 ### 3.2 Prompt validation
 
@@ -154,20 +156,20 @@ SSE adapter 現況使用 `tokio::sync::mpsc::unbounded_channel` 與 spawned prod
 `InputPipeline::run_with_config` 目前固定呼叫：
 
 ```text
-normalize_text → classify_intent → extract_slots
+normalize_text → injection detector → classify_intent → extract_slots
 ```
 
 `InputPipeline.stages` 與 `RuntimeConfig.assembly.input_stages` 不參與 dispatch。config 可調 intent/lexicon/部分 thresholds，但 time parsing、option mapping 與其他規則仍有 Rust 實作。
 
 ### 4.4 Injection and answer policy
 
-`InjectionDetector` 的 production 使用只發生在 `RuntimeConfig::validate`：建構 detector 以驗證 regex。request pipeline 沒有 detector caller，也沒有 `prompt_injection_detected` warning producer。
+`InjectionDetector` 在 config load 時編譯一次，request pipeline 命中時產生 `prompt_injection_detected` warning；`RuleAnswerPolicy` 拒絕且不呼叫 upstream。injection refusal 不持久化，memory context 也重用同一 detector 過濾。
 
-`RuleAnswerPolicy` 的 consumer 存在，決策門檻是硬編的 `<0.5` refusal、`<0.7` disclaimer。`thresholds.confidence.answer_normal` 另被 orchestrator 用來決定是否呼叫 optional LLM normalizer，但不驅動 RuleAnswerPolicy 本身。
+`RuleAnswerPolicy` 的 refusal/disclaimer thresholds 讀 `thresholds.confidence.answer_gray/answer_normal`；numeric range/order validation 尚未完整。
 
 ### 4.5 Memory
 
-`SessionMemoryScope` 型別支援 `actor_id`，但 production load/append 都傳 None。key 因此實際是 anonymous + client session id。context formatter 對少數 phrase 做 whole-field filtering；總長超過 `max_memory_context_chars` 時回 None，沒有 partial truncation。
+`SessionMemoryScope` 型別支援 `actor_id`，但 production load/append 都傳 None。key 因此實際是 anonymous + client session id。context formatter 以 request normalization + capability `InjectionDetector` 做 whole-field filtering；總長超過 `max_memory_context_chars` 時回 None，沒有 partial truncation。
 
 ### 4.6 Audit
 
@@ -192,7 +194,7 @@ normalize_text → classify_intent → extract_slots
 已知 failure semantics：
 
 - transport stream `Err` 會 emit `LlmEvent::Error`。
-- stream 自然 EOF 且未出現 `finish_reason` 時，程式沒有 terminal flag；若無 pending tool call，仍 emit `Done`。
+- final turn 只接受 `finish_reason=stop`；tool turn 只接受相容的 tool finish + 完整 calls。自然 EOF、length、content filter 或不相容 terminal 都 emit Error。
 - `generate` 若 inner stream 結束且沒收到 Done/Error，仍回 `Ok(out)`。
 - MCP `CallToolResult.is_error=true` 只記 warning，`call_tool_text` 回 `Ok(text)`；caller 因此 emit `ToolResult { ok: true }`。
 
@@ -246,32 +248,32 @@ GenerationConfig + discovered MCP tool schemas
 | response replay | artifact-based deterministic checks |
 | response live | provider-backed；需要明確授權與外部服務 |
 
-`src/bin/eval.rs` 在 `run(mode)` 回 Err 時 exit 1；若 `EvalReport.failed > 0` 則只列印 regression，仍正常 return，process exit 0。
+`src/bin/eval.rs` 在 `run(mode)` 回 Err 或 `EvalReport.failed > 0` 時 exit 1；integration test 以 failing replay 驗證 process status。
 
 ## 9. Current config values
 
 | Key | Value / behavior |
 |---|---|
 | runtime prompt cap | 4000 |
-| answer policy effective thresholds | hard-coded 0.5 / 0.7 |
+| answer policy effective thresholds | config `answer_gray` / `answer_normal`（目前 0.5 / 0.7） |
 | intent allowlist | `unknown`, `revenue`, `charging`, `site-build` |
 | memory max turns | 5 |
 | memory context chars | 1200 |
-| runtime enabled env | `true`/`1`; default false |
+| runtime enabled env | default true；只有明確 `false`/`0` rollback |
 
 ## 10. Verification evidence and gaps
 
-現行 `cargo test -- --list` 可列舉 80 項；一般 `cargo test` 為 78 passed、2 ignored、0 failed（2026-06-29 snapshot）。這不等於所有 HTTP/async failure mode 已被覆蓋。
+2026-06-30 fresh `cargo test` 為 92 passed、2 ignored、0 failed。這不等於所有 HTTP/async failure mode 已被覆蓋。
 
 主要 coverage gaps：
 
 - Router-level auth、body cap、timeout、JSON rejection。
 - runtime SSE validation 的 HTTP status/frame contract。
 - slow consumer、client disconnect、producer cancellation、JoinError。
-- 真 `LlmAgentPort` 的 natural EOF/truncation。
+- 真 provider transport 的 EOF/truncation integration（finish-state unit contract 已有）。
 - MCP `is_error` 到 audit `ok` 的語意。
-- eval process exit code。
-- production injection wiring、redaction、actor/session isolation。
+- eval evaluator quality semantics（process exit gate 已有）。
+- production audit redaction、actor/session isolation。
 - Evidence Pack schema/integrity/freshness/citation、gateway policy、Prompt Builder與 Final LLM dependency isolation。
 
 來源與逐項分類見 [QA 現況](../tests/qa-plan.md)。

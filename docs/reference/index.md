@@ -2,7 +2,7 @@
 
 > **文件類型**：documentation source of truth。PRD 定義完成後的 target state 並逐項標建置狀態；Spec、QA、endpoint 與 module 頁描述目前 worktree。  
 > **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
-> **對應版本**：PRD v1.3.0 · Spec v1.2.0 · QA v1.2.0（2026-06-29）
+> **對應版本**：PRD v1.3.0 · Spec v1.3.0 · QA v1.3.0（2026-06-30）
 
 ## 1. 文件權威與邊界
 
@@ -16,15 +16,15 @@
 
 ## 2. 一句話定位
 
-`datacenter-agent` 是 Rust HTTP API 服務，透過 MCP 連接資料中心工具，使用 OpenRouter/OpenAI-compatible LLM tool-calling 回答自然語言查詢。它同時包含一套**預設關閉、部分 config 驅動的 runtime seam**；目前還不是「只換 config 就能換任意垂直應用」的完整可拔插平台。
+`datacenter-agent` 是 Rust HTTP API 服務，透過 MCP 連接資料中心工具，使用 OpenRouter/OpenAI-compatible LLM tool-calling 回答自然語言查詢。它的**部分 config 驅動 runtime 已成為預設請求權威**；目前還不是「只換 config 就能換任意垂直應用」的完整可拔插平台。
 
 | 項目 | 現況 |
 |---|---|
 | crate / 版本 | `datacenter-agent` `0.1.1` |
 | HTTP / async | axum 0.8.9 · tokio 1.52.3 |
 | MCP / LLM | rmcp 0.17.0 client · async-openai 0.40.3 · OpenRouter |
-| 預設請求路徑 | legacy `llm_connector`；`RUNTIME_ENABLED` 未設或非 `true`/`1` 時使用 |
-| runtime 現況 | partial；orchestrator、memory、audit、answer policy 已接線，stage dispatch、injection、evaluator 等仍不完整 |
+| 預設請求路徑 | runtime `run_agent_turn`；只有明確 `RUNTIME_ENABLED=false/0` 才 rollback 到 legacy |
+| runtime 現況 | partial；orchestrator、memory、audit、injection、answer policy 已接線，stage dispatch 與 evaluator semantics 等仍不完整 |
 
 ## 3. 導覽
 
@@ -44,7 +44,7 @@
 - [`src/main.rs`](../../src/main.rs)：讀 CLI/env/config、連 MCP、建立 AppState/Router、啟動 server。
 - [`src/appstate.rs`](../../src/appstate.rs)：持有 MCP handle、tools、LLM defaults、prompts、auth token、greetings 與 optional `AppRuntime`。
 - [`src/config.rs`](../../src/config.rs)：解析 top-level config 與相對檔案路徑。
-- `AppState::new` 在 top-level config 有 runtime refs 時會先 `build_runtime`；`RUNTIME_ENABLED` 只決定建好的 runtime 是否在 handler 被選用。
+- `AppState::new` 先解析 `RUNTIME_ENABLED`；明確 `false/0` 時跳過 runtime config/build，其他值（含未設）必須有 `[runtime]` 並組裝 `AppRuntime`，缺失則 fail-fast。
 
 ## 5. 維護規則
 

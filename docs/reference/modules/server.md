@@ -11,9 +11,9 @@
 
 | 檔案 | 職責 | 關鍵項 |
 |---|---|---|
-| [`route.rs`](../../../src/server/route.rs) | 路由 + middleware 組裝 | `build_router`；64KiB body cap、120s handler timeout、very-permissive CORS、bearer layer |
+| [`route.rs`](../../../src/server/route.rs) | 路由 + middleware 組裝 | `build_router`；64KiB body cap、120s handler timeout、very-permissive CORS、`TraceLayer`、`CompressionLayer`、nosniff/no-referrer 安全 header、bearer layer |
 | [`handler.rs`](../../../src/server/handler.rs) | 五個 handler | `health` / `ready` / `greeting` / `agent` / `agent_stream`；runtime/legacy 雙路徑 |
-| [`dto.rs`](../../../src/server/dto.rs) | 請求／回應型別 | `AgentRequest` / `AgentResponse` / `StreamFrame` / `GreetingResponse` / `ReadyBody` |
+| [`dto.rs`](../../../src/server/dto.rs) | 請求／回應型別 | `AgentRequest` / `AgentResponse` / `StreamFrame` / `IntentResolvedData` / `GreetingResponse` / `ReadyBody` / `ReadyChecks` |
 | <a id="auth"></a>[`auth.rs`](../../../src/server/auth.rs) | bearer 認證 middleware | `require_bearer`；constant-time 比對；失敗回 `418` |
 | [`error.rs`](../../../src/server/error.rs) | HTTP 錯誤型別 | `AppError` / `ErrorBody` |
 | <a id="greeting"></a>[`greeting.rs`](../../../src/server/greeting.rs) | 開機背景任務 | 跑 greeting prompt 過 tool-calling 迴圈，填 `AppState::greetings` |

@@ -28,8 +28,8 @@ runtime 模式下由 [orchestrator](./runtime-orchestrator.md) 的 `LlmAgentPort
 
 ## Terminal semantics（現況限制）
 
-- provider chunk 有 `finish_reason` 時 inner loop break，無 pending tool call則 emit Done。
-- provider stream自然 EOF、沒有 `finish_reason` 且沒有 pending tool call時，程式目前也 emit Done；partial output 可能被誤判完成。
+- provider final turn 只有明確 `finish_reason=stop` 才 emit Done；tool turn 只接受 `tool_calls`/deprecated `function_call` 且必須組出完整 tool call。
+- natural EOF、`length`、`content_filter`、缺失/不相容 finish reason 都 emit Error，不保存 partial output。
 - `generate` 若 event stream 結束但沒收到 Done/Error，仍 `Ok(out)`。
 - tool call arguments 目前以 raw string寫入 info log；可能含敏感業務資料。
 - MCP semantic error 的 `ok` 問題見 [mcp_client](./mcp-client.md)。

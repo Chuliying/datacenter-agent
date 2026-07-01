@@ -48,7 +48,7 @@
 - client disconnect 會 drop response-side future/JoinHandle；drop JoinHandle 只 detach task，不代表 producer/upstream 被取消。
 - send failure 被忽略，producer 可繼續呼叫 LLM/MCP、memory、audit。
 - 120 秒 Router timeout 只限制 handler 建立 Response 前；不限制後續 SSE body/turn。
-- provider stream natural EOF without finish reason 可能被底層 connector emit 為 Done。
+- provider natural EOF／token-limit truncation 由底層 connector 轉成 Error，不 emit Done。
 - `Aborted` outcome 沒有專屬外部 event；stream 是否已有 terminal frame取決於 upstream frames。
 
 這些是現況限制。PRD 的完成樣貌要求 bounded channel、disconnect cancellation、deadline 與單一 terminal outcome；見 [PRD FR-008](../prd.md) 與 [plan I01](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)。
@@ -67,4 +67,4 @@ curl -N http://localhost:8080/agent/stream \
 - DTO serialization：`tests/runtime_contract.rs`。
 - event mapping：handler module tests。
 - orchestrator ordering：fake `AgentPort` component test。
-- 未覆蓋：Router-level status、slow consumer、disconnect、JoinError、live adapter truncation。
+- 未覆蓋：Router-level status、slow consumer、disconnect、JoinError、真 provider transport truncation。

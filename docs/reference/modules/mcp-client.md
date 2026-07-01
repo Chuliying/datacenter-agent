@@ -15,6 +15,7 @@ datacenter MCP server 的 rmcp **client**：以 HTTP transport 連線、執行 M
 ## 連線設定
 - `DATACENTER_MCP_URL`（環境變數，指向 server 的 `/mcp` 端點）。
 - rmcp 0.17，client-only、HTTP-only transport，版本與 server 對齊。
+- `src/runtime/eval/runner.rs` 的 eval CLI 會**另外獨立建立一條 MCP 連線**（自己呼叫 `McpClient::connect_http` + `server_instructions()`），不透過 `AppState.mcp`；非本文件描述的主連線路徑，需注意兩者設定需保持一致。
 
 ## Tool result semantics
 

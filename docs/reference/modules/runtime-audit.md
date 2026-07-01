@@ -17,7 +17,7 @@
 - `AuditRecord` 保留 raw `session_id` 與 event fields。
 - `StdoutAuditSink` 直接 `serde_json` + `println!`；沒有呼叫 `redact_secrets`。
 - 沒有 preview env gate。
-- injection request path dormant，因此沒有真 injection refusal audit。
+- injection refusal 會留下 `input_normalized`、`refused` 與 terminal `response_completed(status=refused)` audit，且不呼叫 upstream。
 - `Aborted` return path 與 client cancellation 沒有完整 terminal audit contract。
 
 因此目前不能宣稱「每個 audit event 都已 PII hash / secret redacted」。Target 見 [PRD FR-007](../prd.md)；工作見 [plan I05](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)。

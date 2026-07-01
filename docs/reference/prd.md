@@ -3,8 +3,8 @@
 **Story ID**：S-RUNTIME-01  
 **版本**：v1.3.0  
 **狀態**：Target-state product source of truth  
-**對應現況 Spec**：[spec v1.2.0](./spec/spec.md)  
-**對應現況 QA**：[qa v1.2.0](./tests/qa-plan.md)  
+**對應現況 Spec**：[spec v1.3.0](./spec/spec.md)
+**對應現況 QA**：[qa v1.3.0](./tests/qa-plan.md)
 **Source**：產品目標來自本頁；建置狀態以 [`src/`](../../src/lib.rs)、[`config/`](../../config/config.toml) 與 [QA evidence](./tests/qa-plan.md) 驗證
 
 > 本 PRD 描述**全部完成後的產品樣貌**。每條需求都標示目前建置狀態，未完成不代表已上線。現況技術行為以 [Spec](./spec/spec.md) 為準；部分完成／待建置 項目的執行順序以 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 為準。
@@ -102,8 +102,8 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 | 機制可插拔 | registry builder 回傳真正會被 AppState/request path 使用的 component | 部分完成 部分 backend 已接線 |
 | Secure by default | 最小 CORS、標準 bearer、secret-safe log、tenant-safe memory | 部分完成／待建置 |
 | Streaming 可取消 | 有 backpressure、deadline、disconnect cancellation、terminal event | 待建置 |
-| Evidence before claim | CI 對 regression 回 nonzero，QA 區分 unit/contract/live | 部分完成 eval gate 會假綠 |
-| 可回滾 | runtime 關閉時不載入 runtime config，legacy 可獨立開機 | 部分完成 handler 可回滾，startup 不可完整回滾 |
+| Evidence before claim | CI 對 regression 回 nonzero，QA 區分 unit/contract/live | 部分完成 process gate 已生效；evaluator coverage仍有限 |
+| 可回滾 | runtime 關閉時不載入 runtime config，legacy 可獨立開機 | 部分完成 false/0 startup rollback 已接線/測試；staging smoke待補 |
 | 能力隔離 | Final LLM 只做生成；所有 MCP/DB/RAG 存取經 gateway 產出 Evidence Pack | 待建置 現況 Final LLM tool loop 直接持有 MCP tools |
 | 證據可追溯 | 每個可驗證事實能回指 Evidence Pack item/citation/provenance | 待建置 沒有 Evidence Pack/Output Validator |
 
@@ -143,7 +143,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - config validation 防止缺 stage、重複、不合法順序與未知 ID。
 - stage ordering 有 integration tests，不能只測 builder。
 
-現況：request path 硬編 `normalize → intent → slots`；`InputPipeline.stages` 未使用。
+現況：request path 硬編 `normalize → injection → intent → slots`；`InputPipeline.stages` 未使用。
 
 ### FR-004：Guardrails 與 answer policy — 部分完成
 
@@ -154,7 +154,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - refusal/disclaimer/answer thresholds 全部讀 capability config，並驗證 `0 ≤ gray ≤ normal ≤ 1`。
 - 語意拒絕不呼叫 LLM/MCP、不消耗 upstream token，audit 記錄穩定 reason code。
 
-現況：off-scope/low-confidence 已接線；injection 只有 detector/consumer isolated unit tests；policy 的 0.5/0.7 硬編。
+現況：injection/off-scope/low-confidence 都已接入 request path，policy thresholds 讀 capability config；仍缺 REST/SSE Router-level E2E 與 confidence numeric/order validation。
 
 ### FR-005：Config-driven registry — 部分完成
 
@@ -177,7 +177,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - backend 可替換，clear/retention/expiry 行為一致。
 - memory 失敗遵循明確 fail-open/fail-closed policy 並有 audit。
 
-現況：in-memory store 已接線；production `actor_id=None`，保存 full text，sanitizer 與 budget semantics 有限。可信 actor 來源尚需決策。
+現況：in-memory store 已接線；production `actor_id=None` 且保存 full text。injection refusal 不寫 memory，context sanitizer 重用 capability detector；budget 仍是整段 drop。可信 actor 來源尚需決策。
 
 ### FR-007：結構化且去敏的 Audit — 部分完成
 
@@ -213,7 +213,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - MCP `is_error=true` 保留為 semantic failure，模型仍可自我修正，但 `ToolResult.ok=false` 且 audit 真實。
 - 對 client 只回 stable code；完整 upstream chain 去敏後留 server log。
 
-現況：transport error 有處理；natural EOF 可誤報 Done/Ok；MCP semantic error 會被記為 ok=true。
+現況：transport error、natural EOF、length/content-filter 與不相容 finish reason 都不會 emit Done；`generate` 的無 terminal fallback 與 MCP semantic `ok=true` 仍待修。
 
 ### FR-010：可信 Eval / CI gate — 部分完成
 
@@ -225,7 +225,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - CI 同時有 positive 與 intentional-negative process tests，證明 gate 會擋 regression。
 - quality claim 明列 evaluator 類型；沒有 judge 就不能宣稱 grounding/hallucination 已評估。
 
-現況：runner/fixtures/replay/CLI 已有；pipeline-only 只有 3 fixtures；reported failure 仍 exit 0。
+現況：runner/fixtures/replay/CLI 已有，reported failure 會 exit nonzero 並有 process integration test；pipeline-only 仍只有 3 fixtures，registry evaluator 仍是 noop，沒有 LLM judge。
 
 ### FR-011：Authentication、CORS 與 probes — 部分完成／compatibility 待決策
 
@@ -247,7 +247,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - runtime 開啟時 fail-fast 驗證全部 contract。
 - rollout/rollback 有 startup tests、smoke runbook 與明確 telemetry。
 
-現況：handler 分流預設 off；AppState 仍先 load runtime config，故 startup rollback 不完整。
+現況：runtime 預設開啟；明確 `RUNTIME_ENABLED=false/0` 會在載入 capability config 前跳過 runtime build，且有 invalid-config regression test。staging rollback smoke/telemetry 尚未完成。
 
 ### FR-013：Evidence Pack 與 Final LLM isolation — 待建置
 
@@ -286,11 +286,11 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 | body >64 KiB | 413 | 413 before stream | 待建置 未固定測試/映射 |
 | invalid bearer | 401 + challenge（或 versioned 418 compatibility） | same | 決策中 |
 | upstream transport | 502 stable code | terminal error + cancel | 部分完成 |
-| natural provider truncation | 502/aborted，不回完整成功 | terminal aborted/error | 待建置 |
-| semantic refusal | 200 + intent unknown | refusal token + done，不呼叫上游 | 部分完成 injection 尚未接線 |
+| natural provider truncation | 502/aborted，不回完整成功 | terminal aborted/error | 部分完成 adapter 會 emit error；route/live transport test 缺 |
+| semantic refusal | 200 + intent unknown | refusal token + done，不呼叫上游 | 部分完成 request path 已接線；Router test 缺 |
 | client disconnect | N/A | cancel producer/upstream + audit | 待建置 |
 | turn deadline | 504 | terminal timeout + cancel | 待建置 SSE |
-| invalid runtime config while disabled | legacy 正常 startup | N/A | 待建置 |
+| invalid runtime config while disabled | legacy 正常 startup | N/A | 已完成 false/0 在 config load 前 rollback |
 | capability/tool not allowed | stable policy-denied code；不呼叫 tool | terminal policy error/refusal | 待建置 |
 | evidence empty/stale/oversized/conflicting | typed insufficient-evidence outcome | terminal insufficient-evidence/refusal | 待建置 |
 | Evidence Pack digest/citation invalid | 不呼叫 Final LLM或不發布輸出 | terminal validation error | 待建置 |
@@ -301,15 +301,15 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 |---|---|---|---|---|
 | AC-001 | REST/SSE 共用明確 prompt/body validation contract | 部分完成 | 雙 cap 有單元測試；runtime SSE/body status 缺 | I02 |
 | AC-002 | runtime stream 有 bounded backpressure、cancel、deadline、terminal outcome | 待建置 | 無 lifecycle tests | I01 |
-| AC-003 | provider EOF/finish/tool semantics 不會把 partial 當成功 | 待建置 | fake orchestrator test 不覆蓋 adapter | I03 |
+| AC-003 | provider EOF/finish/tool semantics 不會把 partial 當成功 | 部分完成 | finish-state helper 已接 production；真 provider transport test 缺 | I03 |
 | AC-004 | MCP semantic error 保留 `ok=false` 並正確 audit | 待建置 | `is_error=true` 被轉成 Ok | I03 |
 | AC-005 | config 真正 dispatch input/guardrail/extractor/evaluator | 部分完成 | 多數只 validation metadata | I04 |
-| AC-006 | injection 在 request path 生效且 thresholds 讀 config | 部分完成 | detector/consumer 分離單元測試 | I04 |
+| AC-006 | injection 在 request path 生效且 thresholds 讀 config | 部分完成 | production producer/consumer + no-upstream test 已有；Router E2E/numeric validation 缺 | I04 |
 | AC-007 | memory 綁可信 actor、摘要/budget/sanitize 契約正確 | 部分完成／待決策 | actor None；identity 待決策 | I05 |
 | AC-008 | audit sink central redaction，所有 terminal path 留痕 | 部分完成 | helper 未接線；cancel/aborted 缺口 | I05 |
-| AC-009 | eval reported failure 使 process/CI nonzero | 待建置 | synthetic failed=1 exit 0 | I06 |
+| AC-009 | eval reported failure 使 process/CI nonzero | 已完成 | synthetic failing replay process test 驗證 nonzero | I06 |
 | AC-010 | auth/CORS/probe 符合已決定的 deployment contract | 部分完成／待決策 | 418、very-permissive、無部署檔 | I07 |
-| AC-011 | runtime disabled 時壞 config 不阻擋 legacy startup | 待建置 | config 在讀 flag 前載入 | I08 |
+| AC-011 | runtime disabled 時壞 config 不阻擋 legacy startup | 已完成 | false/0 skip runtime build + invalid refs regression test | I08 |
 | AC-012 | 每個已完成 claim 都有對應 contract test 與 truthful docs | 部分完成 | test fn 存在但多個外部 contract 未覆蓋 | I08 |
 | AC-013 | Final LLM 無 MCP/DB/RAG access；只能消費 versioned Skill Package + validated Evidence Pack，且輸出 citation 可追溯 | 待建置 | current LLM receives tools directly；相關 types/modules 不存在 | I09 |
 

@@ -13,6 +13,8 @@ src/
 ├── appstate.rs        # 程序級共享狀態（見 專案主體）
 ├── config.rs          # 頂層 config.toml 載入（見 專案主體）
 ├── model.rs           # 根層資料模型
+├── bin/
+│   └── eval.rs        # 第二個 binary target：eval CLI（見 eval）
 ├── server/            # → server 模組
 ├── runtime/           # → runtime 各子模組（領域無關核心）
 ├── llm_connector/     # → llm_connector 模組
@@ -32,14 +34,14 @@ src/
 | `orchestrator` | `run_agent_turn`：一個 turn 的編排骨幹 | [orchestrator](./runtime-orchestrator.md) |
 | `input` | 決定性輸入 pipeline（normalize/intent/slots） | [input](./runtime-input.md) |
 | `llm_normalizer` | 可選 LLM-backed 輸入正規化 seam | [llm_normalizer](./runtime-llm-normalizer.md) |
-| `guardrails` | input guard + answer policy；injection detector dormant | [guardrails](./runtime-guardrails.md) |
+| `guardrails` | input guard + injection detector + config-driven answer policy | [guardrails](./runtime-guardrails.md) |
 | `memory` | partial：in-memory session store + context；actor 未接線 | [memory](./runtime-memory.md) |
 | `audit` | partial：事件/sink；production redaction/actor 未接線 | [audit](./runtime-audit.md) |
 | `registry` | partial：部分 config ID → trait object；多組 ID 只驗證 | [registry](./runtime-registry.md) |
 | `config` | 能力包 config 載入 + validate | [config](./runtime-config.md) |
 | `schema` | 共享 runtime 型別 | [schema](./runtime-schema.md) |
 | `error` | runtime 錯誤模型 | [error](./runtime-error.md) |
-| `eval` | partial：pipeline/replay/live runner；gate exit/evaluator 有缺口 | [eval](./runtime-eval.md) |
+| `eval` | partial：pipeline/replay/live runner；process gate 已接線，evaluator semantics 仍有缺口 | [eval](./runtime-eval.md) |
 
 ### 外部連接
 | 模組 | 職責 | 子頁 |

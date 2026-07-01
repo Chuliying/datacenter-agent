@@ -35,13 +35,13 @@
 
 ## Legacy / runtime 差異
 
-| Item | Legacy（default） | Runtime（`RUNTIME_ENABLED=true/1`） |
+| Item | Runtime（default） | Legacy（`RUNTIME_ENABLED=false/0`） |
 |---|---|---|
-| prompt cap | 2000 | `thresholds.input.max_prompt_chars`，目前 4000 |
-| validation | handler `validate_prompt` | orchestrator `validate_prompt` |
-| orchestration | `llm_connector::generate` | `run_agent_turn` with no-op emit |
-| intent | always `unknown` | Final resolved；Refused/Aborted unknown |
-| memory/audit/policy | no | enabled according to runtime config/wiring |
+| prompt cap | `thresholds.input.max_prompt_chars`，目前 4000 | 2000 |
+| validation | orchestrator `validate_prompt` | handler `validate_prompt` |
+| orchestration | `run_agent_turn` with no-op emit | `llm_connector::generate` |
+| intent | Final resolved；Refused/Aborted unknown | always `unknown` |
+| memory/audit/policy | enabled according to runtime config/wiring | no |
 
 ### Runtime outcome mapping
 
@@ -59,7 +59,7 @@
 - malformed/missing JSON 由 `JsonRejection` 統一包成 400。
 - legacy upstream error 的完整 error chain 目前會放進 502 body。
 - runtime structural error 是 stable-ish code；其他 runtime error 可能回 raw error text。
-- provider stream natural EOF 可能被 connector 誤判為成功，詳見 [llm_connector](../modules/llm-connector.md)。
+- provider stream 只有合法且與內容相容的 `finish_reason` 才完成，詳見 [llm_connector](../modules/llm-connector.md)。
 
 ## Example
 
