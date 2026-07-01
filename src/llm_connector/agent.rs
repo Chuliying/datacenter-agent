@@ -146,10 +146,16 @@ fn assemble_tool_calls(accum: BTreeMap<u32, ToolSlot>) -> Vec<ResolvedToolCall> 
 
 /// Parsing the tool arguments
 ///
-/// Tool arguments arrive as a JSON *string*, parse to an object.
+/// Tool arguments arrive as a JSON *string*, parse to an object. A blank
+/// string is how some providers represent "no arguments" for a
+/// zero-parameter tool call (instead of the literal `"{}"`), so treat it as
+/// an empty object rather than a parse failure.
 fn parse_tool_arguments(
     args_str: &str,
 ) -> serde_json::Result<serde_json::Map<String, serde_json::Value>> {
+    if args_str.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
     serde_json::from_str(args_str)
 }
 
@@ -596,6 +602,33 @@ mod tests {
 
         let invalid = "not a json";
         assert!(parse_tool_arguments(invalid).is_err());
+    }
+
+    #[test]
+    fn empty_arguments_parse_as_empty_object() {
+        assert_eq!(
+            parse_tool_arguments("").expect("empty arguments should parse"),
+            serde_json::Map::new()
+        );
+        assert_eq!(
+            parse_tool_arguments("   ").expect("whitespace arguments should parse"),
+            serde_json::Map::new()
+        );
+    }
+
+    #[test]
+    fn zero_argument_tool_call_is_complete() {
+        let mut accum = BTreeMap::new();
+        accum.insert(
+            0,
+            ToolSlot {
+                id: Some("call-1".into()),
+                name: Some("list_reports".into()),
+                arguments: String::new(),
+            },
+        );
+
+        assert!(tool_calls_are_complete(&accum));
     }
 
     #[test]

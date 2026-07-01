@@ -284,17 +284,37 @@ fn build_runtime_for_flag(
     })))
 }
 
+/// Recognized rollback (falsey) spellings for `RUNTIME_ENABLED`, matched
+/// case-insensitively after trimming.
+const RUNTIME_DISABLED_VALUES: &[&str] = &["false", "0", "no", "off", "disabled"];
+
 /// Resolve the runtime route flag with cutover semantics.
 ///
 /// The Rust runtime is now the default streaming authority, so an unset (or
-/// otherwise non-falsey) `RUNTIME_ENABLED` keeps it on. The flag is a rollback
-/// escape hatch: only an explicit `false`/`0` (case- and whitespace-insensitive)
-/// reverts a request to the legacy direct path.
+/// otherwise unrecognized) `RUNTIME_ENABLED` keeps it on. The flag is a
+/// rollback escape hatch: only an explicit, recognized falsey spelling (see
+/// [`RUNTIME_DISABLED_VALUES`]) reverts a request to the legacy direct path.
+/// An unrecognized non-empty value is almost certainly an operator typo
+/// during an incident, not an intentional value, so it is logged loudly
+/// rather than silently treated as "enabled".
 fn runtime_enabled_from_env(value: Option<&str>) -> bool {
     match value.map(str::trim) {
-        Some("0") => false,
-        Some(rollback) if rollback.eq_ignore_ascii_case("false") => false,
-        _ => true,
+        None | Some("") => true,
+        Some(v)
+            if RUNTIME_DISABLED_VALUES
+                .iter()
+                .any(|d| v.eq_ignore_ascii_case(d)) =>
+        {
+            false
+        }
+        Some(v) => {
+            tracing::warn!(
+                value = v,
+                "RUNTIME_ENABLED has an unrecognized value; treating as enabled (not a rollback). \
+                 Expected one of {RUNTIME_DISABLED_VALUES:?} to roll back to the legacy path."
+            );
+            true
+        }
     }
 }
 
@@ -338,9 +358,29 @@ mod tests {
         ] {
             assert!(runtime_enabled_from_env(value));
         }
-        // Rollback escape hatch: only explicit false/0 reverts to the legacy path.
-        for value in [Some("false"), Some("FALSE"), Some(" false "), Some("0")] {
+        // Rollback escape hatch: recognized falsey spellings revert to the legacy path.
+        for value in [
+            Some("false"),
+            Some("FALSE"),
+            Some(" false "),
+            Some("0"),
+            Some("no"),
+            Some("off"),
+            Some("disabled"),
+            Some("OFF"),
+        ] {
             assert!(!runtime_enabled_from_env(value));
+        }
+    }
+
+    #[test]
+    fn runtime_enabled_env_treats_unrecognized_typo_as_enabled_not_rollback() {
+        // An operator typo during an incident (e.g. "flase") must not be
+        // mistaken for a successful rollback: it stays enabled (loudly
+        // logged), rather than silently disabling the runtime OR silently
+        // staying enabled with no signal that the rollback failed.
+        for value in [Some("flase"), Some("nope"), Some("disable")] {
+            assert!(runtime_enabled_from_env(value));
         }
     }
 
