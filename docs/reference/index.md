@@ -35,6 +35,7 @@
 | 現況測試證據 | [tests/qa-plan.md](./tests/qa-plan.md) | 實際 test inventory、來源與 coverage gaps |
 | HTTP API | [endpoints/](./endpoints/index.md) | 路由、認證、limits、REST/SSE 契約 |
 | 內部模組 | [modules/](./modules/index.md) | request-path wiring 與 runtime 成熟度 |
+| Work items | [../work/](../work/index.md) | 變更中的 PRD/spec/QA/交付紀錄；不代表現況 contract |
 | 待改程式 | [implementation.md](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) | 未來工作；不代表目前已完成 |
 
 > 雙路徑差異、request flow、端點契約、runtime 成熟度與已知缺口都由上述 owner 文件單獨維護；本頁只導覽、不複製，避免重複造成漂移。
@@ -49,6 +50,7 @@
 ## 5. 維護規則
 
 - 每個 reference 頁都要有 `Source`，且指向實際檔案或 symbol。
+- Reference 頁只放可重用的 target/current contract；單一變更的過程、PRD/spec/QA 交接放 `docs/work/<slug>/`。
 - 數值契約必須標明適用路徑，禁止只寫「prompt cap 2000」或「所有請求 120s」。
 - 單元測試只證明局部行為；沒有 production call path 時必須標 `dormant`。
 - 程式修改 PR 應同時更新受影響的 reference 與 QA coverage；計劃完成前不可先把未落地行為寫成現況。
