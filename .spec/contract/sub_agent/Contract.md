@@ -82,6 +82,15 @@ maps each `ToolId` to a concrete `Tool` (schema + `target: ArtifactKey` + call i
 one backend**: an MCP-backed tool wraps an `McpHandle` + a tool name. `ToolId` (which *grants*
 a tool) stays distinct from `ArtifactKey` (the *slot* a tool's result fills).
 
+**Multiple MCP servers are supported and require no type change.** The registry is
+backend-agnostic — each `ToolId` binds to its own backend — so different `ToolId`s may be
+backed by *different* MCP servers (or non-MCP backends). Two consequences bind any
+implementation: (a) a tool's name **advertised to the LLM** derives from its canonical
+`ToolId` string, not the raw per-server tool name, so tools never collide across servers
+within an agent's exposed set; and (b) MCP handshake `instructions` are a **per-server**
+concern, so the instructions composed into a `ConfiguredAgent`'s system prompt are those of
+the servers backing *its granted tools* — not one global block.
+
 ### 1.4 Pipelines are first-class, and there may be many
 
 Orchestration is a first-class concept. A **`PipelineConfig`** (`id` + ordered `stages` of
@@ -244,5 +253,7 @@ These are deferred to the [implementation plan](../../plan/sub_agent.md), not to
   providers are per-agent.
 - **Migration** — today's single `GenerationConfig` + shared `McpHandle` → `[llm.default]` +
   registry; the existing `/agent` path → a one-stage pipeline.
+- **Multiple MCP servers** — the config surface for N servers, their connection lifecycle,
+  per-server instruction routing, and `ToolId`-derived tool naming (plan steps 2–3).
 - **Namespace enforcement (future)** — the cheap validator for §2.5.
 - **`ToolId` / `Provider` variants** — expected to grow as tools and providers are added.
