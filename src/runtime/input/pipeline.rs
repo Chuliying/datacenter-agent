@@ -85,6 +85,34 @@ mod tests {
     }
 
     #[test]
+    fn member_growth_prompt_classifies_as_member_and_is_answerable() {
+        let cfg = default_runtime_config();
+        let pipeline = InputPipeline::default();
+
+        let input = pipeline
+            .run_with_config(&cfg, "我們最近會員的成長狀況怎麼樣", None)
+            .expect("pipeline should run");
+
+        assert_eq!(input.intent, "member");
+        assert_eq!(input.intent_source, Some(IntentSource::RuleLexicon));
+        // Must clear the answer_normal gate so the answer policy proceeds
+        // instead of refusing the turn as off-scope.
+        assert!(input.confidence >= cfg.thresholds.confidence.answer_normal);
+    }
+
+    #[test]
+    fn revenue_growth_prompt_stays_on_revenue_not_member() {
+        let cfg = default_runtime_config();
+        let pipeline = InputPipeline::default();
+
+        let input = pipeline
+            .run_with_config(&cfg, "營收成長狀況如何", None)
+            .expect("pipeline should run");
+
+        assert_eq!(input.intent, "revenue");
+    }
+
+    #[test]
     fn text_override_beats_option_path_when_confident() {
         let cfg = default_runtime_config();
         let pipeline = InputPipeline::default();
