@@ -64,6 +64,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/greeting", get(handler::greeting))
         .route("/agent", post(handler::agent))
         .route("/agent/stream", post(handler::agent_stream))
+        .route("/report", post(handler::report))
+        .route("/report/stream", post(handler::report_stream))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

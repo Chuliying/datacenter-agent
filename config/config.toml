@@ -25,14 +25,59 @@ version = 1
 #
 # Currently implemented, good for reference:
 #   * agent_system    — analytics agent system prompt for /agent and /agent/stream.
+#   * report_system   — HTML report generator system prompt for /report and /report/stream.
 #   * greeting_system — greeting system prompt for /greeting.
 #   * greeting_user   — greeting user prompt for /greeting.
 
 [prompts.agent_system]
 file = "prompt_guide/agent_system.md"
 
+[prompts.report_system]
+file = "prompt_guide/report_system.md"
+
 [prompts.greeting_system]
 file = "prompt_guide/greeting_system.md"
 
 [prompts.greeting_user]
 file = "prompt_guide/greeting_user.md"
+
+
+# ──── Runtime capability pack section ───
+# These refs are parsed at boot but not wired into AppState until the
+# runtime route flag work begins.
+
+[runtime]
+intents = "runtime/intents.toml"
+lexicon = "runtime/lexicon.toml"
+thresholds = "runtime/thresholds.toml"
+injection = "runtime/injection.toml"
+
+[runtime.pipeline]
+input_stages = ["normalize", "input_guard", "injection", "intent", "slots"]
+
+[runtime.answer_policy]
+backend = "rule"
+
+[runtime.llm_normalizer]
+enabled = false
+backend = "disabled"
+
+[runtime.memory]
+enabled = true
+backend = "in-memory"
+
+[runtime.audit]
+sink = "stdout"
+failure_policy = "fail-open"
+
+[runtime.guardrails]
+enabled = ["injection", "input_guard", "answer_policy"]
+
+[runtime.slots]
+extractors = ["time_range", "metric", "asset", "rank_limit"]
+
+[runtime.eval]
+pipeline_evaluators = ["pipeline-deterministic"]
+response_evaluators = ["response-baseline", "llm-judge"]
+fixtures = "runtime/evals/inputs.json"
+baseline = "runtime/evals/response-baseline.json"

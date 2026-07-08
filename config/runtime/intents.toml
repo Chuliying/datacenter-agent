@@ -1,0 +1,38 @@
+# EV Chief-of-Staff runtime intent pack.
+
+intent_allowlist = [
+  "unknown",
+  "revenue",
+  "charging",
+  "site-build",
+  "member",
+]
+
+[option_prefixes]
+revenue = "revenue"
+charging = "charging"
+site = "site-build"
+member = "member"
+
+[[intents]]
+id = "unknown"
+keywords = ["未知", "其他"]
+
+[[intents]]
+id = "revenue"
+keywords = ["營收", "收入", "賺多少", "revenue"]
+
+[[intents]]
+id = "charging"
+keywords = ["充電", "度數", "電量", "charging"]
+
+[[intents]]
+id = "site-build"
+keywords = ["建置", "站點", "場站", "site"]
+
+# Membership base — identified by membership-specific vocabulary. Generic
+# growth words (e.g. 成長) are deliberately excluded so revenue-growth phrasing
+# like `營收成長` stays on `revenue` instead of colliding here.
+[[intents]]
+id = "member"
+keywords = ["會員", "會員數", "會員成長", "註冊", "留存", "活躍會員", "membership", "member"]

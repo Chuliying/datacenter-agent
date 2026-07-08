@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 // ──── History ───
 
 /// One previous turn of a conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct History {
     pub user_prompt: String,
     pub model_response: String,
@@ -40,8 +40,8 @@ pub struct History {
 /// - `system` is the fully-resolved system prompt (base prompt + any MCP server
 ///   conventions).
 /// - `history` is replayed as alternating user/assistant turns before the
-/// current `user_prompt`, so the model can answer follow-ups from prior data
-/// without re-fetching.
+///   current `user_prompt`, so the model can answer follow-ups from prior data
+///   without re-fetching.
 ///
 /// ## Warning
 ///

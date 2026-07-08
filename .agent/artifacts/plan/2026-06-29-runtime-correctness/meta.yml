@@ -1,0 +1,11 @@
+skill: plan-sync
+stage: plan
+created_at: 2026-06-29T14:26:00+08:00
+status: validated
+primary_output: implementation.md
+inputs:
+  - docs/reference/prd.md
+  - docs/reference/spec/spec.md
+  - docs/reference/tests/qa-plan.md
+  - scratchpad/codex-global-review-report.md
+  - user-provided Capability/Evidence architecture screenshot (2026-06-29)

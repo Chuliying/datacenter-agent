@@ -1,0 +1,27 @@
+[input]
+max_prompt_chars = 4000
+
+[confidence]
+answer_normal = 0.7
+answer_gray = 0.5
+option_path = 0.95
+llm_override_floor = 0.8
+
+[classifier]
+option_match_confidence = 0.95
+text_override_confidence = 0.90
+unknown_confidence = 0.25
+no_score_floor = 0.20
+ambiguous_confidence = 0.55
+margin_tiers = [
+  { min_margin = 3, confidence = 0.92 },
+  { min_margin = 2, confidence = 0.85 },
+  { min_margin = 1, confidence = 0.72 },
+]
+keyword_long_chars = 4
+keyword_long_weight = 2
+keyword_short_weight = 1
+
+[memory]
+max_turns = 5
+max_memory_context_chars = 1200

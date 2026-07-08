@@ -1,0 +1,8 @@
+# Endpoint mappings
+[endpoints]
+bill_revenue = "starcharger/api/v2/bill_revenue"
+station_revenue_ranking = "starcharger/api/v2/station_revenue_ranking"
+bill_charge = "starcharger/api/v2/bill_charge"
+member_analysis = "starcharger/api/v2/member_analysis"
+business_metrics = "starcharger/api/v2/business_metrics"
+bill_member_analysis = "starcharger/api/v2/bill_member_analysis"

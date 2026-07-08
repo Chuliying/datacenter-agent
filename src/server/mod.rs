@@ -21,5 +21,5 @@ pub mod greeting;
 pub mod handler;
 pub mod route;
 
-pub use route::build_router;
 pub use crate::appstate::AppState;
+pub use route::build_router;
