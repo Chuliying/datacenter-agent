@@ -25,11 +25,15 @@ version = 1
 #
 # Currently implemented, good for reference:
 #   * agent_system    — analytics agent system prompt for /agent and /agent/stream.
+#   * report_system   — HTML report generator system prompt for /report and /report/stream.
 #   * greeting_system — greeting system prompt for /greeting.
 #   * greeting_user   — greeting user prompt for /greeting.
 
 [prompts.agent_system]
 file = "prompt_guide/agent_system.md"
+
+[prompts.report_system]
+file = "prompt_guide/report_system.md"
 
 [prompts.greeting_system]
 file = "prompt_guide/greeting_system.md"

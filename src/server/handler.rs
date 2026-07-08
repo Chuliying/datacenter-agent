@@ -22,7 +22,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, Stream, StreamExt};
 use tracing::{error, instrument, warn, Instrument};
 use uuid::Uuid;
 
@@ -45,6 +45,16 @@ use crate::runtime::schema::AgentTurnInput;
 
 /// Upper bound on the user prompt, in UTF-8 characters.
 pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
+
+/// Output-token ceiling for the report endpoints.
+///
+/// A full self-contained HTML report (design-system CSS + markup + chart
+/// script) far exceeds the chat-sized [`LlmDefaults::max_tokens`] default, so
+/// the `/report` paths raise it. Kept below the 120 s request timeout's
+/// practical generation budget.
+///
+/// [`LlmDefaults::max_tokens`]: crate::appstate::LlmDefaults::max_tokens
+const REPORT_MAX_TOKENS: u32 = 16_384;
 
 /// SSE keep-alive interval.
 ///
@@ -126,22 +136,33 @@ pub async fn agent(
         session_id = req.session_id.as_deref().unwrap_or(""),
         option_id = req.option_id.as_deref().unwrap_or(""),
     );
-    agent_inner(state, req).instrument(span).await
+    if should_use_runtime(state.runtime.as_deref()) {
+        return agent_inner_runtime(state, req).instrument(span).await;
+    }
+    let base_system = state.prompts.agent_system.clone();
+    completion_inner(state, req, base_system, None)
+        .instrument(span)
+        .await
 }
 
-async fn agent_inner(state: AppState, req: AgentRequest) -> Result<Json<AgentResponse>, AppError> {
-    if should_use_runtime(state.runtime.as_deref()) {
-        return agent_inner_runtime(state, req).await;
-    }
-
+/// Shared completion body for the non-streaming JSON endpoints.
+///
+/// `base_system` selects the system prompt (analytics vs report) and
+/// `max_tokens_override` bumps the output ceiling for the report path.
+async fn completion_inner(
+    state: AppState,
+    req: AgentRequest,
+    base_system: String,
+    max_tokens_override: Option<u32>,
+) -> Result<Json<AgentResponse>, AppError> {
     let user_prompt = req.prompt.clone();
-    let cfg = prepare_config(&state, req)?;
+    let cfg = prepare_config(&state, req, &base_system, max_tokens_override)?;
 
     // MCP tool-calling loop
     let md = match llm_connector::generate(cfg, state.tools.clone(), state.mcp.clone()).await {
         Ok(m) => m,
         Err(e) => {
-            error!(error = %e, "agent.llm_failed");
+            error!(error = %e, "completion.llm_failed");
             return Err(AppError::BadGateway(format!("{e:#}")));
         }
     };
@@ -264,7 +285,7 @@ pub async fn agent_stream(
     }
 
     // Prepare configuration
-    let cfg = prepare_config(&state, req)?;
+    let cfg = prepare_config(&state, req, &state.prompts.agent_system, None)?;
 
     // Build SSE stream
     let sse_stream: BoxStream<'static, Result<Event, Infallible>> =
@@ -281,6 +302,74 @@ pub async fn agent_stream(
     Ok(Sse::new(sse_stream)
         .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
         .into_response())
+}
+
+// ──── /report ───
+
+/// HTML report handler.
+///
+/// Mirrors [`agent`] but drives the `report_system` prompt, which produces a
+/// self-contained HTML report wrapped in a `falcon-report` fenced block. The
+/// output ceiling is raised to [`REPORT_MAX_TOKENS`] to fit a full document.
+pub async fn report(
+    State(state): State<AppState>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<AgentResponse>, AppError> {
+    let Json(req) = req?;
+
+    // Prepare logging
+    let span = tracing::info_span!(
+        "report",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+    );
+    let base_system = state.prompts.report_system.clone();
+    completion_inner(state, req, base_system, Some(REPORT_MAX_TOKENS))
+        .instrument(span)
+        .await
+}
+
+// ──── /report/stream ───
+
+/// Server-Sent Events variant of [`report`].
+///
+/// Same wire contract as [`agent_stream`]; the `falcon-report` HTML block
+/// streams token-by-token like any other answer.
+pub async fn report_stream(
+    State(state): State<AppState>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let Json(req) = req?;
+
+    // Prepare logging
+    let span = tracing::info_span!(
+        "report-stream",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+    );
+    let _enter = span.enter();
+
+    // Prepare configuration
+    let cfg = prepare_config(
+        &state,
+        req,
+        &state.prompts.report_system,
+        Some(REPORT_MAX_TOKENS),
+    )?;
+
+    // Build SSE stream
+    let sse_stream: BoxStream<'static, Result<Event, Infallible>> =
+        llm_connector::agent_stream(cfg, state.tools.clone(), state.mcp.clone())
+            .filter_map(|ev| async move {
+                let frame = stream_frame_from_llm_event(ev)?;
+                let event = Event::default()
+                    .json_data(&frame)
+                    .expect("unexpected error: StreamFrame is always valid JSON");
+                Some(Ok::<_, Infallible>(event))
+            })
+            .boxed();
+
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE)))
 }
 
 async fn agent_stream_runtime(state: AppState, req: AgentRequest) -> Result<Response, AppError> {
@@ -381,17 +470,30 @@ fn turn_event_to_stream_frame(event: TurnEvent) -> StreamFrame {
 /// Prepare a [`GenerationConfig`] from the request.
 ///
 /// Validate the request and assemble a [`GenerationConfig`] for the MCP
-/// tool-calling loop.
+/// tool-calling loop. `base_system` selects which system prompt drives the
+/// loop; `max_tokens_override` (when `Some`) raises the output ceiling above
+/// [`LlmDefaults`] for the report path.
 ///
-/// Shared by both `/agent` and `/agent/stream`.
-fn prepare_config(state: &AppState, req: AgentRequest) -> Result<GenerationConfig, AppError> {
+/// Shared by `/agent`, `/agent/stream`, `/report`, and `/report/stream`.
+///
+/// [`LlmDefaults`]: crate::appstate::LlmDefaults
+fn prepare_config(
+    state: &AppState,
+    req: AgentRequest,
+    base_system: &str,
+    max_tokens_override: Option<u32>,
+) -> Result<GenerationConfig, AppError> {
     validate_prompt(&req.prompt)?;
 
     // build config
-    Ok(state.generation_config(&state.prompts.agent_system, req.prompt, req.history))
+    let mut cfg = state.generation_config(base_system, req.prompt, req.history);
+    if let Some(max_tokens) = max_tokens_override {
+        cfg.max_tokens = max_tokens;
+    }
+    Ok(cfg)
 }
 
-/// Validate the current `/agent` prompt contract.
+/// Validate the current prompt contract.
 fn validate_prompt(prompt: &str) -> Result<(), AppError> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {

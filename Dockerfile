@@ -1,27 +1,24 @@
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.91-alpine AS builder
+
+RUN apk add --no-cache musl-dev build-base
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY . .
 
-RUN cargo build --locked --release --bin datacenter-agent
+RUN cargo build --release --bin datacenter-agent
 
-FROM debian:bookworm-slim AS runtime
+RUN strip -s ./target/release/datacenter-agent
 
-RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --create-home app
+FROM scratch
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/datacenter-agent /usr/local/bin/datacenter-agent
-COPY config ./config
-
-USER app
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/target/release/datacenter-agent /app/datacenter-agent
+COPY --from=builder /app/config /app/config
 
 EXPOSE 8080
 
-ENTRYPOINT ["datacenter-agent"]
-CMD ["--config", "config/config.toml"]
+ENTRYPOINT ["/app/datacenter-agent"]
+CMD ["--host", "0.0.0.0", "--port", "8080"]

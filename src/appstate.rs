@@ -93,6 +93,8 @@ impl LlmDefaults {
 pub struct PromptBank {
     /// System prompt for the analytical `/agent` + `/agent/stream` endpoints.
     pub agent_system: String,
+    /// System prompt for the HTML report `/report` + `/report/stream` endpoints.
+    pub report_system: String,
     /// System prompt for the greeting generator.
     pub greeting_system: String,
     /// User-side stub passed alongside `greeting_system`.
@@ -104,11 +106,12 @@ impl PromptBank {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if any of `agent_system`, `greeting_system`, or
-    /// `greeting_user` is missing from the loaded config.
+    /// Returns `Err` if any of `agent_system`, `report_system`,
+    /// `greeting_system`, or `greeting_user` is missing from the loaded config.
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
+            report_system: cfg.get_prompt_by_id("report_system")?.to_string(),
             greeting_system: cfg.get_prompt_by_id("greeting_system")?.to_string(),
             greeting_user: cfg.get_prompt_by_id("greeting_user")?.to_string(),
         })
