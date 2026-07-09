@@ -119,7 +119,7 @@ struct RuntimeManifest {
     /// Runtime injection config path.
     injection: PathBuf,
     /// Runtime input pipeline assembly.
-    pipeline: RuntimePipelineManifest,
+    input: RuntimeInputManifest,
     /// Runtime answer policy assembly.
     answer_policy: RuntimeAnswerPolicyManifest,
     /// Optional LLM normalizer assembly.
@@ -138,7 +138,7 @@ struct RuntimeManifest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimePipelineManifest {
+struct RuntimeInputManifest {
     /// Ordered input pipeline stage ids.
     input_stages: Vec<String>,
 }
@@ -269,7 +269,7 @@ impl RuntimeRefs {
             lexicon: resolve_relative(root, &manifest.lexicon),
             thresholds: resolve_relative(root, &manifest.thresholds),
             injection: resolve_relative(root, &manifest.injection),
-            input_stages: manifest.pipeline.input_stages,
+            input_stages: manifest.input.input_stages,
             answer_policy_backend: manifest.answer_policy.backend,
             llm_normalizer_enabled: manifest.llm_normalizer.enabled,
             llm_normalizer_backend: manifest.llm_normalizer.backend,

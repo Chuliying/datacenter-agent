@@ -52,7 +52,7 @@ lexicon = "runtime/lexicon.toml"
 thresholds = "runtime/thresholds.toml"
 injection = "runtime/injection.toml"
 
-[runtime.pipeline]
+[runtime.input]
 input_stages = ["normalize", "input_guard", "injection", "intent", "slots"]
 
 [runtime.answer_policy]

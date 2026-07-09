@@ -98,7 +98,7 @@ impl BuiltinRegistry {
     /// Build configured input stage ids in order.
     pub fn build_input_pipeline(&self, cfg: &RuntimeConfig) -> RuntimeResult<Vec<String>> {
         for stage in &cfg.assembly.input_stages {
-            self.require_input_stage(stage, "runtime.pipeline")?;
+            self.require_input_stage(stage, "runtime.input")?;
         }
         Ok(cfg.assembly.input_stages.clone())
     }

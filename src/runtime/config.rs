@@ -296,7 +296,7 @@ impl RuntimeConfig {
             }
         }
         for stage in &self.assembly.input_stages {
-            registry.require_input_stage(stage, "runtime.pipeline")?;
+            registry.require_input_stage(stage, "runtime.input")?;
         }
         registry.require_answer_policy(
             &self.assembly.answer_policy_backend,
@@ -397,7 +397,7 @@ mod tests {
         assert!(matches!(
             err,
             RuntimeError::UnknownModule { ref id, ref section }
-                if id == "not-registered" && section == "runtime.pipeline"
+                if id == "not-registered" && section == "runtime.input"
         ));
     }
 

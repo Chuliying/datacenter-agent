@@ -1292,7 +1292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_consumes_same_orchestration_with_noop_emit() {
+    async fn rest_consumes_same_turn_with_noop_emit() {
         // REST path: same run_agent_turn, emit is a no-op, outcome still aggregates.
         let (outcome, _, _) = run_with_fake_agent(
             turn_input("營收 收入 賺多少"),
