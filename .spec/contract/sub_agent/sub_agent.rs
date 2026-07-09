@@ -203,8 +203,11 @@ pub struct SubAgentConfig {
     pub tools: Vec<ToolId>,
     /// Which payload variants this agent consumes; drives its self-check (§2.4).
     pub accepts: Vec<PayloadKind>,
-    /// How to shape the outgoing payload (see [`OutputShape`]).
-    pub output: OutputShape,
+    /// How to shape the outgoing payload (see [`OutputShape`]). `None` (the common case)
+    /// derives the shape from the agent's position across the pipelines that reference it —
+    /// see [`effective_output`]. Set explicitly only when the agent's shape must diverge from
+    /// its structural position (e.g. reused as both a non-terminal and a terminal stage).
+    pub output: Option<OutputShape>,
 }
 
 /// A pipeline is a first-class, *ordered* list of sub-agent references. A deployment may
@@ -235,6 +238,10 @@ pub enum ResolveError {
         pipeline: PipelineId,
         agent: SubAgentId,
     },
+    /// `output` was left unset and the agent's position is ambiguous across the pipelines
+    /// that reference it — terminal in one, non-terminal in another (§2.4). The author must
+    /// set `output` explicitly to disambiguate.
+    AmbiguousOutput(SubAgentId),
 }
 
 impl fmt::Display for ResolveError {
@@ -246,6 +253,12 @@ impl fmt::Display for ResolveError {
             ResolveError::UnknownAgentRef { pipeline, agent } => {
                 write!(f, "pipeline `{pipeline}` references unknown sub-agent `{agent}`")
             }
+            ResolveError::AmbiguousOutput(agent) => write!(
+                f,
+                "sub-agent `{agent}` has no explicit `output` and its position is ambiguous \
+                 across pipelines (terminal in one, non-terminal in another) — set `output` \
+                 explicitly"
+            ),
         }
     }
 }
@@ -320,6 +333,46 @@ pub fn resolve_llm(
         max_tokens: over.params.max_tokens.unwrap_or(default.max_tokens),
         api_key,
     })
+}
+
+/// **Output-shape default derivation (§2.4).** `configured` (the config's explicit value)
+/// always wins. When unset, the shape is derived from `id`'s position across every declared
+/// pipeline that references it: terminal in *all* of them ⇒ [`OutputShape::Final`];
+/// non-terminal in *all* of them ⇒ [`OutputShape::Intermediate`]. An agent that is terminal in
+/// one pipeline and non-terminal in another (the `quick_fetch`-style reuse case) has no
+/// unambiguous default and **fails resolution**, demanding an explicit `output`. An agent
+/// referenced by no pipeline is unreachable; its shape is never observed, so it defaults to
+/// `Intermediate` rather than erroring.
+pub fn effective_output(
+    id: &SubAgentId,
+    configured: Option<OutputShape>,
+    pipelines: &[PipelineConfig],
+) -> Result<OutputShape, ResolveError> {
+    if let Some(shape) = configured {
+        return Ok(shape);
+    }
+
+    let mut any_terminal = false;
+    let mut any_non_terminal = false;
+    for pipeline in pipelines {
+        for (i, stage) in pipeline.stages.iter().enumerate() {
+            if stage != id {
+                continue;
+            }
+            if i == pipeline.stages.len() - 1 {
+                any_terminal = true;
+            } else {
+                any_non_terminal = true;
+            }
+        }
+    }
+
+    match (any_terminal, any_non_terminal) {
+        (true, true) => Err(ResolveError::AmbiguousOutput(id.clone())),
+        (true, false) => Ok(OutputShape::Final),
+        (false, true) => Ok(OutputShape::Intermediate),
+        (false, false) => Ok(OutputShape::Intermediate), // unreferenced; never observed
+    }
 }
 
 // --- The tool registry: the abstract seam between a grant and a backend ------
@@ -421,11 +474,15 @@ pub struct ConfiguredAgent {
 impl ConfiguredAgent {
     /// Assemble a runnable agent from resolved parts. The LLM capability is injected (built
     /// from a [`ResolvedLlm`] by a factory, elsewhere), which is what makes the agent a pure
-    /// async function of its payload in tests.
+    /// async function of its payload in tests. `output` is the **resolved** shape — the
+    /// config's explicit value, or [`effective_output`]'s position-derived default — never
+    /// `cfg.output` read directly, since the default can only be computed once every pipeline
+    /// referencing this agent is known.
     pub fn new(
         cfg: &SubAgentConfig,
         llm: Arc<dyn LlmCapability>,
         tools: Vec<Box<dyn Tool>>,
+        output: OutputShape,
     ) -> Self {
         Self {
             id: cfg.id.clone(),
@@ -433,7 +490,7 @@ impl ConfiguredAgent {
             llm,
             tools,
             accepts: intern_accepts(&cfg.accepts),
-            output: cfg.output,
+            output,
         }
     }
 
@@ -712,10 +769,11 @@ mod tests {
                 llm: None,
                 tools: vec![],
                 accepts: vec![PayloadKind::Intermediate],
-                output: OutputShape::Final,
+                output: None,
             },
             ScriptedLlm::arc(vec![]),
             vec![],
+            OutputShape::Final, // resolved shape; irrelevant here — the mismatch short-circuits first
         );
         let out = writer
             .run(AgentPayload::Final(FinalResult { user: "u".into(), assistant: "a".into() }))
@@ -732,10 +790,11 @@ mod tests {
                 llm: None,
                 tools: vec![ToolId::BillRevenue],
                 accepts: vec![PayloadKind::Initial],
-                output: OutputShape::Intermediate,
+                output: None,
             },
             ScriptedLlm::arc(vec![tool_call("query_records"), LlmResponse::Message("done".into())]),
             vec![Box::new(FakeFetchTool)],
+            OutputShape::Intermediate,
         );
         let out = fetcher
             .run(AgentPayload::Initial(InitialPrompt { prompt: "get it".into(), history: vec![] }))
@@ -758,10 +817,11 @@ mod tests {
                 llm: None,
                 tools: vec![],
                 accepts: vec![PayloadKind::Intermediate],
-                output: OutputShape::Final,
+                output: None,
             },
             ScriptedLlm::arc(vec![LlmResponse::Message("REPORT".into())]),
             vec![],
+            OutputShape::Final,
         );
         let mut artifacts = HashMap::new();
         artifacts.insert(ArtifactKey::FetcherRecords, ArtifactValue::Text("rows".into()));
@@ -775,18 +835,105 @@ mod tests {
         }
     }
 
+    // ── §2.4 output-shape default: derived from position, ambiguous ⇒ explicit required ──
+
+    #[test]
+    fn output_derives_final_when_terminal_in_every_referencing_pipeline() {
+        let writer = SubAgentId("writer".into());
+        let full = PipelineConfig {
+            id: PipelineId("revenue_report".into()),
+            stages: vec![SubAgentId("fetcher".into()), writer.clone()],
+        };
+        assert_eq!(effective_output(&writer, None, &[full]), Ok(OutputShape::Final));
+    }
+
+    #[test]
+    fn output_derives_intermediate_when_non_terminal_in_every_referencing_pipeline() {
+        let fetcher = SubAgentId("fetcher".into());
+        let full = PipelineConfig {
+            id: PipelineId("revenue_report".into()),
+            stages: vec![fetcher.clone(), SubAgentId("writer".into())],
+        };
+        assert_eq!(effective_output(&fetcher, None, &[full]), Ok(OutputShape::Intermediate));
+    }
+
+    #[test]
+    fn output_position_ambiguous_across_pipelines_requires_explicit_value() {
+        let fetcher = SubAgentId("fetcher".into());
+        let full = PipelineConfig {
+            id: PipelineId("revenue_report".into()),
+            stages: vec![fetcher.clone(), SubAgentId("writer".into())],
+        };
+        let quick = PipelineConfig {
+            id: PipelineId("quick_fetch".into()),
+            stages: vec![fetcher.clone()], // terminal here, non-terminal above
+        };
+        assert_eq!(
+            effective_output(&fetcher, None, &[full, quick]),
+            Err(ResolveError::AmbiguousOutput(fetcher))
+        );
+    }
+
+    #[test]
+    fn explicit_output_overrides_position_even_when_it_contradicts_it() {
+        let writer = SubAgentId("writer".into());
+        // writer is terminal here, yet the author forces `Intermediate` — explicit always wins.
+        let full = PipelineConfig {
+            id: PipelineId("revenue_report".into()),
+            stages: vec![SubAgentId("fetcher".into()), writer.clone()],
+        };
+        assert_eq!(
+            effective_output(&writer, Some(OutputShape::Intermediate), &[full]),
+            Ok(OutputShape::Intermediate)
+        );
+    }
+
+    #[test]
+    fn unreferenced_agent_gets_an_inert_default() {
+        let ghost = SubAgentId("ghost".into());
+        assert_eq!(effective_output(&ghost, None, &[]), Ok(OutputShape::Intermediate));
+    }
+
     // ── §1.4 multiple pipelines reusing one sub-agent ──
 
     #[tokio::test]
     async fn orchestrator_runs_multiple_pipelines_reusing_a_sub_agent() {
+        let fetcher_id = SubAgentId("fetcher".into());
+        let writer_id = SubAgentId("writer".into());
+
+        let full = PipelineConfig {
+            id: PipelineId("revenue_report".into()),
+            stages: vec![fetcher_id.clone(), writer_id.clone()],
+        };
+        let quick = PipelineConfig {
+            id: PipelineId("quick_fetch".into()),
+            stages: vec![fetcher_id.clone()], // same fetcher, different pipeline
+        };
+        let all_pipelines = [full.clone(), quick.clone()];
+
+        // `fetcher` is non-terminal in `revenue_report` but terminal in `quick_fetch` — its
+        // position is ambiguous, so an unset `output` fails resolution (§2.4) instead of
+        // silently picking one.
+        assert_eq!(
+            effective_output(&fetcher_id, None, &all_pipelines),
+            Err(ResolveError::AmbiguousOutput(fetcher_id.clone()))
+        );
+        // The author disambiguates with an explicit value.
+        let fetcher_output = OutputShape::Intermediate;
+
+        // `writer` is terminal in every pipeline that references it (only `revenue_report`),
+        // so the default derives cleanly with no `output` set at all.
+        let writer_output = effective_output(&writer_id, None, &all_pipelines).unwrap();
+        assert_eq!(writer_output, OutputShape::Final);
+
         let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
             &SubAgentConfig {
-                id: SubAgentId("fetcher".into()),
+                id: fetcher_id.clone(),
                 instruction: "fetch".into(),
                 llm: None,
                 tools: vec![ToolId::BillRevenue],
                 accepts: vec![PayloadKind::Initial],
-                output: OutputShape::Intermediate,
+                output: Some(fetcher_output),
             },
             ScriptedLlm::arc(vec![
                 tool_call("query_records"),
@@ -795,32 +942,25 @@ mod tests {
                 LlmResponse::Message("f2".into()),
             ]),
             vec![Box::new(FakeFetchTool)],
+            fetcher_output,
         ));
         let writer: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
             &SubAgentConfig {
-                id: SubAgentId("writer".into()),
+                id: writer_id.clone(),
                 instruction: "write".into(),
                 llm: None,
                 tools: vec![],
                 accepts: vec![PayloadKind::Intermediate],
-                output: OutputShape::Final,
+                output: None,
             },
             ScriptedLlm::arc(vec![LlmResponse::Message("SUMMARY".into())]),
             vec![],
+            writer_output,
         ));
 
         let mut agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = HashMap::new();
-        agents.insert(SubAgentId("fetcher".into()), fetcher);
-        agents.insert(SubAgentId("writer".into()), writer);
-
-        let full = PipelineConfig {
-            id: PipelineId("revenue_report".into()),
-            stages: vec![SubAgentId("fetcher".into()), SubAgentId("writer".into())],
-        };
-        let quick = PipelineConfig {
-            id: PipelineId("quick_fetch".into()),
-            stages: vec![SubAgentId("fetcher".into())], // same fetcher, different pipeline
-        };
+        agents.insert(fetcher_id, fetcher);
+        agents.insert(writer_id, writer);
 
         let mut orch = Orchestrator::new();
         orch.insert(full.id.clone(), resolve_pipeline(&full, &agents).unwrap());

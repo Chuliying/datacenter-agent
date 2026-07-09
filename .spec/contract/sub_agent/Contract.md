@@ -53,7 +53,7 @@ Hand-written agents remain possible; both are the same abstract `SubAgent`.
 | `llm` | `Option<LlmConfig>` (all fields optional) | Per-agent LLM; unset fields inherit the default LLM (§2.1). `None` ⇒ the default verbatim. |
 | `tools` | `Vec<ToolId>` | The **granted tool set** — the isolation boundary (payload §2.3). Closed set, resolved at boot (§2.2). Empty = a no-tool agent. |
 | `accepts` | `Vec<PayloadKind>` | Which payload variants this agent consumes; drives its self-check (§2.4). |
-| `output` | `OutputShape` | Execution-time shaping of the outgoing payload. **Not** a static `produces` — see §2.4. |
+| `output` | `Option<OutputShape>` | Execution-time shaping of the outgoing payload. `None` (the common case) derives the shape from the agent's position in whichever pipeline(s) reference it — see §2.4. An explicit value overrides the derivation. **Not** a static `produces` — see §2.4. |
 
 There is **no `produces` field**. Static produces→accepts wiring validation is removed on
 purpose (§2.4): composition safety is a runtime property, which is what lets a sub-agent be
@@ -135,6 +135,17 @@ deliberate: it lets sub-agents be recombined into different pipelines without re
 static wiring graph. `OutputShape` shapes an agent's *own* outgoing payload at execution time
 and participates in no cross-agent validation.
 
+**Default output is derived from pipeline position, not authored per agent.** Most sub-agents
+never set `output`: at resolution time, the loader inspects every declared `PipelineConfig` and
+determines, for a given `SubAgentId`, whether it is a *terminal* stage (nothing follows it) —
+consistently across every pipeline it appears in. Terminal everywhere ⇒ the default is `Final`;
+non-terminal everywhere ⇒ the default is `Intermediate`. If the same sub-agent is terminal in
+one declared pipeline and non-terminal in another (the `quick_fetch`-style reuse case in §3) and
+its `output` is unset, that is a **resolution error**: the author must set `output` explicitly
+to disambiguate. This keeps `output` optional in the common single-role case while keeping the
+field for the one case it exists to serve — an agent whose outgoing shape must diverge from its
+structural position.
+
 ### 2.5 Identity namespaces production (no enforcement yet)
 
 Each sub-agent's `id` namespaces the `ArtifactKey`s it produces (payload §2.5) and attributes
@@ -163,9 +174,16 @@ One encoding satisfying §1–§2; swap freely. See [`sub_agent.rs`](./sub_agent
 - **`ToolRegistry`** — `HashMap<ToolId, ToolFactory>` the designer populates at startup;
   `resolve(&grants)` indexes it per grant and **fails boot on a miss**. The factory indirection
   is the seam that lets one logical tool be re-backed (MCP → HTTP → mock).
+- **`effective_output`** — implements the position-derived default above: the config's
+  explicit value wins; otherwise it scans every declared `PipelineConfig` for the agent's id
+  and returns `Final`/`Intermediate` when its terminal-ness is consistent, or a resolution
+  error when it is not. Runs once per agent, before that agent's `ConfiguredAgent` is built —
+  it needs the full pipeline set, which a single agent's own config does not carry.
 - **`ConfiguredAgent`** — the generic engine implementing the abstract `SubAgent`: self-checks
   `accepts` (§2.4), seeds `run_llm_loop` with `instruction` + payload over the granted tools,
-  and shapes the result via `OutputShape`, merging incoming artifacts append-only.
+  and shapes the result via a **resolved** `OutputShape` (the config's explicit value, or
+  `effective_output`'s derived default — never `SubAgentConfig.output` read directly), merging
+  incoming artifacts append-only.
 - **`Orchestrator`** — holds every resolved pipeline and threads a payload through a selected
   one with `?` (Kleisli composition; the first mismatch short-circuits). `resolve_pipeline`
   fails boot on an unknown stage reference.
@@ -190,7 +208,8 @@ id = "fetcher"
 instruction = { file = "prompts/fetcher.md" }
 tools = ["bill_revenue", "station_revenue_ranking"]
 accepts = ["initial"]
-output = "intermediate"
+output = "intermediate"          # explicit: terminal in `quick_fetch` below but not in
+                                  # `revenue_report` — position alone is ambiguous here
 # no [sub_agent.llm] → inherits [llm.default] verbatim
 
 [[sub_agent]]
@@ -198,7 +217,7 @@ id = "writer"
 instruction = { file = "prompts/writer.md" }
 tools = []                       # no-tool agent
 accepts = ["intermediate"]
-output = "final"
+# no `output` → derived: terminal in every pipeline it appears in ⇒ "final"
 [sub_agent.llm]
 model = "anthropic/claude-sonnet-5"   # override only the model; inherit provider + params
 
@@ -223,6 +242,7 @@ stages = ["fetcher"]
 | Tool set resolution | **Closed set, resolved at boot, fail-fast** | An unknown grant is a config error, caught before any LLM call. |
 | Secrets | **k8s-style env reference**, checked at boot | Config commits safely; a missing secret fails boot. |
 | `produces` / wiring | **Dropped**; runtime self-check instead | Enables free recombination and multiple pipelines. |
+| `output` default | **Position-derived when unset**; ambiguous position requires an explicit value | Removes a footgun (a configured shape disagreeing with actual pipeline position) while keeping the field for the one case that needs it: reuse across pipelines at different positions. |
 | Pipelines | **First-class, multiple** | Orchestration is a first-class, practical concern. |
 | Namespace enforcement | **None yet** (convention only) | Cheap to add later; not worth the machinery now. |
 | Sub-agent shape | **Abstract, config-driven default** | One generic engine; hand-written agents still possible. |
