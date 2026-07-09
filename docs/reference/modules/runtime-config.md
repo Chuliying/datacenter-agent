@@ -10,7 +10,7 @@
 ## 載入內容
 - 領域資料：`config/runtime/intents.toml`、`lexicon.toml`、`thresholds.toml`、`injection.toml`。
 - 模組組裝段（決定 [registry](./runtime-registry.md) 組什麼）：
-  - `[runtime.pipeline] input_stages = ["normalize","input_guard","injection","intent","slots"]` 注意：目前為**宣告性**：registry 會驗證這組 id，但 `InputPipeline` 尚未據其分派，實際固定執行 `normalize→injection→intent→slots`（見 [orchestrator](./runtime-orchestrator.md)）
+  - `[runtime.input] input_stages = ["normalize","input_guard","injection","intent","slots"]` 注意：目前為**宣告性**：registry 會驗證這組 id，但 `InputPipeline` 尚未據其分派，實際固定執行 `normalize→injection→intent→slots`（見 [turn](./runtime-turn.md)）
   - `[runtime.answer_policy] backend = "rule"`
   - `[runtime.llm_normalizer] enabled, backend`
   - `[runtime.memory] enabled, backend`

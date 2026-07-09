@@ -24,5 +24,5 @@ runtime 內部共享的資料型別 —— 連接 input、orchestrator、guardra
 
 ## 相關
 - 產生者 → [input](./runtime-input.md)
-- 消費者 → [orchestrator](./runtime-orchestrator.md)
+- 消費者 → [turn](./runtime-turn.md)
 - 對外 DTO（HTTP wire）→ [server · dto](./server.md)

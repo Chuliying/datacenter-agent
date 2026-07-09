@@ -1,8 +1,8 @@
-# 模組：`runtime::orchestrator`
+# 模組：`runtime::turn`
 
 > ← 回 [模組總覽](./index.md) ｜ [專案主體](../index.md)
 >
-> **Source**：[`src/runtime/orchestrator.rs`](../../../src/runtime/orchestrator.rs)
+> **Source**：[`src/runtime/turn.rs`](../../../src/runtime/turn.rs)
 
 ## 職責
 一個 agent turn 的編排骨幹（`run_agent_turn`），把輸入處理 → 防護決策 → 記憶注入 → LLM/MCP 迴圈 → 回寫記憶/稽核串成單一流程。**只依賴 trait**，不綁具體實作，故 REST 與 SSE 共用同一條編排。
@@ -20,7 +20,7 @@
 | `StreamPlan` | turn 同步前段的結果（在送任何 token 前決定 error/refuse/放行） |
 
 ## 流程（runtime 模式）
-1. 結構防護 `validate_prompt`（空／超長 → pre-stream `Error`）。此為 orchestrator 的獨立前置步，**不在** input pipeline 內。
+1. 結構防護 `validate_prompt`（空／超長 → pre-stream `Error`）。此為 turn 的獨立前置步，**不在** input pipeline 內。
 2. [input pipeline](./runtime-input.md) `run_with_config`：實際跑 `normalize → injection guard → intent → slots`（`injection` 偵測已接入此階段，命中時附加 `prompt_injection_detected` warning，見 [guardrails](./runtime-guardrails.md)）。注意：config 的 `input_stages` 仍是**宣告性 metadata**，pipeline 目前依然**未**依其動態分派階段順序——順序是寫死的，不是資料驅動的。
 3. 可選 [llm_normalizer](./runtime-llm-normalizer.md) 補強低信心。
 4. [answer policy](./runtime-guardrails.md) 決策：拒絕／提示／放行。injection warning 會被 answer policy 轉成 `Refuse("prompt_injection")`，在呼叫上游 LLM 前攔截；該類拒絕不會寫入 session memory。

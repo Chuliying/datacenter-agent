@@ -1,7 +1,7 @@
 # 模組：`runtime::memory` — partial
 
 > ← [Modules](./index.md)  
-> **Source**：[`src/runtime/memory/store.rs`](../../../src/runtime/memory/store.rs)、[`src/runtime/memory/context.rs`](../../../src/runtime/memory/context.rs)、[`src/runtime/orchestrator.rs`](../../../src/runtime/orchestrator.rs) `apply_memory_context` / `append_memory_turn_if_enabled`
+> **Source**：[`src/runtime/memory/store.rs`](../../../src/runtime/memory/store.rs)、[`src/runtime/memory/context.rs`](../../../src/runtime/memory/context.rs)、[`src/runtime/turn.rs`](../../../src/runtime/turn.rs) `apply_memory_context` / `append_memory_turn_if_enabled`
 
 ## 現況
 

@@ -10,7 +10,7 @@
 ## 關鍵項
 - `trait LlmInputNormalizer` —— 介面 seam。
 - 由 `[runtime.llm_normalizer] enabled / backend` config gate，**預設關閉**（`disabled`）。
-- 開啟時由 [orchestrator](./runtime-orchestrator.md) 在 rule pipeline 後呼叫。
+- 開啟時由 [turn](./runtime-turn.md) 在 rule pipeline 後呼叫。
 
 ## 設計意圖
 保留「之後可加 LLM 補強」的接線，但預設不動成本／延遲；屬本輪 out-of-scope 的即時 fallback，只先立介面 + gate。

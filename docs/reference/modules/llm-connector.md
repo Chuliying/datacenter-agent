@@ -24,7 +24,7 @@ OpenRouter（OpenAI-compatible）LLM 連接 + MCP tool-calling 迴圈 —— age
 其中 `ToolCalled`/`ToolResult` 在 legacy 串流路徑被 handler 過濾，不外送到 SSE。
 
 ## 與 runtime 的關係
-runtime 模式下由 [orchestrator](./runtime-orchestrator.md) 的 `LlmAgentPort`（實作 `AgentPort`）包覆呼叫；runtime 關閉時由 [handler](./server.md) 直接呼叫。
+runtime 模式下由 [turn](./runtime-turn.md) 的 `LlmAgentPort`（實作 `AgentPort`）包覆呼叫；runtime 關閉時由 [handler](./server.md) 直接呼叫。
 
 ## Terminal semantics（現況限制）
 

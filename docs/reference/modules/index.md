@@ -31,7 +31,7 @@ src/
 ### Runtime 核心（[`src/runtime/`](../../../src/runtime/mod.rs)，與 HTTP 解耦）
 | 模組 | 職責 | 子頁 |
 |---|---|---|
-| `orchestrator` | `run_agent_turn`：一個 turn 的編排骨幹 | [orchestrator](./runtime-orchestrator.md) |
+| `turn` | `run_agent_turn`：一個 turn 的編排骨幹 | [turn](./runtime-turn.md) |
 | `input` | 決定性輸入 pipeline（normalize/intent/slots） | [input](./runtime-input.md) |
 | `llm_normalizer` | 可選 LLM-backed 輸入正規化 seam | [llm_normalizer](./runtime-llm-normalizer.md) |
 | `guardrails` | input guard + injection detector + config-driven answer policy | [guardrails](./runtime-guardrails.md) |
@@ -52,7 +52,7 @@ src/
 ## 依賴流向（高層）
 
 ```
-server ──呼叫──▶ runtime::orchestrator ◀── AppState 組裝部分 registry components ◀── config
+server ──呼叫──▶ runtime::turn ◀── AppState 組裝部分 registry components ◀── config
    │                     │
    │                     ├─▶ input ─▶ llm_normalizer(可選)
    │                     ├─▶ guardrails
