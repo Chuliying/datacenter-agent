@@ -52,6 +52,7 @@ exist in the tree. The real starting point:
 | Decision | Choice |
 |---|---|
 | Term ownership | **Sub-agent layer owns bare `pipeline` / `orchestration`** (Option B). Runtime renamed to `turn` / `input` **first**, behind a behavior-preserving gate (§2). |
+| Agent anatomy | **Three optional components — LLM, Tools, Logic** — behind one `SubAgent` trait unifying **config-defined** (`ConfiguredAgent`) and **code-defined** (`agents.rs`) agents (contract §1.1). The two endpoints are all config; code path is groundwork. |
 | `/report` shape | **Two-stage fetch→write** (`fetcher` → `writer`), the contract's canonical example. |
 | Sub-agent orchestrator ↔ runtime | **Pipeline sits *behind* `AgentPort`** — a `PipelineAgentPort` replaces `LlmAgentPort`; guardrails/intent/memory/audit are preserved. |
 | Tool set | **Closed, hand-authored `ToolId` enum** + registry, resolved at boot (contract §1.3, §2.2). Auto-discovery is replaced. Each grant additionally binds an explicit wire name (`mcp_name`) when it differs from the canonical `ToolId` string (§4). |
@@ -67,7 +68,8 @@ exist in the tree. The real starting point:
 |---|---|---|
 | Payload types (`AgentPayload`, `AgentError`, `Tool`, `LlmCapability`, `run_llm_loop`) | `src/agent/payload.rs` | Port of `agent_payload.rs`. Drop the `#[cfg(feature = "openai")]` gate — the crate depends on async-openai unconditionally. |
 | Config model + resolution (`SubAgentConfig`, `LlmConfig`, `Provider`, `ToolId`, `ResolvedLlm`, merge, secret bind) | `src/agent/config.rs` | Port of `sub_agent.rs` PART A + resolution. |
-| Generic engine + sub-agent orchestrator (`ConfiguredAgent`, `Orchestrator`, `resolve_pipeline`, `effective_output`) | `src/agent/engine.rs` | PART B. Bare `Orchestrator` / `Pipeline*` names, free after §2. Uses the `sub_agent.rs` `SubAgent` trait (`id()` + `accepts()`, **no `produces()`**). `ConfiguredAgent::new` takes the *resolved* `OutputShape` as an explicit argument (never reads `cfg.output` itself) — `effective_output` computes it from the full pipeline set before construction. |
+| Generic engine + sub-agent orchestrator (`ConfiguredAgent`, `Orchestrator`, `resolve_pipeline`, `effective_output`) | `src/agent/engine.rs` | PART B. Bare `Orchestrator` / `Pipeline*` names, free after §2. Uses the `sub_agent.rs` `SubAgent` trait (`id()` + `accepts()`, **no `produces()`**). `ConfiguredAgent` is the **config path** — its Logic is the built-in LLM tool-loop; it always holds an LLM. `ConfiguredAgent::new` takes the *resolved* `OutputShape` as an explicit argument (never reads `cfg.output` itself) — `effective_output` computes it from the full pipeline set before construction. |
+| Code-defined agents (hand-written `SubAgent` impls) | `src/agent/agents.rs` | The **code path** (contract §1.1): agents whose Logic is Rust, with any component absent — a Logic-only session-memory keeper, a fixed responder. Each is `Arc<dyn SubAgent>`, inserted into the resolved agent map beside config agents before `resolve_pipeline` (§6). The reference's `HelloWorld` is the template. |
 | Tool registry + MCP-backed tools | `src/agent/tools.rs` | Wraps one or more `McpHandle`s; registry is backend-agnostic. |
 | MCP server pool (N connections + per-server instructions) | `src/agent/mcp_pool.rs` | Connects every configured server at boot; owns handles + instruction blocks. |
 | LLM factory (`ResolvedLlm` → `Arc<dyn LlmCapability>`) + streaming capability | `src/agent/llm.rs` | async-openai adapter (0.40); buffered `chat` + a streaming path for the terminal stage. |
@@ -76,6 +78,16 @@ exist in the tree. The real starting point:
 
 The reference `.rs` files compile standalone; porting is mostly moving code into modules and
 replacing the `mod agent_payload` include with `use crate::agent::payload::*`.
+
+**The three-component model (contract §1.1).** An agent = up to three *optional* components —
+**LLM** (talk to the model), **Tools** (interact with the real world), **Logic** (the actions
+it processes, i.e. the `run` procedure). Two provenances, one `SubAgent` trait: **config-defined**
+(`ConfiguredAgent` — always an LLM, optional tools, Logic = the built-in tool-loop) and
+**code-defined** (`agents.rs` — arbitrary Logic, any component absent). This plan's two
+endpoints (§10) are *all config* agents; `agents.rs` exists for the cases a prompt can't express
+and stays empty until one appears. The Logic can be iterative — the fetcher's "loop tool calls
+until the data is ready" *is* the built-in loop ([`llm_connector/agent.rs`](../../src/llm_connector/agent.rs),
+`MAX_ITERATIONS`), driven by the model, not a fixed script.
 
 ---
 
@@ -257,6 +269,12 @@ granted tool subsets, that is wrong.
 - Resolve `instruction = { file = … }` prompt refs via the existing `load_prompt` path
   (relative to the manifest dir) — the report `writer` reuses `report_system`, the analytics
   agent reuses `agent_system`.
+- **Merge code-defined agents into the same map.** After building `ConfiguredAgent`s from
+  `[[sub_agent]]`, insert any hand-written `SubAgent`s (§1, `agents.rs`) into the *same*
+  `HashMap<SubAgentId, Arc<dyn SubAgent>>` before `resolve_pipeline`, so a `[[pipeline]]` stage
+  can reference a code agent by id exactly like a config one. A collision between a code
+  agent's id and a `[[sub_agent]]` id fails boot (two agents claiming one id). Code agents have
+  no `[[sub_agent]]` entry — they carry their own prompt/tools/Logic (or none) in Rust.
 - Keep `SUPPORTED_VERSION` handling; bump if the schema shape changes materially.
 - **Exit check:** load a fixture `config.toml` with the two agents + two pipelines from §10;
   assert the resolved sub-agent orchestrator has both pipelines and any shared agent is reused.

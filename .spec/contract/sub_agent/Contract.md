@@ -37,14 +37,55 @@ relax the payload contract.
 
 ## 1. Data model (normative)
 
-### 1.1 The sub-agent is abstract; config drives the default implementation
+### 1.1 An agent is three optional components, unified by one trait
 
-A sub-agent is anything satisfying the payload morphism and the falling convention. The
-**default** way to obtain one is *data*: a `SubAgentConfig` fed to one generic engine, so the
-payload contract's `DataFetcher` / `ReportWriter` become *configs*, not bespoke Rust types.
-Hand-written agents remain possible; both are the same abstract `SubAgent`.
+A sub-agent is anything satisfying the payload morphism and the falling convention — anything
+implementing the `SubAgent` trait (§3). Its behaviour is composed from up to **three
+components, each optional**:
 
-`SubAgentConfig`:
+| Component | What it is | Role | Optional? |
+|---|---|---|---|
+| **LLM** | an `LlmCapability` | LLM language processing, talk to the model | yes |
+| **Tools** | a set of `Tool`s (a granted `ToolId` subset) | interact with the real world | yes — empty = none |
+| **Logic** | the `run` procedure itself | the actions the agent processes to turn its input payload into its output | always *some* procedure; ranges from the built-in LLM tool-loop to arbitrary code |
+
+A sub-agent is obtained **two ways, both the same abstract `SubAgent`**:
+
+- **From config** — a `SubAgentConfig` fed to the one generic engine (`ConfiguredAgent`, §3).
+  The author writes an *instruction* (system prompt), an LLM, a tool grant, `accepts`, and
+  `output`; the **Logic is the built-in engine procedure** (assemble the prompt + carried
+  artifacts → drive the LLM tool-loop → shape the output). A config-defined agent therefore
+  **always carries an LLM** — a prompt with no model to read it is meaningless — and *may*
+  carry tools. This is the "prompt an LLM, optionally with tools" family: the fetcher, the
+  report writer, a greeter.
+- **From code** — a hand-written `impl SubAgent`. The author writes the Logic in Rust, and
+  *any* component may be absent. This covers behaviours a prompt cannot express: a **Logic-only**
+  agent (a session-memory keeper that queries a store and emits a memory artifact — no LLM, no
+  tools), a trivial fixed responder (a hello-world agent), or any agent needing bespoke control
+  flow.
+
+The **`SubAgent` trait is the unification**: config-defined and code-defined agents are both
+`Arc<dyn SubAgent>`, and the `Orchestrator`/pipeline holds and threads them identically — it
+cannot tell, and does not care, which provenance a stage came from.
+
+**The Logic component can be complex.** The built-in engine Logic is already **iterative**: the
+model calls a tool, the result is fed back, and it may call again — looping until the model
+emits a final message (a step cap guards non-termination). This is exactly how the fetcher
+"loops tool calls until all required data is prepared": the *model*, not a fixed script, decides
+when it has enough (see `run_llm_loop` in the payload contract, and the production streaming loop
+in `llm_connector/agent.rs`). A code-defined Logic may implement any control flow at all.
+
+**Component matrix** — the running examples:
+
+| Agent | LLM | Tools | Logic | Provenance |
+|---|---|---|---|---|
+| fetcher | ✓ | ✓ | built-in loop — iterates tool calls until the model stops | config |
+| report writer / greeter | ✓ | — | built-in loop — degenerates to a single model turn (nothing to call) | config |
+| session-memory keeper | — | — | custom — query the store, emit a memory artifact | code |
+| hello-world | — | — | custom — ignore the input, return a fixed `Final` | code |
+
+The remainder of §1 specifies the **config path's authored surface**; the code path needs no
+config schema — it *is* Rust. `SubAgentConfig`:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -54,6 +95,10 @@ Hand-written agents remain possible; both are the same abstract `SubAgent`.
 | `tools` | `Vec<ToolId>` | The **granted tool set** — the isolation boundary (payload §2.3). Closed set, resolved at boot (§2.2). Empty = a no-tool agent. |
 | `accepts` | `Vec<PayloadKind>` | Which payload variants this agent consumes; drives its self-check (§2.4). |
 | `output` | `Option<OutputShape>` | Execution-time shaping of the outgoing payload. `None` (the common case) derives the shape from the agent's position in whichever pipeline(s) reference it — see §2.4. An explicit value overrides the derivation. **Not** a static `produces` — see §2.4. |
+
+`llm = None` here means **inherit the default LLM verbatim** (§2.1), *not* "no LLM" — a
+config-defined agent always has one. The LLM-absent case of §1.1 is reached only by writing a
+code-defined agent, which has no `SubAgentConfig` at all.
 
 There is **no `produces` field**. Static produces→accepts wiring validation is removed on
 purpose (§2.4): composition safety is a runtime property, which is what lets a sub-agent be
@@ -155,10 +200,11 @@ validator) and is out of scope here.
 
 ### 2.6 A resolved sub-agent is a pure function
 
-Given injected capabilities (LLM, tools), a resolved sub-agent is a pure async function of its
-input payload; resolution is a *separate* step from execution. Each sub-agent is unit-tested
-with mocked capabilities and a scripted LLM — no config, no network — exactly as the payload
-contract's tests do.
+Given its (possibly empty) injected components — an optional LLM, a tool set, and its Logic — a
+resolved sub-agent is a pure async function of its input payload; resolution is a *separate*
+step from execution. Each sub-agent is unit-tested with mocked components — a scripted LLM,
+mock tools, or neither for a code-defined Logic-only agent — no config, no network, exactly as
+the payload contract's tests do.
 
 ---
 
@@ -166,6 +212,12 @@ contract's tests do.
 
 One encoding satisfying §1–§2; swap freely. See [`sub_agent.rs`](./sub_agent.rs).
 
+- **`SubAgent` (the trait) is the unification** — `{ id, accepts, run }`. Both provenances
+  implement it: `ConfiguredAgent` (config path) and any hand-written type (code path). The
+  `run` method *is* the Logic component; everything downstream (`resolve_pipeline`,
+  `Orchestrator`) holds `Arc<dyn SubAgent>` and never distinguishes the two. The reference
+  ships a `HelloWorld` code agent (no LLM, no tools) and a test running it in the same
+  `Orchestrator` as a `ConfiguredAgent`, to pin the unification.
 - **`ResolvedLlm`** — the option-free product of §2.1 (provider, base URL, bound key, model,
   params). Constructs the payload contract's `LlmCapability`; an Ollama/Custom endpoint is the
   same OpenAI-compatible adapter with a different base URL + key. The `ResolvedLlm` →
@@ -179,11 +231,13 @@ One encoding satisfying §1–§2; swap freely. See [`sub_agent.rs`](./sub_agent
   and returns `Final`/`Intermediate` when its terminal-ness is consistent, or a resolution
   error when it is not. Runs once per agent, before that agent's `ConfiguredAgent` is built —
   it needs the full pipeline set, which a single agent's own config does not carry.
-- **`ConfiguredAgent`** — the generic engine implementing the abstract `SubAgent`: self-checks
-  `accepts` (§2.4), seeds `run_llm_loop` with `instruction` + payload over the granted tools,
-  and shapes the result via a **resolved** `OutputShape` (the config's explicit value, or
-  `effective_output`'s derived default — never `SubAgentConfig.output` read directly), merging
-  incoming artifacts append-only.
+- **`ConfiguredAgent`** — the **config path**'s `SubAgent`: the generic engine whose Logic is
+  the built-in LLM tool-loop. It self-checks `accepts` (§2.4), seeds `run_llm_loop` with
+  `instruction` + payload over the granted tools, and shapes the result via a **resolved**
+  `OutputShape` (the config's explicit value, or `effective_output`'s derived default — never
+  `SubAgentConfig.output` read directly), merging incoming artifacts append-only. It always
+  holds an LLM; tools may be empty. Today there is exactly one built-in Logic — a genuinely
+  different procedure is a code-defined agent, not a config knob (see §6).
 - **`Orchestrator`** — holds every resolved pipeline and threads a payload through a selected
   one with `?` (Kleisli composition; the first mismatch short-circuits). `resolve_pipeline`
   fails boot on an unknown stage reference.
@@ -245,7 +299,9 @@ stages = ["fetcher"]
 | `output` default | **Position-derived when unset**; ambiguous position requires an explicit value | Removes a footgun (a configured shape disagreeing with actual pipeline position) while keeping the field for the one case that needs it: reuse across pipelines at different positions. |
 | Pipelines | **First-class, multiple** | Orchestration is a first-class, practical concern. |
 | Namespace enforcement | **None yet** (convention only) | Cheap to add later; not worth the machinery now. |
-| Sub-agent shape | **Abstract, config-driven default** | One generic engine; hand-written agents still possible. |
+| Sub-agent anatomy | **Three optional components — LLM, Tools, Logic** | Extends the earlier LLM+Tools model; "Logic" names the procedure so a pure-logic agent (no LLM/tools) is first-class. |
+| Sub-agent provenance | **Config-defined *or* code-defined, unified by the `SubAgent` trait** | Config = prompt+capabilities over the built-in Logic; code = handcrafted Logic for what a prompt can't express. Both compose identically. |
+| Built-in Logics | **One (the LLM tool-loop)** for now | A different procedure is a code agent today; a config-selectable Logic registry is a deferred extension (§6). |
 
 ---
 
@@ -254,11 +310,13 @@ stages = ["fetcher"]
 - **Orchestration designer** — owns the `ToolRegistry` (mints `ToolId`s, wires each to a
   backend + `ArtifactKey` target), authors `SubAgentConfig`s and `PipelineConfig`s, supplies
   the default LLM and the secret environment, and assembles the `Orchestrator`.
-- **Sub-agent** — transforms one payload into another, exposing to its LLM *only* its granted
-  tools, self-checking its input and returning a typed `Mismatch` when handed a variant it does
-  not accept.
-- **The LLM** — used by every agent; decides which exposed tool to call. It never names a key,
-  never invents a tool, and is never trusted by types to refrain from inventing facts.
+- **Sub-agent** — transforms one payload into another via its Logic, exposing to its LLM (*if
+  it has one*) *only* its granted tools, self-checking its input and returning a typed
+  `Mismatch` when handed a variant it does not accept. A code-defined agent with no LLM and no
+  tools is still a full sub-agent — its Logic alone does the work.
+- **The LLM** — used by every *LLM-bearing* agent; decides which exposed tool to call. It never
+  names a key, never invents a tool, and is never trusted by types to refrain from inventing
+  facts. An agent may legitimately have none.
 
 ---
 
@@ -277,3 +335,9 @@ These are deferred to the [implementation plan](../../plan/sub_agent.md), not to
   per-server instruction routing, and `ToolId`-derived tool naming (plan steps 2–3).
 - **Namespace enforcement (future)** — the cheap validator for §2.5.
 - **`ToolId` / `Provider` variants** — expected to grow as tools and providers are added.
+- **Config-selectable Logics** — if more than the one built-in Logic (the LLM tool-loop) is
+  ever needed from *config* (rather than by writing a code agent), a `logic = "…"` selector over
+  a small registry of named built-in procedures. Not needed while the loop covers every
+  config agent.
+- **Code-defined agent registration** — the concrete seam by which hand-written `SubAgent`s are
+  inserted into the resolved agent map alongside config-defined ones (implementation-plan item).

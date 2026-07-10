@@ -17,13 +17,28 @@
 //!   `ToolRegistry`, the generic `ConfiguredAgent`, and an `Orchestrator`. Advisory — swap
 //!   any of it as long as PART A holds.
 //!
-//! ## The sub-agent is abstract; config drives the default implementation
+//! ## Three optional components, unified by one trait
 //!
-//! A sub-agent is anything satisfying the payload morphism and the *falling convention*
-//! (self-check its input, return `AgentError::Mismatch`, never panic). The default way to
-//! obtain one is **data**: a [`SubAgentConfig`] fed to one generic [`ConfiguredAgent`], so
-//! the payload contract's `DataFetcher` / `ReportWriter` become *configs*, not bespoke
-//! types. Hand-written agents remain possible; both are the same abstract [`SubAgent`].
+//! A sub-agent is anything implementing [`SubAgent`] — the payload morphism plus the *falling
+//! convention* (self-check its input, return `AgentError::Mismatch`, never panic). Its
+//! behaviour is composed from up to three components, **each optional**:
+//!
+//! - **LLM** (`Option<LlmCapability>`) — talk to the model.
+//! - **Tools** (a granted `ToolId` subset) — interact with the real world.
+//! - **Logic** (the `run` procedure) — the actions the agent processes. Ranges from the
+//!   built-in LLM tool-loop to arbitrary code, and can be iterative (the fetcher loops tool
+//!   calls until the model has all it needs — see `run_llm_loop`).
+//!
+//! Two provenances, both the same abstract [`SubAgent`]:
+//!
+//! - **Config-defined** — a [`SubAgentConfig`] fed to the generic [`ConfiguredAgent`], whose
+//!   Logic is the built-in loop; it always has an LLM and may have tools (fetcher, writer,
+//!   greeter).
+//! - **Code-defined** — a hand-written `impl SubAgent` (see [`HelloWorld`]); any component may
+//!   be absent, for behaviour a prompt can't express (a Logic-only memory keeper; a fixed
+//!   responder).
+//!
+//! The [`Orchestrator`] holds `Arc<dyn SubAgent>` and threads both provenances identically.
 //!
 //! ## Why there is no `produces` field
 //!
@@ -415,9 +430,12 @@ impl ToolRegistry {
 
 // --- The abstract SubAgent (no `produces`) and the generic engine -----------
 
-/// The sub-agent abstraction *of this contract*: a self-checking morphism. It deliberately
-/// omits the payload contract's advisory `produces` — composition safety is the runtime
-/// falling convention (§2.4), not a static graph.
+/// The sub-agent abstraction *of this contract*: a self-checking morphism, and the **single
+/// seam that unifies config-defined and code-defined agents** (§1.1). [`ConfiguredAgent`]
+/// implements it from a [`SubAgentConfig`]; a hand-written type like [`HelloWorld`] implements
+/// it directly. The `run` method *is* the Logic component — the built-in loop for the former,
+/// arbitrary code for the latter. It deliberately omits the payload contract's advisory
+/// `produces` — composition safety is the runtime falling convention (§2.4), not a static graph.
 #[async_trait]
 pub trait SubAgent: Send + Sync {
     fn id(&self) -> &SubAgentId;
@@ -554,6 +572,54 @@ impl SubAgent for ConfiguredAgent {
                 assistant: text,
             })),
         }
+    }
+}
+
+// --- A code-defined agent: no LLM, no tools, pure Logic ---------------------
+
+/// A hand-written [`SubAgent`] with **no LLM and no tools** — its entire behaviour is Logic
+/// (§1.1). Whatever `Initial` prompt it is handed, it returns a fixed `Final`. It cannot be
+/// expressed as a [`SubAgentConfig`] (there is no prompt and no model to configure), yet it is
+/// the *same* abstract `SubAgent` and drops into any pipeline beside config-defined agents —
+/// the point of the unifying trait. A real Logic-only agent (e.g. a session-memory keeper that
+/// queries a store and emits an artifact) has exactly this shape with a non-trivial `run`.
+pub struct HelloWorld {
+    id: SubAgentId,
+}
+
+impl HelloWorld {
+    pub fn new(id: SubAgentId) -> Self {
+        Self { id }
+    }
+}
+
+#[async_trait]
+impl SubAgent for HelloWorld {
+    fn id(&self) -> &SubAgentId {
+        &self.id
+    }
+
+    fn accepts(&self) -> &'static [PayloadKind] {
+        &[PayloadKind::Initial]
+    }
+
+    async fn run(&self, input: AgentPayload) -> Result<AgentPayload, AgentError> {
+        // Self-check like any agent (§2.4): fall on a variant we don't accept, never panic.
+        if !self.accepts().contains(&input.kind()) {
+            return Err(AgentError::Mismatch {
+                expected: self.accepts(),
+                got: input.kind(),
+            });
+        }
+        // No LLM, no tools — the Logic ignores the prompt content and answers a fixed string.
+        let user = match input {
+            AgentPayload::Initial(p) => p.prompt,
+            _ => String::new(),
+        };
+        Ok(AgentPayload::Final(FinalResult {
+            user,
+            assistant: "hello world.".to_string(),
+        }))
     }
 }
 
@@ -987,5 +1053,82 @@ mod tests {
             resolve_pipeline(&cfg, &agents),
             Err(ResolveError::UnknownAgentRef { .. })
         ));
+    }
+
+    // ── §1.1 code-defined agent (no LLM, no tools) unifies with config agents ──
+
+    #[tokio::test]
+    async fn code_defined_agent_runs_beside_config_agents_in_one_orchestrator() {
+        // A code-defined agent (no LLM, no tools, custom Logic) is an `Arc<dyn SubAgent>` just
+        // like a `ConfiguredAgent`, and threads through the same `Orchestrator`.
+        let hello: Arc<dyn SubAgent> = Arc::new(HelloWorld::new(SubAgentId("hello".into())));
+        let writer: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+            &SubAgentConfig {
+                id: SubAgentId("writer".into()),
+                instruction: "write".into(),
+                llm: None,
+                tools: vec![],
+                accepts: vec![PayloadKind::Intermediate],
+                output: None,
+            },
+            ScriptedLlm::arc(vec![LlmResponse::Message("REPORT".into())]),
+            vec![],
+            OutputShape::Final,
+        ));
+
+        let mut agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = HashMap::new();
+        agents.insert(SubAgentId("hello".into()), hello);
+        agents.insert(SubAgentId("writer".into()), writer);
+
+        // Two single-stage pipelines: one runs the code agent, one the config agent.
+        let greet = PipelineConfig {
+            id: PipelineId("greet".into()),
+            stages: vec![SubAgentId("hello".into())],
+        };
+        let report = PipelineConfig {
+            id: PipelineId("report".into()),
+            stages: vec![SubAgentId("writer".into())],
+        };
+        let mut orch = Orchestrator::new();
+        orch.insert(greet.id.clone(), resolve_pipeline(&greet, &agents).unwrap());
+        orch.insert(report.id.clone(), resolve_pipeline(&report, &agents).unwrap());
+
+        // The code agent: any input → the fixed string, no model consulted.
+        let out = orch
+            .run(
+                &PipelineId("greet".into()),
+                AgentPayload::Initial(InitialPrompt { prompt: "anything".into(), history: vec![] }),
+            )
+            .await
+            .unwrap();
+        match out {
+            AgentPayload::Final(f) => assert_eq!(f.assistant, "hello world."),
+            other => panic!("expected Final, got {:?}", other.kind()),
+        }
+
+        // The config agent, in the same orchestrator, still runs its built-in LLM Logic.
+        let mut artifacts = HashMap::new();
+        artifacts.insert(ArtifactKey::FetcherRecords, ArtifactValue::Text("rows".into()));
+        let out = orch
+            .run(
+                &PipelineId("report".into()),
+                AgentPayload::Intermediate(IntermediateData { prompt: "write it".into(), artifacts }),
+            )
+            .await
+            .unwrap();
+        match out {
+            AgentPayload::Final(f) => assert_eq!(f.assistant, "REPORT"),
+            other => panic!("expected Final, got {:?}", other.kind()),
+        }
+    }
+
+    #[tokio::test]
+    async fn code_defined_agent_falls_on_a_variant_it_does_not_accept() {
+        // Even a no-LLM code agent obeys the falling convention (§2.4) — never panics.
+        let hello = HelloWorld::new(SubAgentId("hello".into()));
+        let out = hello
+            .run(AgentPayload::Final(FinalResult { user: "u".into(), assistant: "a".into() }))
+            .await;
+        assert!(matches!(out, Err(AgentError::Mismatch { got: PayloadKind::Final, .. })));
     }
 }
