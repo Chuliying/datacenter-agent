@@ -138,15 +138,21 @@ is why the core compiles and unit-tests without the SDK.
 
 A `Tool` advertises a schema to the LLM and declares a `target: ArtifactKey` — the slot its
 result fills. The **LLM decides which tool to call** at run time; the **designer decides the
-key names** via `target`. The LLM never names a key or invents a tool.
+key names** via `target`. The LLM never names a key or invents a tool. `Tool::call` returns a
+`ToolOutcome` — `Produced(value)` or `Rejected { reason }` (a retryable, model-facing outcome,
+distinct from a fatal `Err(AgentError)`). The full tool story — the fetch/sink/validator
+taxonomy, `ToolId` naming/resolution, and the `SchemaTool` adapter — lives in the
+[Tool contract](../tool/Contract.md).
 
 ### 3.3 The tool-use loop
 
 `run_llm_loop` sends the agent's tool schemas to the LLM, dispatches each requested call to
-the matching `Tool`, feeds results back, and repeats until the LLM returns a final message.
-Tool results are collected into the artifact map, keyed by each tool's `target`. A call to a
-tool the agent does not own is rejected here — the isolation boundary of §2.3, guarded at
-dispatch. A step cap prevents a non-terminating loop.
+the matching `Tool`, feeds results back, and repeats until the LLM returns a final message. On
+`Produced`, the result is recorded in the artifact map keyed by the tool's `target` and fed
+back; on **`Rejected { reason }`**, *no artifact is recorded* and the reason is fed back so the
+model can correct and retry (a validating tool thus "loops until valid" for free); a fatal
+`Err` aborts. A call to a tool the agent does not own is rejected here — the isolation boundary
+of §2.3, guarded at dispatch. A step cap bounds retries and prevents a non-terminating loop.
 
 ### 3.4 Agents differ only by their tool set
 
@@ -216,7 +222,10 @@ surface changes across releases.
   in the type system.
 - **`AgentError::Capability`** is a placeholder string. Give capability failures a taxonomy
   (retryable vs. fatal, which tool/transport) before finalizing — it shapes how the
-  orchestrator routes around a failed stage.
+  orchestrator routes around a failed stage. The *tool-input* half is now settled: a
+  bad/invalid tool argument is a retryable `ToolOutcome::Rejected`, **not** an `AgentError`
+  (see the [Tool contract](../tool/Contract.md) §1.2); `AgentError` is reserved for fatal
+  transport/wiring failures.
 - **Output-key validator** — the concrete "output references only provided keys" check (the
   enforceable half of §2.3) is not yet written.
 - **`ArtifactValue` / `ArtifactKey` variants** — expected to grow as agents and wires are

@@ -688,7 +688,7 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_payload::{InitialPrompt, LlmMessage, LlmResponse, ToolCall, ToolSchema};
+    use agent_payload::{InitialPrompt, LlmMessage, LlmResponse, ToolCall, ToolOutcome, ToolSchema};
     use std::sync::Mutex;
 
     // ── test doubles ──
@@ -731,8 +731,10 @@ mod tests {
         fn target(&self) -> ArtifactKey {
             ArtifactKey::FetcherRecords
         }
-        async fn call(&self, _args: serde_json::Value) -> Result<ArtifactValue, AgentError> {
-            Ok(ArtifactValue::Json(serde_json::json!([{ "id": 1 }])))
+        async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
+            Ok(ToolOutcome::Produced(ArtifactValue::Json(
+                serde_json::json!([{ "id": 1 }]),
+            )))
         }
     }
 

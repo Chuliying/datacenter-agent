@@ -261,13 +261,30 @@ pub trait LlmCapability: Send + Sync {
     ) -> Result<LlmResponse, AgentError>;
 }
 
-/// A tool the LLM may choose to call. `target` is the artifact slot its result fills —
-/// wired by the orchestration designer, never chosen by the LLM.
+/// The result of one tool invocation. **`Rejected` is not an error** — it is a retryable,
+/// model-facing outcome (bad arguments, failed validation), distinct from a fatal
+/// `Err(AgentError)` (transport/wiring). See the tool contract; `run_llm_loop` feeds a
+/// `Rejected { reason }` back to the model so it can correct, and does **not** record an
+/// artifact for it. This is what makes a validating/sink tool "loop until valid" for free.
+#[derive(Clone, Debug)]
+pub enum ToolOutcome {
+    /// The call succeeded; the value fills the tool's `target` artifact slot.
+    Produced(ArtifactValue),
+    /// The call was rejected (e.g. schema validation failed). Fed back to the model as a
+    /// tool message; no artifact is recorded. Retryable within the loop's step cap.
+    Rejected { reason: String },
+}
+
+/// A tool the LLM may choose to call — a **named capability the LLM invokes, whose result
+/// fills an artifact slot** (`target`). This spans data fetches (MCP), output *sinks* that
+/// validate the model's own structured output, and pure *validators/compute* (a calculator).
+/// `target` is wired by the orchestration designer, never chosen by the LLM.
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn schema(&self) -> ToolSchema;
     fn target(&self) -> ArtifactKey;
-    async fn call(&self, arguments: serde_json::Value) -> Result<ArtifactValue, AgentError>;
+    /// `Ok(Produced)` fills `target`; `Ok(Rejected)` is fed back for a retry; `Err` is fatal.
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError>;
 }
 
 /// The tool-use loop: the model sees `tools` and DECIDES which to call; each call is
@@ -303,11 +320,18 @@ pub async fn run_llm_loop<L: LlmCapability>(
                         .iter()
                         .find(|t| t.schema().name == name)
                         .ok_or_else(|| AgentError::UnknownTool(name.clone()))?;
-                    let result = tool.call(arguments).await?;
-                    produced.insert(tool.target(), result.clone());
+                    // A fatal `Err` aborts (`?`); a `Rejected` is fed back for a retry.
+                    let content = match tool.call(arguments).await? {
+                        ToolOutcome::Produced(value) => {
+                            produced.insert(tool.target(), value.clone());
+                            value.to_string()
+                        }
+                        // Do NOT record an artifact: the model must correct and call again.
+                        ToolOutcome::Rejected { reason } => format!("REJECTED: {reason}"),
+                    };
                     messages.push(LlmMessage::Tool {
                         tool_call_id: id,
-                        content: result.to_string(),
+                        content,
                     });
                 }
             }
@@ -621,8 +645,10 @@ mod tests {
         async fn call(
             &self,
             _arguments: serde_json::Value,
-        ) -> Result<ArtifactValue, AgentError> {
-            Ok(ArtifactValue::Json(serde_json::json!([{ "id": 1 }, { "id": 2 }])))
+        ) -> Result<ToolOutcome, AgentError> {
+            Ok(ToolOutcome::Produced(ArtifactValue::Json(
+                serde_json::json!([{ "id": 1 }, { "id": 2 }]),
+            )))
         }
     }
 

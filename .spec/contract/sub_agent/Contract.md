@@ -124,8 +124,12 @@ default base URL and auth style:
 Tools are named by a logical **`ToolId`** — a **closed enum** (parity with `ArtifactKey`: a
 typo is a compile/parse error), decoupled from any backend. A designer-owned **`ToolRegistry`**
 maps each `ToolId` to a concrete `Tool` (schema + `target: ArtifactKey` + call impl). **MCP is
-one backend**: an MCP-backed tool wraps an `McpHandle` + a tool name. `ToolId` (which *grants*
-a tool) stays distinct from `ArtifactKey` (the *slot* a tool's result fills).
+one backend**; **code-backed sinks/validators** (e.g. a `SchemaTool<T>` that schema-checks the
+model's structured output) are another. `ToolId` (which *grants* a tool) stays distinct from
+`ArtifactKey` (the *slot* a tool's result fills). The tool *abstraction, backends, naming,
+resolution, and structured-output enforcement* are specified in the
+[Tool contract](../tool/Contract.md); this contract owns only the **grant** (§2.2) — which
+`ToolId`s an agent is given, its isolation boundary.
 
 **Multiple MCP servers are supported and require no type change.** The registry is
 backend-agnostic — each `ToolId` binds to its own backend — so different `ToolId`s may be

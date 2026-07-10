@@ -1,10 +1,11 @@
 # SubAgent — Implementation Plan
 
-Turns the [SubAgent contract](../contract/sub_agent/Contract.md) and the
-[AgentPayload contract](../contract/agent_payload/Contract.md) into working code inside
-`datacenter-agent`. The contracts fix the *what* (payload sum type + config model +
-resolution/composition rules); this plan covers the *how*, the items the contracts deferred
-(sub-agent §6, payload §6), and the concrete migration of **today's monolithic endpoints into
+Turns the [SubAgent contract](../contract/sub_agent/Contract.md), the
+[AgentPayload contract](../contract/agent_payload/Contract.md), and the
+[Tool contract](../contract/tool/Contract.md) into working code inside `datacenter-agent`. The
+contracts fix the *what* (payload sum type + config model + tool abstraction + resolution/
+composition rules); this plan covers the *how*, the items the contracts deferred (sub-agent §6,
+payload §6, tool §6), and the concrete migration of **today's monolithic endpoints into
 sub-agent pipelines**.
 
 Sequenced so each step compiles and is testable on its own. Nothing here changes the
@@ -53,7 +54,7 @@ exist in the tree. The real starting point:
 |---|---|
 | Term ownership | **Sub-agent layer owns bare `pipeline` / `orchestration`** (Option B). Runtime renamed to `turn` / `input` **first**, behind a behavior-preserving gate (§2). |
 | Agent anatomy | **Three optional components — LLM, Tools, Logic** — behind one `SubAgent` trait unifying **config-defined** (`ConfiguredAgent`) and **code-defined** (`agents.rs`) agents (contract §1.1). The two endpoints are all config; code path is groundwork. |
-| `/report` shape | **Two-stage fetch→write** (`fetcher` → `writer`), the contract's canonical example. |
+| `/report` shape | **Three-stage** `fetcher → charter → finalizer` — the `finalizer` combines the fetcher's data with the `charter`'s schema-checked chart artifacts into the final HTML (§10). |
 | Sub-agent orchestrator ↔ runtime | **Pipeline sits *behind* `AgentPort`** — a `PipelineAgentPort` replaces `LlmAgentPort`; guardrails/intent/memory/audit are preserved. |
 | Tool set | **Closed, hand-authored `ToolId` enum** + registry, resolved at boot (contract §1.3, §2.2). Auto-discovery is replaced. Each grant additionally binds an explicit wire name (`mcp_name`) when it differs from the canonical `ToolId` string (§4). |
 | Streaming | Terminal stage streams (reuse the existing loop, narrowed to the agent's tool grant); upstream stages run buffered via the abstract non-streaming loop. |
@@ -173,9 +174,10 @@ Only when the gate is green is the room clean: the sub-agent modules (§3+) then
 5. **Exit check:** `cargo test` green, `cargo clippy` clean. Nothing is wired into `AppState`
    yet — this step only adds dormant, tested modules.
 
-## 4. Closed `ToolId` enum, multi-server MCP pool + tool registry
+## 4. The tool layer: closed `ToolId`, MCP pool, sinks/validators, registry
 
-Replaces auto-discovery with a closed, boot-resolved set (contract §1.3, §2.2).
+Implements the [Tool contract](../contract/tool/Contract.md). Replaces auto-discovery with a
+closed, boot-resolved set (sub-agent §1.3/§2.2; tool §1–§2).
 
 - **Author the `ToolId` enum.** Run the server once and read the `discovered MCP tools` boot
   log (`main.rs` already logs `names = [...]`) to get the real datacenter tool names, then mint
@@ -214,18 +216,38 @@ Replaces auto-discovery with a closed, boot-resolved set (contract §1.3, §2.2)
   it. Its **advertised schema name is the canonical `ToolId` string, not `mcp_name`** — so two
   servers exposing the same raw name never collide within an agent's exposed set. `call()`
   delegates to `McpHandle::call_tool_text`, sending `mcp_name` to its own server.
-- **Registry population.** Build one `ToolFactory` per parsed `(ToolId, mcp_name, server)`
-  triple, each capturing the correct server's handle. Resolve every `SubAgentConfig.tools`
-  grant at boot; abort with a clear error listing the offending `(sub_agent, ToolId)`.
-- **Optional drift guard.** After discovery, assert every `[[mcp_server]].tools` entry's
-  `mcp_name` maps to a name the server actually advertised, and warn on advertised names with
-  no `ToolId` — so the closed set never silently diverges from the live server. Compare against
-  `mcp_name` here, not the `ToolId` string: the server only ever advertises the former.
+- **Code-backed sinks & validators via `SchemaTool<T>`.** MCP is one backend; the other is
+  code (tool contract §1.1). Port the reference [`SchemaTool<T>`](../contract/tool/tool.rs): a
+  generic `Tool` whose advertised schema is `schemars`-derived from a protocol type `T` and
+  whose `call` validates by deserializing into `T`, mapping a failure to `ToolOutcome::Rejected`
+  (fed back, retried) rather than a crash. `SchemaTool::sink` (identity — the validated `T` *is*
+  the artifact, e.g. `emit_chart`) and `SchemaTool::new` (transform, e.g. a `calculate` tool
+  that may `Reject` on divide-by-zero) cover the structured-output cases. Adds the `schemars`
+  dependency.
+- **`ToolOutcome::Rejected` retry-feedback in the loop.** The generalized streaming loop (§8)
+  and the buffered `run_llm_loop` must both feed a `Rejected { reason }` back to the model as a
+  tool message **without recording an artifact**, and abort only on a fatal `Err` — bounded by
+  the step cap. This is the "loop until valid" behavior; the reference already encodes it.
+- **Registry population + completeness.** Build one `ToolFactory` per `ToolId` — MCP tools from
+  the parsed `(ToolId, mcp_name, server)` triples, sink/validator tools from code. Resolve every
+  `SubAgentConfig.tools` grant at boot; abort listing the offending `(sub_agent, ToolId)`. Also
+  run the **completeness check** (`assert_complete(ALL_TOOL_IDS)`) so every `ToolId` in the
+  closed set has exactly one backend — no gap, no duplicate.
+- **Registration ergonomics (auto-register) — decision.** Default to **explicit** registration
+  (a designer-owned `build_registry()` with one `register` per tool). A `#[tool]` attribute
+  proc-macro (schema derive + `Tool` impl + optional `inventory` link-time collection) is a
+  deferred ergonomic add (tool §3/§6); *if* adopted, auto-collection is validated against the
+  closed `ToolId` set by the completeness check above, so the fail-fast guarantee survives — a
+  link-dropped or mistagged tool fails boot rather than vanishing.
+- **Optional drift guard (MCP only).** After discovery, assert every `[[mcp_server]].tools`
+  entry's `mcp_name` maps to a name the server actually advertised, and warn on advertised names
+  with no `ToolId`. Compare against `mcp_name`, not the `ToolId` string: the server only
+  advertises the former. (Sink/validator tools have no server, so this guard skips them.)
 - **Exit check:** a unit test resolves a grant spanning two mock servers, rejects an
-  unregistered `ToolId`, asserts two same-named raw tools get distinct advertised names, and
-  covers the `mcp_name` override — a `ToolId` configured with an explicit `mcp_name` dispatches
-  *that* name to the mock server while the LLM-visible schema name stays the canonical `ToolId`
-  string.
+  unregistered `ToolId`, asserts two same-named raw tools get distinct advertised names, covers
+  the `mcp_name` override, and (from the tool reference) covers a `SchemaTool` sink that
+  `Rejects` a bad shape then `Produces` on a valid one — with the loop recording the artifact
+  only for the valid attempt.
 
 ## 5. Per-server MCP instruction routing
 
@@ -236,11 +258,11 @@ granted tool subsets, that is wrong.
 - Attach each server's `instructions` to its pool entry.
 - When building a `ConfiguredAgent`, compute the **distinct set of servers backing its granted
   tools** and compose *those* instruction blocks (deduplicated) into its system prompt,
-  alongside the agent's own `instruction`. A no-tool agent (e.g. the report `writer`) gets none.
+  alongside the agent's own `instruction`. A no-tool agent (e.g. the report `finalizer`) gets none.
 - Keep the existing "Current Time" + base-prompt assembly (`generation_config`); only the
   instructions source changes from one global block to the per-agent server set.
 - **Exit check:** an agent granted tools from server A only never sees server B's instructions;
-  an agent spanning A+B sees both, once each; the no-tool `writer` sees neither.
+  an agent spanning A+B sees both, once each; the no-tool `finalizer` sees neither.
 
 ## 6. TOML raw→resolved loader
 
@@ -267,7 +289,7 @@ granted tool subsets, that is wrong.
   `MissingModel` / `UnknownAgentRef` — name the offending `SubAgentId` and collect it alongside
   any other resolution errors (§7) rather than aborting on the first one.
 - Resolve `instruction = { file = … }` prompt refs via the existing `load_prompt` path
-  (relative to the manifest dir) — the report `writer` reuses `report_system`, the analytics
+  (relative to the manifest dir) — the report `finalizer` reuses `report_system`, the analytics
   agent reuses `agent_system`.
 - **Merge code-defined agents into the same map.** After building `ConfiguredAgent`s from
   `[[sub_agent]]`, insert any hand-written `SubAgent`s (§1, `agents.rs`) into the *same*
@@ -384,12 +406,12 @@ stages = ["analyst"]
 `analyst` is the terminal (and only) stage → it streams. Behavior-preserving vs today's
 `/agent`.
 
-### `report` — two-stage fetch→write
+### `report` — fetch → chart → finalize (three stages)
 
-The report maker splits into a data `fetcher` (holds the data tools, emits `Intermediate`
-artifacts, runs **buffered**) and a `writer` (no tools — it *cannot* fetch or invent — consumes
-the artifacts, emits the final HTML, runs as the **streaming terminal stage** with the raised
-token ceiling):
+The report maker splits into three: a data `fetcher`, a `charter` that produces
+**schema-enforced chart artifacts** via a `SchemaTool` sink, and a `finalizer` that **combines
+all upstream artifacts** (data + charts) into the final HTML. The first two run **buffered**;
+the `finalizer` is the **streaming terminal stage** with the raised token ceiling.
 
 ```toml
 [[sub_agent]]
@@ -397,46 +419,58 @@ id = "fetcher"
 instruction = { file = "prompt_guide/agent_system.md" }   # or a dedicated fetch prompt
 tools = [ /* same data-tool grant */ ]
 accepts = ["initial"]
-# no `output` — "fetcher" is non-terminal in the only pipeline that references it (`report`
-# below), so the shape derives to "intermediate"
+# non-terminal ⇒ output derives to "intermediate"
 
 [[sub_agent]]
-id = "writer"
+id = "charter"
+instruction = { file = "prompt_guide/charter_system.md" }
+tools = ["emit_chart"]            # a code-backed SchemaTool sink (NOT an MCP tool)
+accepts = ["intermediate"]        # reads the fetcher's data artifacts
+# non-terminal ⇒ output derives to "intermediate"; the validated chart lands at `charts.spec`
+
+[[sub_agent]]
+id = "finalizer"
 instruction = { file = "prompt_guide/report_system.md" }
-tools = []                        # no-tool agent → isolation boundary is empty
+tools = []                        # no tools — it combines, it doesn't fetch or invent
 accepts = ["intermediate"]
-# no `output` — "writer" is terminal in the only pipeline that references it, so the shape
-# derives to "final"
+# terminal ⇒ output derives to "final"
 [sub_agent.llm]
 max_tokens = 16384                # replaces the REPORT_MAX_TOKENS override
 
 [[pipeline]]
 id = "report"
-stages = ["fetcher", "writer"]
+stages = ["fetcher", "charter", "finalizer"]
 ```
 
-- Neither example above sets `output`: with only two pipelines and no agent shared between
-  them at different positions, position-derivation (contract §2.4) resolves both cleanly. The
-  contract's *own* canonical example — the same `fetcher` reused terminally in a
-  `quick_fetch = ["fetcher"]` pipeline — is exactly the case that would force `output =
-  "intermediate"` back onto `fetcher` explicitly; we don't have that pipeline, so we don't pay
-  for it.
-- The `writer`'s empty grant is the contract's isolation guarantee made concrete: its LLM has
-  no fetch tool, so it writes only from the `fetcher`'s artifacts (§2.3).
-- `REPORT_MAX_TOKENS` (handler const) becomes the `writer`'s per-agent `llm.max_tokens`;
+- **`emit_chart` is a code-registered sink**, not an MCP tool — it has no `[[mcp_server]]`
+  entry. `ToolId::EmitChart` is backed by a `SchemaTool::<ChartSpec>::sink` in `build_registry()`
+  (§4), targeting a new `ArtifactKey::ChartsSpec` (`charts.spec`). The model calls it with a
+  chart spec; a bad shape is `Rejected` and fed back until valid — "loop until valid" for free.
+- **The `finalizer` is the "combine all stuff" stage** (your decision): its empty grant is the
+  isolation guarantee made concrete (it can't fetch or invent), and it consumes the *merged*
+  artifact map — the fetcher's data plus the charter's `charts.spec` — emitting one HTML report
+  that embeds the validated chart data. This is why chart producers must be **`Intermediate`**:
+  `OutputShape::Final` keeps prose and *drops* artifacts (contract §2.4), so a chart can never be
+  a terminal stage's output — it must flow as an artifact into the finalizer.
+- No agent sets `output`; none is shared across pipelines at different positions, so
+  position-derivation resolves all three cleanly (contract §2.4).
+- `REPORT_MAX_TOKENS` becomes the `finalizer`'s per-agent `llm.max_tokens`;
   `USER_PROMPT_LENGTH_CAP` stays a cheap HTTP-layer check in `handler.rs`.
-- Streaming: `fetcher` buffered, `writer` streams token-by-token — same wire contract as
-  `/report/stream` today.
-- **Exit check:** `/report` yields a `falcon-report` HTML block whose content references only
-  artifacts the `fetcher` produced; a unit test drives the two-stage pipeline with a mocked LLM
-  + mock tools and asserts the `writer` receives the `fetcher`'s artifacts and holds zero tools.
+- Streaming: `fetcher` + `charter` buffered, `finalizer` streams token-by-token — same wire
+  contract as `/report/stream` today.
+- **Exit check:** a unit test drives the three-stage pipeline with a mocked LLM + mock data
+  tools + the real `SchemaTool` sink; assert the `charter` rejects a malformed chart then
+  produces `charts.spec`, and the `finalizer` receives both the fetcher's data and the chart
+  artifact and holds zero tools. `/report` yields a `falcon-report` HTML block whose chart data
+  is exactly what the sink validated.
 
 ## 11. Migration & compatibility
 
 - **Ship §2 first, on its own, behind its gate** — the vocabulary rename is a standalone,
   behavior-preserving commit that precedes all sub-agent code. Nothing downstream starts until
   its gate is green.
-- Ship §10's `agent` (one-stage) and `report` (two-stage) pipelines as the default config.
+- Ship §10's `agent` (one-stage) and `report` (three-stage `fetcher → charter → finalizer`)
+  pipelines as the default config.
 - Keep the legacy direct path (`should_use_runtime == false` rollback) working until the
   pipeline path is proven in staging, then remove `LlmAgentPort` and the raw `tools` /
   `instructions` `AppState` fields.
@@ -450,6 +484,9 @@ stages = ["fetcher", "writer"]
 
 - **async-openai 0.40 → 0.41.1** — crate-wide bump; do it in an isolated commit after the
   pipeline path is stable (§8).
+- **`#[tool]` proc-macro + `inventory` auto-registration** — ergonomic tool definition
+  (schema derive + `Tool` impl + link-time collection), reconciled with the closed set by the
+  boot completeness check (tool contract §3/§6). Explicit registration ships first.
 - **Eval CLI tidy** `--pipeline-only → --input-only` — optional, cosmetic; deferred so §2 does
   not break a shipped flag.
 - **Report-route guardrail tuning** — the reduced-turn / report-answer-policy decision (§9).
@@ -464,7 +501,7 @@ stages = ["fetcher", "writer"]
 - **Caller-requested intermediate projection** — a request-time knob (e.g. a query param or
   header) letting a caller ask for the pipeline's pre-terminal `Intermediate` payload instead
   of the terminal stage's `Final` one. This is where "return the fetcher's raw artifacts, not
-  the writer's prose" now lives, now that `output` is derived from *structural* position rather
+  the finalizer's prose" now lives, now that `output` is derived from *structural* position rather
   than authored per request — it is a caller-side projection, not a per-agent config choice.
 
 ---
