@@ -395,19 +395,21 @@ fn arg_object(
 
 /// A [`Tool`] backed by an MCP server.
 ///
-/// The **advertised** name is the canonical [`ToolId`] string, so two servers exposing the same
-/// raw name never collide within an agent's exposed set.
-/// `call` sends `mcp_name` — the server's own raw name, which may differ — to that server.
+/// `name` is the **advertised**, LLM-facing name; `call` sends `mcp_name` — the server's own raw
+/// name, which may differ — to that server. Two constructors set `name`: [`new`](Self::new) from a
+/// closed [`ToolId`] (its canonical string), and [`from_name`](Self::from_name) from a plain
+/// string (the config-driven path, where the datacenter's wire names are the source of truth
+/// rather than a compile-time enum).
 ///
 /// `description` and `parameters` are the server's advertised schema, so the model knows how to
 /// call it.
 ///
 /// # References
 ///
-/// - Tool contract §2.3 — advertised name is the canonical `ToolId` string
+/// - Tool contract §2.3 — advertised name distinct from the raw wire name
 pub struct McpTool {
     handle: McpHandle,
-    id: ToolId,
+    name: String,
     mcp_name: String,
     description: String,
     parameters: serde_json::Value,
@@ -415,17 +417,38 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    /// Builds an MCP-backed tool.
+    /// Builds an MCP-backed tool from a plain advertised **name** (the config-driven path).
     ///
     /// # Arguments
     ///
     /// - `handle`: the connected MCP client the call is sent through.
-    /// - `id`: the logical tool id, whose canonical string is the LLM-facing name.
-    /// - `mcp_name`: the raw name the server is actually asked for (may differ from `id`).
+    /// - `name`: the logical, LLM-facing tool name (a datacenter wire name, from config).
+    /// - `mcp_name`: the raw name the server is actually asked for (may differ from `name`; equals
+    ///   it for the single-server datacenter case).
     /// - `description`: the server's advertised description.
     /// - `parameters`: the tool's JSON-Schema argument spec (typically the `input_schema`
     ///   discovered via [`McpHandle::list_openrouter_tools`]).
     /// - `target`: the artifact slot the tool's result fills.
+    pub fn from_name(
+        handle: McpHandle,
+        name: impl Into<String>,
+        mcp_name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+        target: ArtifactKey,
+    ) -> Self {
+        Self {
+            handle,
+            name: name.into(),
+            mcp_name: mcp_name.into(),
+            description: description.into(),
+            parameters,
+            target,
+        }
+    }
+
+    /// Builds an MCP-backed tool from a closed [`ToolId`] — its canonical string is the advertised
+    /// name. Convenience over [`from_name`](Self::from_name) for the enumerated-tool path (tests).
     pub fn new(
         handle: McpHandle,
         id: ToolId,
@@ -434,14 +457,7 @@ impl McpTool {
         parameters: serde_json::Value,
         target: ArtifactKey,
     ) -> Self {
-        Self {
-            handle,
-            id,
-            mcp_name: mcp_name.into(),
-            description: description.into(),
-            parameters,
-            target,
-        }
+        Self::from_name(handle, id.to_string(), mcp_name, description, parameters, target)
     }
 }
 
@@ -449,7 +465,7 @@ impl McpTool {
 impl Tool for McpTool {
     fn schema(&self) -> ToolSchema {
         ToolSchema {
-            name: self.id.to_string(), // §2.3: advertised name is the canonical ToolId string
+            name: self.name.clone(), // the advertised, LLM-facing name (ToolId string or config wire name)
             description: self.description.clone(),
             parameters: self.parameters.clone(),
         }

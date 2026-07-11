@@ -85,7 +85,9 @@ fn summarize(ev: &AgentEvent) -> String {
         AgentEvent::StageProduced { agent, keys } => {
             format!("[stage produced] {} -> {keys:?}", agent.0)
         }
-        AgentEvent::StageFinished { agent } => format!("[stage finished] {}", agent.0),
+        AgentEvent::StageFinished { agent, outcome } => {
+            format!("[stage finished] {} ({outcome:?})", agent.0)
+        }
         AgentEvent::ToolStarted { name } => format!("[tool started] {name}"),
         AgentEvent::ToolProduced { name, target } => format!("[tool produced] {name} -> {target}"),
         AgentEvent::ToolRejected { name, reason } => format!("[tool rejected] {name}: {reason}"),

@@ -97,6 +97,45 @@ struct Manifest {
     /// Optional runtime capability-pack references and assembly.
     #[serde(default)]
     runtime: Option<RuntimeManifest>,
+    /// Optional `/insight` pipeline tool grants (defaults applied when absent).
+    #[serde(default)]
+    insight: Option<InsightManifest>,
+}
+
+/// Optional `[insight]` section: per-sub-agent tool grants for the `/insight` pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsightManifest {
+    #[serde(default = "default_insight_grants")]
+    grants: InsightGrantsManifest,
+}
+
+/// `[insight.grants]`: the tools each `/insight` sub-agent exposes to its LLM, by wire name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsightGrantsManifest {
+    #[serde(default = "default_fetcher_grant")]
+    fetcher: Vec<String>,
+    #[serde(default = "default_charter_grant")]
+    charter: Vec<String>,
+}
+
+/// The fetcher's default grant: `["*"]` — every tool the MCP server advertises, so new datacenter
+/// tools are wired without a code change.
+fn default_fetcher_grant() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+/// The charter's default grant: the built-in `emit_chart` sink only.
+fn default_charter_grant() -> Vec<String> {
+    vec!["emit_chart".to_string()]
+}
+
+fn default_insight_grants() -> InsightGrantsManifest {
+    InsightGrantsManifest {
+        fetcher: default_fetcher_grant(),
+        charter: default_charter_grant(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -219,6 +258,30 @@ pub struct AppConfig {
     pub prompts: BTreeMap<String, String>,
     /// Optional runtime config references and assembly.
     pub runtime: Option<RuntimeRefs>,
+    /// Resolved `/insight` pipeline tool grants (defaults when `[insight]` is absent).
+    pub insight_grants: InsightGrants,
+}
+
+/// Resolved `/insight` pipeline tool grants — which tools each sub-agent exposes to its LLM.
+///
+/// Names are matched at boot against the MCP server's advertised set (fail-fast on a typo) or the
+/// built-in code-backed tools (e.g. `emit_chart`). A grant of `["*"]` means "every tool the MCP
+/// server advertises", so new datacenter tools are wired without a code change.
+#[derive(Debug, Clone)]
+pub struct InsightGrants {
+    /// The fetcher's granted data tools (MCP wire names, or `["*"]` for all discovered).
+    pub fetcher: Vec<String>,
+    /// The charter's granted tools (normally the built-in `emit_chart` sink).
+    pub charter: Vec<String>,
+}
+
+impl Default for InsightGrants {
+    fn default() -> Self {
+        Self {
+            fetcher: default_fetcher_grant(),
+            charter: default_charter_grant(),
+        }
+    }
 }
 
 /// Resolved runtime references and assembly from the host config.
@@ -336,6 +399,14 @@ impl AppConfig {
             .runtime
             .map(|runtime| RuntimeRefs::resolve(&root, runtime));
 
+        let insight_grants = manifest
+            .insight
+            .map(|insight| InsightGrants {
+                fetcher: insight.grants.fetcher,
+                charter: insight.grants.charter,
+            })
+            .unwrap_or_default();
+
         // Log the loaded config
         info!(
             root = %root.display(),
@@ -347,6 +418,7 @@ impl AppConfig {
             root,
             prompts,
             runtime,
+            insight_grants,
         })
     }
 
@@ -406,5 +478,31 @@ mod tests {
         assert!(runtime
             .response_baseline
             .ends_with("runtime/evals/response-baseline.json"));
+    }
+
+    #[test]
+    fn config_loads_insight_grants() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        // The fetcher enumerates the datacenter analytics tools explicitly; the charter gets the
+        // code-backed `emit_chart` sink.
+        assert_eq!(
+            cfg.insight_grants.fetcher,
+            [
+                "bill_revenue",
+                "bill_charge",
+                "member_analysis",
+                "business_metrics",
+                "station_revenue_ranking",
+            ]
+        );
+        assert_eq!(cfg.insight_grants.charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn insight_grants_default_to_wildcard_when_section_absent() {
+        // The in-code default (no `[insight]` section) still grants the fetcher every discovered
+        // MCP tool, so a minimal config keeps working.
+        assert_eq!(InsightGrants::default().fetcher, ["*"]);
+        assert_eq!(InsightGrants::default().charter, ["emit_chart"]);
     }
 }

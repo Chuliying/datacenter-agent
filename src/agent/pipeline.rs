@@ -21,7 +21,7 @@
 //!
 //! | Stage | Kind | Reads | Produces | Shape |
 //! |---|---|---|---|---|
-//! | `fetcher` | [`ConfiguredAgent`] + MCP tools | the user prompt | `fetcher.records` | Intermediate |
+//! | `fetcher` | [`ConfiguredAgent`] + MCP tools | the user prompt | `fetcher.*` (one per granted tool) | Intermediate |
 //! | `analyst` | [`ConfiguredAgent`], no tools | `fetcher.records` | `analyst.message` (its prose) | Intermediate |
 //! | `charter` | [`ConfiguredAgent`] + `emit_chart` sink | the report + data | `charts.spec` (or nothing) | Intermediate |
 //! | `finalizer` | [`Finalizer`] — pure logic, no LLM | `analyst.message` + `charts.spec` | the answer | Final |
@@ -53,7 +53,6 @@ use crate::agent::engine::SubAgent;
 use crate::agent::payload::{
     AgentError, AgentPayload, ArtifactKey, ArtifactValue, FinalResult, PayloadKind,
 };
-use crate::agent::tools::ToolId;
 
 // ===========================================================================
 // Authored stage instructions (compiled in; superseded by the §6 TOML loader later)
@@ -70,8 +69,11 @@ pub const CHARTER_INSTRUCTION: &str = include_str!("../../config/prompt_guide/ch
 // Stage configs — the authored `SubAgentConfig` for each LLM-driven stage
 // ===========================================================================
 
-/// The `fetcher` config: MCP data tools, consumes the initial prompt, produces `fetcher.records`.
+/// The `fetcher` config: instruction, accepts, and message policy for the MCP data-fetch stage.
 ///
+/// Its **tool grant is config-driven** (`[insight.grants].fetcher`, resolved by
+/// [`build_insight_pipeline`](crate::agent::wiring::build_insight_pipeline)); the `tools` field
+/// here is left empty because the `/insight` path never reads it.
 /// Non-terminal ⇒ its output shape derives to `Intermediate`
 /// ([`effective_output`](crate::agent::config::effective_output)).
 pub fn fetcher_config() -> SubAgentConfig {
@@ -79,7 +81,7 @@ pub fn fetcher_config() -> SubAgentConfig {
         id: SubAgentId("fetcher".into()),
         instruction: FETCHER_INSTRUCTION.to_string(),
         llm: None,
-        tools: vec![ToolId::BillRevenue], // the real datacenter grant (extends with the closed set)
+        tools: vec![], // grant is config-driven; see `[insight.grants]` / `build_insight_pipeline`
         accepts: vec![PayloadKind::Initial],
         output: None,
         capture_message: false, // tool-only stage — its "已取得營收" note is throwaway
@@ -103,14 +105,17 @@ pub fn analyst_config() -> SubAgentConfig {
     }
 }
 
-/// The `charter` config: the `emit_chart` sink only, consumes the report + data, produces
-/// `charts.spec` (or nothing, for chit-chat).
+/// The `charter` config: instruction, accepts, and message policy for the chart stage.
+///
+/// Its tool grant is config-driven (`[insight.grants].charter`, normally the `emit_chart` sink);
+/// the `tools` field here is left empty because the `/insight` path never reads it. Consumes the
+/// report + data, produces `charts.spec` (or nothing, for chit-chat).
 pub fn charter_config() -> SubAgentConfig {
     SubAgentConfig {
         id: SubAgentId("charter".into()),
         instruction: CHARTER_INSTRUCTION.to_string(),
         llm: None,
-        tools: vec![ToolId::EmitChart],
+        tools: vec![], // grant is config-driven; see `[insight.grants]` / `build_insight_pipeline`
         accepts: vec![PayloadKind::Intermediate],
         output: None,
         capture_message: false, // its output is the validated chart artifact, not its message

@@ -62,8 +62,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(handler::health))
         .route("/ready", get(handler::ready))
         .route("/greeting", get(handler::greeting))
-        .route("/agent", post(handler::agent))
-        .route("/agent/stream", post(handler::agent_stream))
+        .route("/insight", post(handler::insight))
+        .route("/insight/stream", post(handler::insight_stream))
         .route("/report", post(handler::report))
         .route("/report/stream", post(handler::report_stream))
         .layer(middleware::from_fn_with_state(

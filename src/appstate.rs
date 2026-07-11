@@ -91,7 +91,9 @@ impl LlmDefaults {
 /// cost up to kilobytes!).
 #[derive(Debug)]
 pub struct PromptBank {
-    /// System prompt for the analytical `/agent` + `/agent/stream` endpoints.
+    /// Legacy monolith analytics system prompt. The live `/insight` + `/insight/stream`
+    /// endpoints now drive the sub-agent pipeline (with its own per-stage prompts under
+    /// `config/prompt_guide/`); this prompt still backs the eval baseline runner.
     pub agent_system: String,
     /// System prompt for the HTML report `/report` + `/report/stream` endpoints.
     pub report_system: String,
@@ -152,6 +154,9 @@ pub struct AppState {
     /// Runtime wiring. Active by default (cutover); `RUNTIME_ENABLED=false`
     /// rolls a request back to the legacy direct path.
     pub runtime: Option<Arc<AppRuntime>>,
+    /// Resolved `/insight` pipeline tool grants (from `[insight.grants]`), validated against the
+    /// discovered MCP tool set at boot.
+    pub insight_grants: crate::config::InsightGrants,
 }
 
 /// Runtime dependencies assembled at boot.
@@ -189,6 +194,16 @@ impl AppState {
             .build()
             .context("build /ready probe http client")?;
         let runtime = build_runtime(app_config)?;
+
+        // Fail fast at boot if a configured /insight tool grant names a tool the datacenter server
+        // did not advertise (or an unknown built-in) — never a deferred first-request failure.
+        crate::agent::wiring::validate_insight_grants(
+            &tools,
+            &app_config.insight_grants.fetcher,
+            &app_config.insight_grants.charter,
+        )
+        .context("validate /insight tool grants")?;
+
         Ok(Self {
             mcp,
             tools,
@@ -199,6 +214,7 @@ impl AppState {
             auth_token: Arc::new(auth_token),
             greetings: Arc::new(Mutex::new(Vec::new())),
             runtime,
+            insight_grants: app_config.insight_grants.clone(),
         })
     }
 
@@ -206,9 +222,9 @@ impl AppState {
     ///
     /// The effective system prompt is `base_system` with the MCP server's
     /// conventions appended (when present), mirroring the orchestrator. LLM
-    /// parameters are cloned from [`LlmDefaults`]. Shared by `/agent`,
-    /// `/agent/stream`, and the greeting generator so the wire contract and
-    /// model behaviour stay identical.
+    /// parameters are cloned from [`LlmDefaults`]. Shared by the legacy monolith
+    /// `/report` + `/report/stream` paths and the greeting generator so the wire
+    /// contract and model behaviour stay identical.
     pub fn generation_config(
         &self,
         base_system: &str,

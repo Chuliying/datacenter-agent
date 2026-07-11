@@ -40,7 +40,7 @@ use crate::agent::clock::current_time_header;
 use crate::agent::config::{
     OutputShape, PipelineConfig, PipelineId, ResolveError, SubAgentConfig, SubAgentId,
 };
-use crate::agent::events::{AgentEvent, EventSink};
+use crate::agent::events::{AgentEvent, EventSink, StageOutcome};
 use crate::agent::payload::{
     run_llm_loop, AgentError, AgentPayload, ArtifactKey, ArtifactValue, FinalResult,
     IntermediateData, LlmCapability, LlmMessage, LlmResponse, PayloadKind, Tool, ToolSchema,
@@ -468,6 +468,12 @@ impl Orchestrator {
             acc = match stage.run(acc).await {
                 Ok(next) => next,
                 Err(e) => {
+                    // Mark the failed stage (a red dot) before the terminal error, so a UI can
+                    // close out its indicator with a failure rather than leaving it spinning.
+                    sink.emit(AgentEvent::StageFinished {
+                        agent: agent.clone(),
+                        outcome: StageOutcome::Failure,
+                    });
                     sink.emit(AgentEvent::Error {
                         message: e.to_string(),
                     });
@@ -490,7 +496,10 @@ impl Orchestrator {
                     });
                 }
             }
-            sink.emit(AgentEvent::StageFinished { agent });
+            sink.emit(AgentEvent::StageFinished {
+                agent,
+                outcome: StageOutcome::Success,
+            });
         }
         if let AgentPayload::Final(f) = &acc {
             sink.emit(AgentEvent::Finished {
@@ -981,6 +990,7 @@ mod tests {
                 },
                 AgentEvent::StageFinished {
                     agent: SubAgentId("fetcher".into()),
+                    outcome: StageOutcome::Success,
                 },
                 AgentEvent::StageStarted {
                     agent: SubAgentId("writer".into()),
@@ -991,11 +1001,75 @@ mod tests {
                 },
                 AgentEvent::StageFinished {
                     agent: SubAgentId("writer".into()),
+                    outcome: StageOutcome::Success,
                 },
                 AgentEvent::Finished {
                     assistant: "THE REPORT".into(),
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn run_emitting_marks_a_failed_stage_then_emits_a_terminal_error() {
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::new());
+
+        // A stage that only accepts Intermediate, handed an Initial → it falls with `Mismatch`
+        // before its LLM is ever consulted.
+        let writer_cfg = SubAgentConfig {
+            id: SubAgentId("writer".into()),
+            instruction: "write".into(),
+            llm: None,
+            tools: vec![],
+            accepts: vec![PayloadKind::Intermediate],
+            output: None,
+            capture_message: true,
+        };
+        let writer = ConfiguredAgent::new(
+            &writer_cfg,
+            ScriptedLlm::arc(vec![]), // never called — the accept-check fails first
+            vec![],
+            OutputShape::Final,
+        );
+        let mut agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = HashMap::new();
+        agents.insert(SubAgentId("writer".into()), Arc::new(writer));
+        let pipe = PipelineConfig {
+            id: PipelineId("p".into()),
+            stages: vec![SubAgentId("writer".into())],
+        };
+        let mut orch = Orchestrator::new();
+        orch.insert(pipe.id.clone(), resolve_pipeline(&pipe, &agents).unwrap());
+
+        let result = orch
+            .run_emitting(
+                &PipelineId("p".into()),
+                AgentPayload::Initial(InitialPrompt {
+                    prompt: "x".into(),
+                    history: vec![],
+                    now: fixed_now(),
+                }),
+                &*sink,
+            )
+            .await;
+
+        assert!(result.is_err());
+        // The failed stage is closed out with `Failure` (red dot) *before* the terminal error.
+        let events = sink.events();
+        assert_eq!(events.len(), 3, "got {events:?}");
+        assert!(matches!(
+            &events[0],
+            AgentEvent::StageStarted {
+                input: PayloadKind::Initial,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::StageFinished {
+                outcome: StageOutcome::Failure,
+                ..
+            }
+        ));
+        assert!(matches!(&events[2], AgentEvent::Error { .. }));
     }
 }

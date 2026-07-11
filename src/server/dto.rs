@@ -47,7 +47,7 @@ pub struct AgentResponse {
     pub intent: String,
 }
 
-/// One frame on the `POST /agent/stream` SSE wire.
+/// One frame on the `POST /insight/stream` (and legacy `/report/stream`) SSE wire.
 ///
 /// Every frame is a JSON object inside a single `data:` line, with `event`
 /// as the discriminator.
@@ -56,6 +56,7 @@ pub struct AgentResponse {
 /// - `error`: The `data` field carries the error message.
 /// - `done`: Carries no payload, used to indicate the end of the stream.
 /// - `clear`: Carries no payload, used to suggest down stream reset current accumulated tokens.
+/// - `stage`: The `data` field names the sub-agent now running (`/insight/stream` only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum StreamFrame {
@@ -67,6 +68,10 @@ pub enum StreamFrame {
     Error { data: String },
     /// Clear event, used to suggest down stream reset current accumulated tokens.
     Clear,
+    /// Sub-agent stage transition. `data` carries the sub-agent id and its lifecycle phase
+    /// (`started`, then `success` / `failure` on completion) — enough for a client to show a
+    /// per-stage progress indicator that turns green or red. Emitted only by `/insight/stream`.
+    Stage { data: StageData },
     /// Intent resolved event, emitted once before any token so the host can
     /// pick the answer topic branch. Mirrors the frontend `intent.resolved`
     /// event shape (`data: { intent, candidateIntents }`).
@@ -82,6 +87,28 @@ pub struct IntentResolvedData {
     pub intent: String,
     /// Candidate intents considered by the pipeline.
     pub candidate_intents: Vec<String>,
+}
+
+/// Payload for the [`StreamFrame::Stage`] event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StageData {
+    /// The sub-agent this transition is about (`fetcher` / `analyst` / `charter` / `finalizer`).
+    pub agent: String,
+    /// Whether the sub-agent just started, or finished with success / failure.
+    pub phase: StagePhase,
+}
+
+/// Lifecycle phase of a sub-agent stage, for a start → success/failure indicator (e.g. a dot
+/// that spins, then turns green or red).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StagePhase {
+    /// The stage began running.
+    Started,
+    /// The stage finished successfully (a green dot).
+    Success,
+    /// The stage finished with an error (a red dot); a terminal `error` frame follows.
+    Failure,
 }
 
 // ──── /greeting ───

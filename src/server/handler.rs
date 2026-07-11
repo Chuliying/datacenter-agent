@@ -15,6 +15,7 @@
 //! Request handlers.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -24,24 +25,24 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{stream::BoxStream, Stream, StreamExt};
 use tracing::{error, instrument, warn, Instrument};
-use uuid::Uuid;
 
 use rand::seq::SliceRandom;
 
 use super::dto::{
-    AgentRequest, AgentResponse, GreetingResponse, IntentResolvedData, ReadyBody, ReadyChecks,
+    AgentRequest, AgentResponse, GreetingResponse, ReadyBody, ReadyChecks, StageData, StagePhase,
     StreamFrame,
 };
 use super::error::AppError;
 use super::AppState;
-use crate::appstate::AppRuntime;
+use crate::agent::clock::{Clock, SystemClock};
+use crate::agent::config::{Provider, ResolvedLlm};
+use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
+use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
+use crate::agent::pipeline::agent_pipeline_id;
+use crate::agent::wiring::build_insight_pipeline;
+use crate::appstate::LlmDefaults;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
-use crate::runtime::audit::{AuditCtx, AuditWriter};
-use crate::runtime::schema::AgentTurnInput;
-use crate::runtime::turn::{
-    run_agent_turn, AgentTurnDeps, AgentTurnOutcome, LlmAgentPort, TurnEvent,
-};
 
 /// Upper bound on the user prompt, in UTF-8 characters.
 pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
@@ -119,30 +120,58 @@ pub async fn greeting(State(state): State<AppState>) -> Result<Json<GreetingResp
     }
 }
 
-// ──── /agent ───
+// ──── /insight ───
 
-/// Regular agent chat handler.
-pub async fn agent(
+/// Non-streaming analytics handler: runs the four-stage `/insight` pipeline (fetcher → analyst →
+/// charter → finalizer) and returns the finalizer's complete answer — the analyst's report with
+/// any charts embedded as `falcon-chart` fenced blocks.
+///
+/// This drives the sub-agent pipeline **directly**: it does not pass through the runtime turn
+/// (guardrails / intent / memory / audit). Routing the pipeline behind the runtime `AgentPort` is
+/// the plan's §9 step, deferred until the pipeline is proven by hand.
+pub async fn insight(
     State(state): State<AppState>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<AgentResponse>, AppError> {
     let Json(req) = req?;
 
-    // Prepare logging
     let span = tracing::info_span!(
-        "agent",
+        "insight",
         prompt_len = req.prompt.chars().count(),
         history_len = req.history.len(),
         session_id = req.session_id.as_deref().unwrap_or(""),
         option_id = req.option_id.as_deref().unwrap_or(""),
     );
-    if should_use_runtime(state.runtime.as_deref()) {
-        return agent_inner_runtime(state, req).instrument(span).await;
+    async move {
+        validate_prompt(&req.prompt)?;
+        let user_prompt = req.prompt.clone();
+
+        // Assemble the pipeline buffered (no sink) and thread the payload through it.
+        let resolved = resolved_insight_llm(&state.llm);
+        let orchestrator = build_insight_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.insight_grants.fetcher,
+            &state.insight_grants.charter,
+            &resolved,
+            None,
+        )
+        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+
+        let outcome = orchestrator
+            .run(&agent_pipeline_id(), insight_initial(req))
+            .await
+            .map_err(insight_error_to_app_error)?;
+
+        Ok(Json(AgentResponse {
+            user_prompt,
+            model_response: final_answer(outcome)?,
+            intent: "unknown".into(),
+        }))
     }
-    let base_system = state.prompts.agent_system.clone();
-    completion_inner(state, req, base_system, None)
-        .instrument(span)
-        .await
+    .instrument(span)
+    .await
 }
 
 /// Shared completion body for the non-streaming JSON endpoints.
@@ -174,141 +203,11 @@ async fn completion_inner(
     }))
 }
 
-async fn agent_inner_runtime(
-    state: AppState,
-    req: AgentRequest,
-) -> Result<Json<AgentResponse>, AppError> {
-    let runtime = state
-        .runtime
-        .clone()
-        .ok_or_else(|| AppError::ServiceUnavailable("runtime not configured".into()))?;
-    let user_prompt = req.prompt.clone();
-    let cfg = state.generation_config(
-        &state.prompts.agent_system,
-        req.prompt.clone(),
-        req.history.clone(),
-    );
-    let agent = LlmAgentPort::new(cfg, state.tools.clone(), state.mcp.clone());
-    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
-    let request_id = Uuid::new_v4();
-    let audit_ctx = AuditCtx {
-        request_id: request_id.to_string(),
-        session_id: req.session_id.clone(),
-        route: "/agent".into(),
-        actor: None,
-    };
-    let turn_input = AgentTurnInput {
-        request_id,
-        raw_input: req.prompt.clone(),
-        prompt: req.prompt,
-        history: req.history,
-        session_id: req.session_id,
-        option_id: req.option_id,
-    };
-
-    let outcome = run_agent_turn(
-        turn_input,
-        &audit_ctx,
-        AgentTurnDeps {
-            runtime_config: &runtime.config,
-            input_pipeline: &runtime.input_pipeline,
-            answer_policy: runtime.answer_policy.as_ref(),
-            llm_normalizer: runtime.llm_normalizer.as_deref(),
-            sessions: runtime.sessions.as_deref(),
-            agent: &agent,
-            audit: &audit,
-            // REST aggregates the outcome; live events are dropped.
-            emit: &|_event| {},
-        },
-    )
-    .await
-    .map_err(runtime_error_to_app_error)?;
-
-    agent_response_from_outcome(outcome, user_prompt).map(Json)
-}
-
-/// Map a runtime turn outcome onto the external `/agent` response contract.
-///
-/// `Final` carries the resolved intent; `Refused`/`Aborted` collapse to
-/// `"unknown"` (no topic branch). `Error` maps to a host HTTP error.
-fn agent_response_from_outcome(
-    outcome: AgentTurnOutcome,
-    user_prompt: String,
-) -> Result<AgentResponse, AppError> {
-    match outcome {
-        AgentTurnOutcome::Final { response, intent } => Ok(AgentResponse {
-            user_prompt,
-            model_response: response,
-            intent,
-        }),
-        AgentTurnOutcome::Refused { copy, .. } => Ok(AgentResponse {
-            user_prompt,
-            model_response: copy,
-            intent: "unknown".into(),
-        }),
-        AgentTurnOutcome::Aborted { response } => Ok(AgentResponse {
-            user_prompt,
-            model_response: response,
-            intent: "unknown".into(),
-        }),
-        AgentTurnOutcome::Error { code, status } => Err(runtime_outcome_error(code, status)),
-    }
-}
-
-// ──── /agent/stream ───
-
-/// Server-Sent Events variant of [`agent`].
-///
-/// Every frame is a single SSE `data:` line carrying a JSON envelope:
-/// - `{"event":"token","data":"<text fragment>"}`: append to the answer.
-/// - `{"event":"done"}`: model finished cleanly; close the connection.
-/// - `{"event":"error","data":"<message>"}`: terminal error; close the connection.
-/// - `{"event":"clear"}`: suggest to clear the answer.
-pub async fn agent_stream(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = req?;
-
-    // Prepare logging
-    let span = tracing::info_span!(
-        "agent-stream",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-        session_id = req.session_id.as_deref().unwrap_or(""),
-        option_id = req.option_id.as_deref().unwrap_or(""),
-    );
-    let _enter = span.enter();
-
-    if should_use_runtime(state.runtime.as_deref()) {
-        return agent_stream_runtime(state, req).await;
-    }
-
-    // Prepare configuration
-    let cfg = prepare_config(&state, req, &state.prompts.agent_system, None)?;
-
-    // Build SSE stream
-    let sse_stream: BoxStream<'static, Result<Event, Infallible>> =
-        llm_connector::agent_stream(cfg, state.tools.clone(), state.mcp.clone())
-            .filter_map(|ev| async move {
-                let frame = stream_frame_from_llm_event(ev)?;
-                let event = Event::default()
-                    .json_data(&frame)
-                    .expect("unexpected error: StreamFrame is always valid JSON");
-                Some(Ok::<_, Infallible>(event))
-            })
-            .boxed();
-
-    Ok(Sse::new(sse_stream)
-        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-        .into_response())
-}
-
 // ──── /report ───
 
-/// HTML report handler.
+/// HTML report handler (legacy monolith path).
 ///
-/// Mirrors [`agent`] but drives the `report_system` prompt, which produces a
+/// Drives the `report_system` prompt through the monolith tool-loop, producing a
 /// self-contained HTML report wrapped in a `falcon-report` fenced block. The
 /// output ceiling is raised to `REPORT_MAX_TOKENS` to fit a full document.
 pub async fn report(
@@ -333,7 +232,7 @@ pub async fn report(
 
 /// Server-Sent Events variant of [`report`].
 ///
-/// Same wire contract as [`agent_stream`]; the `falcon-report` HTML block
+/// Same `data:`-JSON-envelope wire contract as [`insight_stream`]; the `falcon-report` HTML block
 /// streams token-by-token like any other answer.
 pub async fn report_stream(
     State(state): State<AppState>,
@@ -372,64 +271,77 @@ pub async fn report_stream(
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE)))
 }
 
-async fn agent_stream_runtime(state: AppState, req: AgentRequest) -> Result<Response, AppError> {
-    let runtime = state
-        .runtime
-        .clone()
-        .ok_or_else(|| AppError::ServiceUnavailable("runtime not configured".into()))?;
-    let cfg = state.generation_config(
-        &state.prompts.agent_system,
-        req.prompt.clone(),
-        req.history.clone(),
-    );
-    let agent = LlmAgentPort::new(cfg, state.tools.clone(), state.mcp.clone());
-    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
-    let request_id = Uuid::new_v4();
-    let audit_ctx = AuditCtx {
-        request_id: request_id.to_string(),
-        session_id: req.session_id.clone(),
-        route: "/agent/stream".into(),
-        actor: None,
-    };
-    let turn_input = AgentTurnInput {
-        request_id,
-        raw_input: req.prompt.clone(),
-        prompt: req.prompt,
-        history: req.history,
-        session_id: req.session_id,
-        option_id: req.option_id,
-    };
+// ──── /insight/stream ───
 
-    // Single orchestration: the turn runs in a task, emitting live events into a
-    // channel; the SSE stream drains them in real time. Same `run_agent_turn`
-    // the REST path uses — only the injected sink differs.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamFrame>();
-    let turn = tokio::spawn(async move {
-        let emit = move |event: TurnEvent| {
-            let _ = tx.send(turn_event_to_stream_frame(event));
-        };
-        let deps = AgentTurnDeps {
-            runtime_config: &runtime.config,
-            input_pipeline: &runtime.input_pipeline,
-            answer_policy: runtime.answer_policy.as_ref(),
-            llm_normalizer: runtime.llm_normalizer.as_deref(),
-            sessions: runtime.sessions.as_deref(),
-            agent: &agent,
-            audit: &audit,
-            emit: &emit,
-        };
-        run_agent_turn(turn_input, &audit_ctx, deps).await
+/// Server-Sent Events variant of [`insight`].
+///
+/// Runs the same four-stage pipeline, streaming its progress live onto one shared per-turn sink
+/// (plan §8.5, mechanism A). Each frame is a single SSE `data:` line carrying a JSON envelope:
+/// - `{"event":"stage","data":{"agent":"<id>","phase":"started"}}`: the sub-agent started; on
+///   completion a matching `{"phase":"success"}` / `{"phase":"failure"}` follows (a green/red dot).
+/// - `{"event":"token","data":"<text fragment>"}`: a fragment of the current stage's output.
+/// - `{"event":"clear"}` then `{"event":"token","data":"<full answer>"}`: on completion, the
+///   streamed previews are cleared and the **complete** finalizer answer (report + charts) is
+///   re-sent, so a consumer always ends with the correct full answer.
+/// - `{"event":"done"}`: finished cleanly; close the connection.
+/// - `{"event":"error","data":"<message>"}`: terminal error; close the connection.
+///
+/// Like [`insight`], this drives the pipeline directly (no runtime turn).
+pub async fn insight_stream(
+    State(state): State<AppState>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, AppError> {
+    let Json(req) = req?;
+
+    let span = tracing::info_span!(
+        "insight-stream",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
+    );
+    let _enter = span.enter();
+
+    validate_prompt(&req.prompt)?;
+
+    // One shared per-turn sink drives the stream: the streaming analyst LLM emits content deltas
+    // onto it, and the orchestrator emits stage transitions (both from outside `SubAgent::run`).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+
+    let resolved = resolved_insight_llm(&state.llm);
+    let orchestrator = build_insight_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.insight_grants.fetcher,
+        &state.insight_grants.charter,
+        &resolved,
+        Some(sink.clone()),
+    )
+    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+
+    let initial = insight_initial(req);
+    // The task owns the orchestrator + sink, so when the run finishes every sink clone drops and
+    // the channel closes — the drain loop below ends naturally on close.
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&agent_pipeline_id(), initial, &*sink)
+            .await
     });
 
     let sse_stream = async_stream::stream! {
-        while let Some(frame) = rx.recv().await {
-            yield Ok::<_, Infallible>(sse_event(frame));
+        while let Some(event) = rx.recv().await {
+            for frame in insight_frames(event) {
+                yield Ok::<_, Infallible>(sse_event(frame));
+            }
         }
-        // Channel closed → the turn finished. Surface a hard runtime error (one
-        // that returned `Err` instead of emitting) as a terminal error frame.
-        if let Ok(Err(err)) = turn.await {
+        // Channel closed → the run finished. A stage failure already surfaced as an `error` frame
+        // during draining (the orchestrator emits it before returning `Err`); only a task panic
+        // needs a fallback terminal frame here.
+        if let Err(join) = run.await {
             yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                data: err.to_string(),
+                data: format!("insight task failed: {join}"),
             }));
         }
     };
@@ -446,25 +358,6 @@ fn sse_event(frame: StreamFrame) -> Event {
         .expect("unexpected error: StreamFrame is always valid JSON")
 }
 
-/// Map an internal turn event onto the external SSE frame contract.
-fn turn_event_to_stream_frame(event: TurnEvent) -> StreamFrame {
-    match event {
-        TurnEvent::IntentResolved {
-            intent,
-            candidate_intents,
-        } => StreamFrame::IntentResolved {
-            data: IntentResolvedData {
-                intent,
-                candidate_intents,
-            },
-        },
-        TurnEvent::Token { data } => StreamFrame::Token { data },
-        TurnEvent::Clear => StreamFrame::Clear,
-        TurnEvent::Done => StreamFrame::Done,
-        TurnEvent::Error { data } => StreamFrame::Error { data },
-    }
-}
-
 // ──── shared prelude ───
 
 /// Prepare a [`GenerationConfig`] from the request.
@@ -474,7 +367,8 @@ fn turn_event_to_stream_frame(event: TurnEvent) -> StreamFrame {
 /// loop; `max_tokens_override` (when `Some`) raises the output ceiling above
 /// [`LlmDefaults`] for the report path.
 ///
-/// Shared by `/agent`, `/agent/stream`, `/report`, and `/report/stream`.
+/// Shared by the legacy monolith `/report` and `/report/stream` paths. (The analytics endpoints
+/// are now `/insight` + `/insight/stream`, which drive the sub-agent pipeline instead.)
 ///
 /// [`LlmDefaults`]: crate::appstate::LlmDefaults
 fn prepare_config(
@@ -522,47 +416,123 @@ fn stream_frame_from_llm_event(ev: llm_connector::LlmEvent) -> Option<StreamFram
     }
 }
 
-fn should_use_runtime(runtime: Option<&AppRuntime>) -> bool {
-    runtime.is_some_and(|runtime| runtime.enabled)
-}
+// ──── /insight shared helpers ───
 
-fn runtime_error_to_app_error(err: crate::runtime::error::RuntimeError) -> AppError {
-    match err {
-        crate::runtime::error::RuntimeError::InputRequired
-        | crate::runtime::error::RuntimeError::InputTooLong(_) => {
-            AppError::BadRequest(err.to_string())
-        }
-        crate::runtime::error::RuntimeError::Upstream(_) => AppError::BadGateway(err.to_string()),
-        crate::runtime::error::RuntimeError::AuditSink(_)
-        | crate::runtime::error::RuntimeError::Config(_)
-        | crate::runtime::error::RuntimeError::UnknownModule { .. }
-        | crate::runtime::error::RuntimeError::IntentNotAllowed(_)
-        | crate::runtime::error::RuntimeError::PipelineContract
-        | crate::runtime::error::RuntimeError::Internal(_)
-        | crate::runtime::error::RuntimeError::Request(_) => {
-            AppError::ServiceUnavailable(err.to_string())
-        }
+/// Bounded buffer for the `/insight/stream` event channel.
+///
+/// Large enough that a normal turn's events (stage transitions plus the analyst's streamed
+/// report) are never dropped by [`ChannelSink`]'s `try_send`; a lossless channel is a later
+/// refinement (plan §8.2).
+const INSIGHT_STREAM_BUFFER: usize = 8192;
+
+/// Bridge the environment's [`LlmDefaults`] onto the sub-agent layer's [`ResolvedLlm`].
+///
+/// Every `/insight` stage runs on OpenRouter (the deployment's single provider today) with the
+/// shared model and sampling params.
+fn resolved_insight_llm(llm: &LlmDefaults) -> ResolvedLlm {
+    ResolvedLlm {
+        provider: Provider::OpenRouter,
+        base_url: llm.base_url.clone(),
+        model: llm.model.clone(),
+        temperature: llm.temperature,
+        top_p: llm.top_p,
+        max_tokens: llm.max_tokens,
+        api_key: Some(llm.api_key.clone()),
     }
 }
 
-fn runtime_outcome_error(code: String, status: u16) -> AppError {
-    match status {
-        400 => AppError::BadRequest(code),
-        502 => AppError::BadGateway(code),
-        _ => AppError::ServiceUnavailable(code),
+/// Build the pipeline's `Initial` payload, stamping the turn's `now` once at this boundary
+/// (plan §12.1) and carrying prior turns forward as [`Exchange`]es.
+///
+/// (The pipeline does not yet thread `history` into each stage's prompt — a known limitation of
+/// this first cut; the payload carries it for when it does.)
+fn insight_initial(req: AgentRequest) -> AgentPayload {
+    let history = req
+        .history
+        .into_iter()
+        .map(|turn| Exchange {
+            user: turn.user_prompt,
+            assistant: turn.model_response,
+        })
+        .collect();
+    AgentPayload::Initial(InitialPrompt {
+        prompt: req.prompt,
+        history,
+        now: SystemClock::default().now(),
+    })
+}
+
+/// Extract the user-facing answer from the pipeline's terminal payload.
+///
+/// The `/insight` pipeline always ends in a `Final` (the finalizer); anything else is an internal
+/// wiring fault surfaced as a host error rather than a panic.
+fn final_answer(outcome: AgentPayload) -> Result<String, AppError> {
+    match outcome {
+        AgentPayload::Final(result) => Ok(result.assistant),
+        other => Err(AppError::ServiceUnavailable(format!(
+            "insight pipeline did not produce a final result (got {:?})",
+            other.kind()
+        ))),
+    }
+}
+
+/// Map a pipeline [`AgentError`] onto the external HTTP error contract.
+///
+/// A capability failure (LLM transport, MCP tool) is an upstream `502`; an internal mismatch /
+/// missing-artifact / unknown-tool is a wiring fault surfaced as `503`.
+fn insight_error_to_app_error(err: AgentError) -> AppError {
+    match err {
+        AgentError::Capability(msg) => AppError::BadGateway(msg),
+        other => AppError::ServiceUnavailable(other.to_string()),
+    }
+}
+
+/// Map one sub-agent [`AgentEvent`] onto the external SSE frames it surfaces (0 or more).
+///
+/// Each stage's start and completion surface as `stage` frames — the completion carrying a
+/// `success` / `failure` phase, for a green/red indicator — and every LLM stage's tokens stream
+/// live as `token`s (delimited by those stage frames). On the terminal `Finished` the
+/// **complete** finalizer answer (report + `falcon-chart` blocks) is re-sent after a `clear`, so a
+/// consumer always ends with the correct full answer regardless of the intermediate token
+/// previews. The finer-grained tool / reasoning events stay internal for now.
+fn insight_frames(event: AgentEvent) -> Vec<StreamFrame> {
+    match event {
+        AgentEvent::StageStarted { agent, .. } => vec![StreamFrame::Stage {
+            data: StageData {
+                agent: agent.0,
+                phase: StagePhase::Started,
+            },
+        }],
+        AgentEvent::StageFinished { agent, outcome } => vec![StreamFrame::Stage {
+            data: StageData {
+                agent: agent.0,
+                phase: stage_phase(outcome),
+            },
+        }],
+        AgentEvent::ContentDelta { text } => vec![StreamFrame::Token { data: text }],
+        AgentEvent::Finished { assistant } => vec![
+            StreamFrame::Clear,
+            StreamFrame::Token { data: assistant },
+            StreamFrame::Done,
+        ],
+        AgentEvent::Error { message } => vec![StreamFrame::Error { data: message }],
+        // Internal framing (stage produced, tool + reasoning deltas, proposed calls) is not
+        // surfaced to the browser yet.
+        _ => vec![],
+    }
+}
+
+/// Map a stage's [`StageOutcome`] onto its wire [`StagePhase`].
+fn stage_phase(outcome: StageOutcome) -> StagePhase {
+    match outcome {
+        StageOutcome::Success => StagePhase::Success,
+        StageOutcome::Failure => StagePhase::Failure,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    use crate::config::AppConfig;
-    use crate::runtime::audit::AuditFailurePolicy;
-    use crate::runtime::config::RuntimeConfig;
-    use crate::runtime::input::pipeline::InputPipeline;
-    use crate::runtime::registry::BuiltinRegistry;
 
     #[test]
     fn prompt_validation_rejects_empty_prompt() {
@@ -619,109 +589,80 @@ mod tests {
     }
 
     #[test]
-    fn runtime_route_selection_requires_built_enabled_runtime() {
-        assert!(!should_use_runtime(None));
+    fn insight_frames_stream_stages_tokens_and_a_clean_terminal() {
+        use crate::agent::config::SubAgentId;
+        use crate::agent::payload::PayloadKind;
 
-        let disabled = app_runtime(false);
-        assert!(!should_use_runtime(Some(&disabled)));
-
-        let enabled = app_runtime(true);
-        assert!(should_use_runtime(Some(&enabled)));
-    }
-
-    #[test]
-    fn agent_response_carries_final_intent() {
-        let outcome = AgentTurnOutcome::Final {
-            response: "ans".into(),
-            intent: "revenue".into(),
-        };
-        let resp = agent_response_from_outcome(outcome, "prompt".into())
-            .expect("final outcome maps to a response");
-        assert_eq!(resp.user_prompt, "prompt");
-        assert_eq!(resp.model_response, "ans");
-        assert_eq!(resp.intent, "revenue");
-    }
-
-    #[test]
-    fn agent_response_refusal_reports_unknown_intent() {
-        let outcome = AgentTurnOutcome::Refused {
-            reason: "off_topic".into(),
-            copy: "sorry".into(),
-        };
-        let resp = agent_response_from_outcome(outcome, "prompt".into())
-            .expect("refusal maps to a response");
-        assert_eq!(resp.model_response, "sorry");
-        assert_eq!(resp.intent, "unknown");
-    }
-
-    #[test]
-    fn agent_response_aborted_reports_unknown_intent() {
-        let outcome = AgentTurnOutcome::Aborted {
-            response: "partial".into(),
-        };
-        let resp = agent_response_from_outcome(outcome, "prompt".into())
-            .expect("aborted maps to a response");
-        assert_eq!(resp.model_response, "partial");
-        assert_eq!(resp.intent, "unknown");
-    }
-
-    #[test]
-    fn turn_event_maps_to_external_stream_frame() {
+        // A stage starting surfaces which sub-agent is running (a spinning dot).
         assert_eq!(
-            turn_event_to_stream_frame(TurnEvent::IntentResolved {
-                intent: "revenue".into(),
-                candidate_intents: vec!["revenue".into()],
+            insight_frames(AgentEvent::StageStarted {
+                agent: SubAgentId("analyst".into()),
+                input: PayloadKind::Intermediate,
             }),
-            StreamFrame::IntentResolved {
-                data: IntentResolvedData {
-                    intent: "revenue".into(),
-                    candidate_intents: vec!["revenue".into()],
+            vec![StreamFrame::Stage {
+                data: StageData {
+                    agent: "analyst".into(),
+                    phase: StagePhase::Started,
+                }
+            }]
+        );
+        // A stage finishing carries its outcome — success (green) or failure (red).
+        assert_eq!(
+            insight_frames(AgentEvent::StageFinished {
+                agent: SubAgentId("fetcher".into()),
+                outcome: StageOutcome::Success,
+            }),
+            vec![StreamFrame::Stage {
+                data: StageData {
+                    agent: "fetcher".into(),
+                    phase: StagePhase::Success,
+                }
+            }]
+        );
+        assert_eq!(
+            insight_frames(AgentEvent::StageFinished {
+                agent: SubAgentId("charter".into()),
+                outcome: StageOutcome::Failure,
+            }),
+            vec![StreamFrame::Stage {
+                data: StageData {
+                    agent: "charter".into(),
+                    phase: StagePhase::Failure,
+                }
+            }]
+        );
+        // Every LLM stage's output streams live as tokens.
+        assert_eq!(
+            insight_frames(AgentEvent::ContentDelta { text: "hi".into() }),
+            vec![StreamFrame::Token { data: "hi".into() }]
+        );
+        // The terminal frame re-sends the COMPLETE answer after a clear, so the finalizer's
+        // appended charts (absent from the streamed preview) always reach the client.
+        assert_eq!(
+            insight_frames(AgentEvent::Finished {
+                assistant: "full answer".into()
+            }),
+            vec![
+                StreamFrame::Clear,
+                StreamFrame::Token {
+                    data: "full answer".into()
                 },
-            }
+                StreamFrame::Done,
+            ]
         );
         assert_eq!(
-            turn_event_to_stream_frame(TurnEvent::Token { data: "hi".into() }),
-            StreamFrame::Token { data: "hi".into() }
+            insight_frames(AgentEvent::Error {
+                message: "boom".into()
+            }),
+            vec![StreamFrame::Error {
+                data: "boom".into()
+            }]
         );
-        assert_eq!(
-            turn_event_to_stream_frame(TurnEvent::Clear),
-            StreamFrame::Clear
-        );
-        assert_eq!(
-            turn_event_to_stream_frame(TurnEvent::Done),
-            StreamFrame::Done
-        );
-        assert_eq!(
-            turn_event_to_stream_frame(TurnEvent::Error { data: "e".into() }),
-            StreamFrame::Error { data: "e".into() }
-        );
-    }
-
-    fn app_runtime(enabled: bool) -> AppRuntime {
-        let app_config = AppConfig::load("config/config.toml").expect("app config should load");
-        let refs = app_config
-            .runtime
-            .expect("runtime refs should be configured");
-        let registry = BuiltinRegistry::default();
-        let config = RuntimeConfig::load(&refs, &registry).expect("runtime config should load");
-        let answer_policy = registry
-            .build_answer_policy(&config)
-            .expect("answer policy should build");
-        let llm_normalizer = registry
-            .build_llm_normalizer(&config)
-            .expect("LLM normalizer should build");
-        let sessions = registry.build_memory(&config).expect("memory should build");
-        let audit_sink = registry.build_audit(&config).expect("audit should build");
-
-        AppRuntime {
-            enabled,
-            config: Arc::new(config),
-            input_pipeline: InputPipeline::default(),
-            answer_policy,
-            llm_normalizer,
-            sessions,
-            audit_sink,
-            audit_failure_policy: AuditFailurePolicy::FailOpen,
-        }
+        // Internal framing (stage produced) surfaces nothing on the wire for now.
+        assert!(insight_frames(AgentEvent::StageProduced {
+            agent: SubAgentId("fetcher".into()),
+            keys: vec![],
+        })
+        .is_empty());
     }
 }

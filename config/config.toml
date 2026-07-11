@@ -42,6 +42,34 @@ file = "prompt_guide/greeting_system.md"
 file = "prompt_guide/greeting_user.md"
 
 
+# ──── Insight pipeline tool grants ───
+# Which tools each /insight sub-agent exposes to its LLM, by wire name.
+# Edit these to change grants WITHOUT recompiling.
+#
+#   * MCP tool names are resolved against the datacenter server's advertised set
+#     at boot — a typo (or a tool the server does not offer) fails boot loudly.
+#   * "emit_chart" is a built-in, code-backed sink (not an MCP tool).
+#   * "*" is a shorthand for "every tool the MCP server advertises", handy while
+#     iterating; the explicit list below is the auditable production form.
+#
+# Omitting this whole section defaults `fetcher` to ["*"] and `charter` to
+# ["emit_chart"].
+
+[insight.grants]
+# The datacenter analytics tools the fetcher may call. These are the tools the
+# agent prompts are written around; see config/mcp-config.toml for the server's
+# full endpoint map (it also exposes "bill_member_analysis", omitted here as no
+# prompt references it — add it if you want the fetcher to reach it).
+fetcher = [
+    "bill_revenue",
+    "bill_charge",
+    "member_analysis",
+    "business_metrics",
+    "station_revenue_ranking",
+]
+charter = ["emit_chart"]
+
+
 # ──── Runtime capability pack section ───
 # These refs are parsed at boot but not wired into AppState until the
 # runtime route flag work begins.

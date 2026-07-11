@@ -38,6 +38,17 @@
 use crate::agent::config::SubAgentId;
 use crate::agent::payload::{ArtifactKey, PayloadKind};
 
+/// The outcome of a completed stage — the signal a UI turns into a success/failure indicator
+/// (e.g. a green vs. red dot next to the sub-agent).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// The stage's `run` returned `Ok`.
+    Success,
+    /// The stage's `run` returned `Err`; the pipeline aborts after this, so a terminal
+    /// [`AgentEvent::Error`] always follows.
+    Failure,
+}
+
 /// One event on the sub-agent layer's ordered stream.
 ///
 /// A superset of the monolith's `LlmEvent`: it keeps content / tool / done framing and adds a
@@ -61,10 +72,14 @@ pub enum AgentEvent {
         /// The keys produced this stage, in sorted order.
         keys: Vec<ArtifactKey>,
     },
-    /// A stage finished cleanly.
+    /// A stage finished — `outcome` says whether its `run` succeeded or failed, so a consumer can
+    /// render a success/failure indicator. A `Failure` is always followed by a terminal
+    /// [`AgentEvent::Error`].
     StageFinished {
         /// The stage that finished.
         agent: SubAgentId,
+        /// Whether the stage succeeded or failed.
+        outcome: StageOutcome,
     },
 
     // ── llm turn — emitted by the streaming adapter ──
