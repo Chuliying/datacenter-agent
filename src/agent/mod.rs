@@ -33,9 +33,13 @@
 //!   ([`ConfiguredAgent`](engine::ConfiguredAgent)) and code-defined
 //!   ([`HelloWorld`](engine::HelloWorld)) agents, plus the [`Orchestrator`](engine::Orchestrator).
 //!   Port of the `sub_agent` contract, PART B.
-//! - [`llm`] — the concrete [`OpenAiLlm`](llm::OpenAiLlm) adapter that turns a
+//! - [`llm`] — the concrete [`OpenAiLlm`](llm::OpenAiLlm) buffered adapter and the
+//!   [`StreamingOpenAiLlm`](llm::StreamingOpenAiLlm) token-streaming sibling that turn a
 //!   [`ResolvedLlm`](config::ResolvedLlm) into an [`LlmCapability`](payload::LlmCapability),
 //!   built against the async-openai already in the tree.
+//! - [`events`] — the streaming event model: one injected [`EventSink`](events::EventSink)
+//!   carrying one tagged [`AgentEvent`](events::AgentEvent), emitted by the LLM adapter, the
+//!   tool wrapper, and the orchestrator (plan §8).
 //!
 //! Nothing here is wired into [`AppState`](crate::appstate::AppState) yet.
 //! The modules are dormant, unit-tested groundwork.
@@ -48,6 +52,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod events;
 pub mod llm;
 pub mod payload;
 pub mod tools;

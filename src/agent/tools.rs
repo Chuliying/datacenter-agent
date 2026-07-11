@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
+use crate::agent::events::{AgentEvent, EventSink};
 use crate::agent::payload::{
     AgentError, ArtifactKey, ArtifactValue, Tool, ToolOutcome, ToolSchema,
 };
@@ -452,6 +453,80 @@ impl Tool for McpTool {
 }
 
 // ===========================================================================
+// StreamingTool — the event-emitting decorator (plan §8.5, mechanism A)
+// ===========================================================================
+
+/// A [`Tool`] decorator that emits an [`AgentEvent`] around the wrapped tool's execution, so a
+/// streaming consumer sees tool activity live.
+///
+/// It delegates `schema` and `target` unchanged, so the tool-use loop's dispatch-by-name and
+/// artifact keying are unaffected — the sink rides on the capability (Path A), and
+/// [`run_llm_loop`](crate::agent::payload::run_llm_loop) never sees it.
+///
+/// The per-call `id` is deliberately absent: the loop dispatches by advertised name and does not
+/// thread the model's call id through [`Tool::call`], so execution events carry `name` (a
+/// [`AgentEvent::ToolCallProposed`] from the LLM adapter carries the id for correlation).
+pub struct StreamingTool {
+    inner: Box<dyn Tool>,
+    name: String,
+    target: ArtifactKey,
+    sink: Arc<dyn EventSink>,
+}
+
+impl StreamingTool {
+    /// Wraps one tool with a shared sink, capturing its advertised name and target up front.
+    pub fn new(inner: Box<dyn Tool>, sink: Arc<dyn EventSink>) -> Self {
+        let name = inner.schema().name;
+        let target = inner.target();
+        Self {
+            inner,
+            name,
+            target,
+            sink,
+        }
+    }
+
+    /// Wraps every tool in a grant with one shared sink — the per-turn wiring of mechanism A.
+    pub fn wrap_all(grant: Vec<Box<dyn Tool>>, sink: Arc<dyn EventSink>) -> Vec<Box<dyn Tool>> {
+        grant
+            .into_iter()
+            .map(|t| Box::new(Self::new(t, sink.clone())) as Box<dyn Tool>)
+            .collect()
+    }
+}
+
+#[async_trait]
+impl Tool for StreamingTool {
+    fn schema(&self) -> ToolSchema {
+        self.inner.schema()
+    }
+
+    fn target(&self) -> ArtifactKey {
+        self.target
+    }
+
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError> {
+        self.sink.emit(AgentEvent::ToolStarted {
+            name: self.name.clone(),
+        });
+        let outcome = self.inner.call(arguments).await;
+        match &outcome {
+            Ok(ToolOutcome::Produced(_)) => self.sink.emit(AgentEvent::ToolProduced {
+                name: self.name.clone(),
+                target: self.target,
+            }),
+            Ok(ToolOutcome::Rejected { reason }) => self.sink.emit(AgentEvent::ToolRejected {
+                name: self.name.clone(),
+                reason: reason.clone(),
+            }),
+            // A fatal error surfaces via `?` in the loop; no event (the orchestrator emits Error).
+            Err(_) => {}
+        }
+        outcome
+    }
+}
+
+// ===========================================================================
 // TESTS — the tool contract's rules, exercised without a network
 // ===========================================================================
 
@@ -619,5 +694,97 @@ mod tests {
         );
         assert!(arg_object(serde_json::json!(42)).is_err());
         assert!(arg_object(serde_json::json!("x")).is_err());
+    }
+
+    // ── StreamingTool: emits Started then Produced/Rejected, delegates schema/target ──
+
+    use crate::agent::events::test_support::CollectingSink;
+
+    /// A tool that ignores its arguments and returns a fixed outcome — lets us assert exactly what
+    /// the decorator emits without a real backend.
+    struct FixedTool {
+        outcome: ToolOutcome,
+    }
+    #[async_trait]
+    impl Tool for FixedTool {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "fixed".into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            }
+        }
+        fn target(&self) -> ArtifactKey {
+            ArtifactKey::FetcherRecords
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
+            Ok(self.outcome.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_emits_started_then_produced() {
+        let sink = Arc::new(CollectingSink::new());
+        let tool = StreamingTool::new(
+            Box::new(FixedTool {
+                outcome: ToolOutcome::Produced(ArtifactValue::Text("rows".into())),
+            }),
+            sink.clone(),
+        );
+        assert!(matches!(
+            tool.call(serde_json::json!({})).await.unwrap(),
+            ToolOutcome::Produced(_)
+        ));
+        assert_eq!(
+            sink.events(),
+            vec![
+                AgentEvent::ToolStarted {
+                    name: "fixed".into()
+                },
+                AgentEvent::ToolProduced {
+                    name: "fixed".into(),
+                    target: ArtifactKey::FetcherRecords,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_emits_started_then_rejected_with_reason() {
+        let sink = Arc::new(CollectingSink::new());
+        let tool = StreamingTool::new(
+            Box::new(FixedTool {
+                outcome: ToolOutcome::Rejected {
+                    reason: "bad shape".into(),
+                },
+            }),
+            sink.clone(),
+        );
+        let _ = tool.call(serde_json::json!({})).await.unwrap();
+        assert_eq!(
+            sink.events(),
+            vec![
+                AgentEvent::ToolStarted {
+                    name: "fixed".into()
+                },
+                AgentEvent::ToolRejected {
+                    name: "fixed".into(),
+                    reason: "bad shape".into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_delegates_schema_and_target() {
+        let sink = Arc::new(CollectingSink::new());
+        let tool = StreamingTool::new(
+            Box::new(FixedTool {
+                outcome: ToolOutcome::Produced(ArtifactValue::Text("x".into())),
+            }),
+            sink,
+        );
+        assert_eq!(tool.schema().name, "fixed");
+        assert_eq!(tool.target(), ArtifactKey::FetcherRecords);
     }
 }

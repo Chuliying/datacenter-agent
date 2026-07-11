@@ -31,7 +31,7 @@
 
 #![allow(dead_code)] // groundwork: the orchestrator is not wired behind AgentPort yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use crate::agent::config::{
     OutputShape, PipelineConfig, PipelineId, ResolveError, SubAgentConfig, SubAgentId,
 };
+use crate::agent::events::{AgentEvent, EventSink};
 use crate::agent::payload::{
     run_llm_loop, AgentError, AgentPayload, ArtifactKey, ArtifactValue, FinalResult,
     IntermediateData, LlmCapability, LlmMessage, LlmResponse, PayloadKind, Tool, ToolSchema,
@@ -386,6 +387,90 @@ impl Orchestrator {
         }
         Ok(acc)
     }
+
+    /// Like [`run`](Self::run) but emits [`AgentEvent`]s for each stage boundary onto `sink` — the
+    /// streaming path (plan §8.5, mechanism A).
+    ///
+    /// Stage-level framing (`StageStarted` / `StageProduced` / `StageFinished`, then a terminal
+    /// `Finished` / `Error`) is emitted here, **outside** any [`SubAgent::run`], so the normative
+    /// `run(payload) -> Result<payload>` morphism is unchanged. The finer-grained token and tool
+    /// events come from the stage's own injected capabilities (a
+    /// [`StreamingOpenAiLlm`](crate::agent::llm::StreamingOpenAiLlm) and
+    /// [`StreamingTool`](crate::agent::tools::StreamingTool) sharing this same `sink`).
+    ///
+    /// # Arguments
+    ///
+    /// - `id`: the pipeline to run.
+    /// - `input`: the initial payload fed to the first stage.
+    /// - `sink`: the per-turn event sink (the same one the stage capabilities were wired with).
+    ///
+    /// # Returns
+    ///
+    /// Returns the final stage's payload (identical to [`run`](Self::run)).
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentError::Mismatch`] — a stage was handed a variant it does not accept (also emitted
+    ///   as an `Error` event before returning).
+    /// - [`AgentError::Capability`] — `id` names no registered pipeline, or a stage failed.
+    pub async fn run_emitting(
+        &self,
+        id: &PipelineId,
+        input: AgentPayload,
+        sink: &dyn EventSink,
+    ) -> Result<AgentPayload, AgentError> {
+        let stages = self
+            .pipelines
+            .get(id)
+            .ok_or_else(|| AgentError::Capability(format!("unknown pipeline: {id}")))?;
+        let mut acc = input;
+        for stage in stages {
+            let agent = stage.id().clone();
+            // Snapshot the artifact keys before the stage, so `StageProduced` reports only what
+            // this stage added (not what it carried forward).
+            let before: HashSet<ArtifactKey> = match &acc {
+                AgentPayload::Intermediate(d) => d.artifacts.keys().copied().collect(),
+                _ => HashSet::new(),
+            };
+            sink.emit(AgentEvent::StageStarted {
+                agent: agent.clone(),
+                input: acc.kind(),
+            });
+
+            acc = match stage.run(acc).await {
+                Ok(next) => next,
+                Err(e) => {
+                    sink.emit(AgentEvent::Error {
+                        message: e.to_string(),
+                    });
+                    return Err(e);
+                }
+            };
+
+            if let AgentPayload::Intermediate(d) = &acc {
+                let mut keys: Vec<ArtifactKey> = d
+                    .artifacts
+                    .keys()
+                    .copied()
+                    .filter(|k| !before.contains(k))
+                    .collect();
+                keys.sort(); // deterministic order (HashMap iteration is not stable)
+                if !keys.is_empty() {
+                    sink.emit(AgentEvent::StageProduced {
+                        agent: agent.clone(),
+                        keys,
+                    });
+                }
+            }
+            sink.emit(AgentEvent::StageFinished { agent });
+        }
+        if let AgentPayload::Final(f) = &acc {
+            sink.emit(AgentEvent::Finished {
+                assistant: f.assistant.clone(),
+            });
+        }
+        Ok(acc)
+    }
 }
 
 // ===========================================================================
@@ -395,7 +480,9 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::test_support::CollectingSink;
     use crate::agent::payload::{InitialPrompt, ToolCall, ToolOutcome, ToolSchema};
+    use crate::agent::tools::StreamingTool;
     use std::sync::Mutex;
 
     /// A scripted LLM: hand it the turns to replay, and an agent becomes deterministic.
@@ -593,5 +680,145 @@ mod tests {
             resolve_pipeline(&cfg, &agents),
             Err(ResolveError::UnknownAgentRef { .. })
         ));
+    }
+
+    // ── streaming: stage + tool + content events land on one ordered sink (mechanism A) ──
+
+    /// A scripted LLM that *also* emits like the real streaming adapter: a `ContentDelta` before a
+    /// final message, a `ToolCallProposed` before tool calls. It stands in for
+    /// [`StreamingOpenAiLlm`](crate::agent::llm::StreamingOpenAiLlm) with no network, so the
+    /// wiring (stage + tool + content events, correctly interleaved) is unit-testable.
+    struct ScriptedStreamingLlm {
+        turns: Mutex<Vec<LlmResponse>>,
+        sink: Arc<dyn EventSink>,
+    }
+    impl ScriptedStreamingLlm {
+        fn arc(turns: Vec<LlmResponse>, sink: Arc<dyn EventSink>) -> Arc<dyn LlmCapability> {
+            Arc::new(Self {
+                turns: Mutex::new(turns),
+                sink,
+            })
+        }
+    }
+    #[async_trait]
+    impl LlmCapability for ScriptedStreamingLlm {
+        async fn chat(
+            &self,
+            _messages: &[LlmMessage],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmResponse, AgentError> {
+            let response = self.turns.lock().unwrap().remove(0);
+            match &response {
+                LlmResponse::Message(text) => self.sink.emit(AgentEvent::ContentDelta {
+                    text: text.clone(),
+                }),
+                LlmResponse::ToolCalls(calls) => {
+                    for c in calls {
+                        self.sink.emit(AgentEvent::ToolCallProposed {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn run_emitting_streams_stage_tool_and_content_events_in_order() {
+        let sink: Arc<CollectingSink> = Arc::new(CollectingSink::new());
+        let dyn_sink: Arc<dyn EventSink> = sink.clone();
+
+        // Upstream fetcher: a BUFFERED (non-emitting) LLM + a StreamingTool-wrapped data tool.
+        // This models a buffered stage that still shows tool activity (plan §8.2).
+        let fetcher = ConfiguredAgent::new(
+            &fetcher_config(),
+            ScriptedLlm::arc(vec![
+                tool_call("bill_revenue"),
+                LlmResponse::Message("fetched".into()),
+            ]),
+            StreamingTool::wrap_all(vec![Box::new(FakeDataTool)], dyn_sink.clone()),
+            OutputShape::Intermediate,
+        );
+
+        // Terminal writer: a STREAMING LLM (emits content deltas) + no tools.
+        let writer_cfg = SubAgentConfig {
+            id: SubAgentId("writer".into()),
+            instruction: "write".into(),
+            llm: None,
+            tools: vec![],
+            accepts: vec![PayloadKind::Intermediate],
+            output: None,
+        };
+        let writer = ConfiguredAgent::new(
+            &writer_cfg,
+            ScriptedStreamingLlm::arc(
+                vec![LlmResponse::Message("THE REPORT".into())],
+                dyn_sink.clone(),
+            ),
+            vec![],
+            OutputShape::Final,
+        );
+
+        let mut agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = HashMap::new();
+        agents.insert(SubAgentId("fetcher".into()), Arc::new(fetcher));
+        agents.insert(SubAgentId("writer".into()), Arc::new(writer));
+        let pipe = PipelineConfig {
+            id: PipelineId("report".into()),
+            stages: vec![SubAgentId("fetcher".into()), SubAgentId("writer".into())],
+        };
+        let mut orch = Orchestrator::new();
+        orch.insert(pipe.id.clone(), resolve_pipeline(&pipe, &agents).unwrap());
+
+        let out = orch
+            .run_emitting(
+                &PipelineId("report".into()),
+                AgentPayload::Initial(InitialPrompt {
+                    prompt: "revenue".into(),
+                    history: vec![],
+                }),
+                &*sink,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(out, AgentPayload::Final(f) if f.assistant == "THE REPORT"));
+        assert_eq!(
+            sink.events(),
+            vec![
+                AgentEvent::StageStarted {
+                    agent: SubAgentId("fetcher".into()),
+                    input: PayloadKind::Initial,
+                },
+                AgentEvent::ToolStarted {
+                    name: "bill_revenue".into(),
+                },
+                AgentEvent::ToolProduced {
+                    name: "bill_revenue".into(),
+                    target: ArtifactKey::FetcherRecords,
+                },
+                AgentEvent::StageProduced {
+                    agent: SubAgentId("fetcher".into()),
+                    keys: vec![ArtifactKey::FetcherRecords],
+                },
+                AgentEvent::StageFinished {
+                    agent: SubAgentId("fetcher".into()),
+                },
+                AgentEvent::StageStarted {
+                    agent: SubAgentId("writer".into()),
+                    input: PayloadKind::Intermediate,
+                },
+                AgentEvent::ContentDelta {
+                    text: "THE REPORT".into(),
+                },
+                AgentEvent::StageFinished {
+                    agent: SubAgentId("writer".into()),
+                },
+                AgentEvent::Finished {
+                    assistant: "THE REPORT".into(),
+                },
+            ]
+        );
     }
 }
