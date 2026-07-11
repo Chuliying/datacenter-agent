@@ -136,6 +136,7 @@ async fn fetcher_fetches_real_data_from_the_datacenter() {
         tools: vec![ToolId::BillRevenue],
         accepts: vec![PayloadKind::Initial],
         output: None,
+        capture_message: false, // tool-only fetcher — its confirmation note is throwaway
     };
     // The fetcher is non-terminal in the report pipeline → Intermediate.
     let fetcher = ConfiguredAgent::new(&cfg, llm, vec![mcp_tool], OutputShape::Intermediate);

@@ -174,6 +174,7 @@ async fn terminal_stage_streams_its_answer_from_the_datacenter() {
         tools: vec![ToolId::BillRevenue],
         accepts: vec![PayloadKind::Initial],
         output: None,
+        capture_message: true, // terminal analyst — its answer prose is the result
     };
     let analyst: Arc<dyn SubAgent> =
         Arc::new(ConfiguredAgent::new(&cfg, llm, tools, OutputShape::Final));

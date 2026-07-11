@@ -129,6 +129,9 @@ pub struct ConfiguredAgent {
     tools: Vec<Box<dyn Tool>>,
     accepts: &'static [PayloadKind],
     output: OutputShape,
+    /// Whether to capture this stage's model message as the `{id}.message` artifact
+    /// ([`SubAgentConfig::capture_message`](crate::agent::config::SubAgentConfig::capture_message)).
+    capture_message: bool,
 }
 
 impl ConfiguredAgent {
@@ -161,6 +164,7 @@ impl ConfiguredAgent {
             tools,
             accepts: intern_accepts(&cfg.accepts),
             output,
+            capture_message: cfg.capture_message,
         }
     }
 
@@ -230,15 +234,18 @@ impl SubAgent for ConfiguredAgent {
         let (text, produced) = run_llm_loop(&self.llm, &system, &user, &self.tools).await?;
 
         // Assemble this stage's full output: everything carried in, plus every tool artifact, plus
-        // the stage's own **message** as a first-class artifact keyed `{id}.message`. Nothing is
-        // dropped — an Intermediate carries it forward and a Final keeps it as provenance, so the
-        // artifact map is lossless across every boundary (open-key contract).
+        // — when `capture_message` is set — the stage's own **message** as a first-class artifact
+        // keyed `{id}.message`. A captured message is never dropped: an Intermediate carries it
+        // forward and a Final keeps it as provenance (open-key contract). A tool-only stage leaves
+        // it off so its throwaway note doesn't clutter the map.
         let mut artifacts = incoming;
         artifacts.extend(produced); // append-only merge
-        artifacts.insert(
-            ArtifactKey::message(&self.id.0),
-            ArtifactValue::Text(text.clone()),
-        );
+        if self.capture_message {
+            artifacts.insert(
+                ArtifactKey::message(&self.id.0),
+                ArtifactValue::Text(text.clone()),
+            );
+        }
 
         match self.output {
             OutputShape::Intermediate => Ok(AgentPayload::Intermediate(IntermediateData {
@@ -564,6 +571,7 @@ mod tests {
             tools: vec![], // grants are resolved into `Vec<Box<dyn Tool>>` at construction
             accepts: vec![PayloadKind::Initial],
             output: None,
+            capture_message: false, // tool-only stage — throwaway note
         }
     }
 
@@ -647,6 +655,7 @@ mod tests {
             tools: vec![],
             accepts: vec![PayloadKind::Intermediate],
             output: None,
+            capture_message: true,
         };
         let writer = ConfiguredAgent::new(
             &cfg,
@@ -676,10 +685,10 @@ mod tests {
     // ── an Intermediate prose stage captures its message into an artifact ──
 
     #[tokio::test]
-    async fn a_stages_message_is_auto_captured_as_a_first_class_artifact() {
-        // The analyst's shape: no tools, Intermediate output. Its message is captured under
-        // `{id}.message` automatically (open-key contract), so an Intermediate boundary is lossless
-        // — no per-agent wiring needed.
+    async fn a_stages_message_is_captured_as_a_first_class_artifact_when_enabled() {
+        // The analyst's shape: no tools, Intermediate output, `capture_message` on. Its message is
+        // captured under `{id}.message`, so an Intermediate boundary keeps its prose (open-key
+        // contract).
         let cfg = SubAgentConfig {
             id: SubAgentId("analyst".into()),
             instruction: "analyse the material".into(),
@@ -687,6 +696,7 @@ mod tests {
             tools: vec![],
             accepts: vec![PayloadKind::Intermediate],
             output: None,
+            capture_message: true,
         };
         let analyst = ConfiguredAgent::new(
             &cfg,
@@ -913,6 +923,7 @@ mod tests {
             tools: vec![],
             accepts: vec![PayloadKind::Intermediate],
             output: None,
+            capture_message: true,
         };
         let writer = ConfiguredAgent::new(
             &writer_cfg,
@@ -964,9 +975,9 @@ mod tests {
                 },
                 AgentEvent::StageProduced {
                     agent: SubAgentId("fetcher".into()),
-                    // open-key contract: the fetcher's own message is captured too, alongside the
-                    // tool artifact (sorted: `fetcher.message` < `fetcher.records`).
-                    keys: vec![ArtifactKey::message("fetcher"), ArtifactKey::fetcher_records()],
+                    // the fetcher has `capture_message` off (tool-only stage), so it produces only
+                    // the tool artifact — its throwaway note is not captured.
+                    keys: vec![ArtifactKey::fetcher_records()],
                 },
                 AgentEvent::StageFinished {
                     agent: SubAgentId("fetcher".into()),

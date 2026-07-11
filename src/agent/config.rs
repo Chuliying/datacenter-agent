@@ -188,6 +188,12 @@ pub struct SubAgentConfig {
     /// see [`effective_output`]. Set explicitly only when the agent's shape must diverge from
     /// its structural position (e.g. reused as both a non-terminal and a terminal stage).
     pub output: Option<OutputShape>,
+    /// Whether this stage's model **message** is captured as a first-class artifact keyed
+    /// `{id}.message` (open-key contract). **Default on** (`true`): a prose stage's report survives
+    /// the boundary and the terminal result gains provenance. Set `false` for a tool-only stage
+    /// whose message is a throwaway note (e.g. the `fetcher`'s "已取得營收"), so it does not clutter
+    /// downstream material or the provenance map.
+    pub capture_message: bool,
 }
 
 /// A pipeline: a first-class, *ordered* list of sub-agent references.

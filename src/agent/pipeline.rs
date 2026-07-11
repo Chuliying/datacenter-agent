@@ -31,10 +31,11 @@
 //! empty grant is the isolation guarantee made concrete (it can neither fetch nor invent), and its
 //! output is deterministic given the upstream artifacts.
 //!
-//! The `analyst`'s report is prose, but nothing special is needed to keep it: every stage's model
-//! message is captured as a first-class artifact under `{id}.message` (open-key contract), so an
-//! `Intermediate` boundary is lossless. The `finalizer` reads the `analyst`'s message as the report
-//! body and carries the whole artifact map onto the `Final` result as provenance.
+//! The `analyst`'s report is prose, kept by its `capture_message` flag: a stage's model message can
+//! be captured as a first-class artifact under `{id}.message` (open-key contract). The `analyst`
+//! captures (its message *is* the report); the tool-only `fetcher` and `charter` opt out, since
+//! their notes are throwaway. The `finalizer` reads the `analyst`'s message as the report body and
+//! carries the whole artifact map onto the `Final` result as provenance.
 //!
 //! # References
 //!
@@ -81,6 +82,7 @@ pub fn fetcher_config() -> SubAgentConfig {
         tools: vec![ToolId::BillRevenue], // the real datacenter grant (extends with the closed set)
         accepts: vec![PayloadKind::Initial],
         output: None,
+        capture_message: false, // tool-only stage — its "已取得營收" note is throwaway
     }
 }
 
@@ -97,6 +99,7 @@ pub fn analyst_config() -> SubAgentConfig {
         tools: vec![],
         accepts: vec![PayloadKind::Intermediate],
         output: None,
+        capture_message: true, // the analyst's message *is* the report — keep it
     }
 }
 
@@ -110,6 +113,7 @@ pub fn charter_config() -> SubAgentConfig {
         tools: vec![ToolId::EmitChart],
         accepts: vec![PayloadKind::Intermediate],
         output: None,
+        capture_message: false, // its output is the validated chart artifact, not its message
     }
 }
 
@@ -653,14 +657,14 @@ mod tests {
                 assert_eq!(parsed["chartType"], "bar");
                 assert_eq!(parsed["data"][1]["value"], 180.0);
 
-                // provenance (open-key contract): the Final result carries the *whole* lossless
-                // artifact map — every stage's tool outputs and messages — for audit, not just the
-                // rendered answer.
+                // provenance (open-key contract): the Final result carries the artifact map for
+                // audit, not just the rendered answer. The analyst captures its message; the
+                // tool-only fetcher/charter opt out, so only meaningful artifacts survive.
                 assert!(f.artifacts.contains_key(&ArtifactKey::fetcher_records()));
-                assert!(f.artifacts.contains_key(&ArtifactKey::message("fetcher")));
                 assert!(f.artifacts.contains_key(&ArtifactKey::message("analyst")));
-                assert!(f.artifacts.contains_key(&ArtifactKey::message("charter")));
                 assert!(f.artifacts.contains_key(&ArtifactKey::charts_spec()));
+                assert!(!f.artifacts.contains_key(&ArtifactKey::message("fetcher")));
+                assert!(!f.artifacts.contains_key(&ArtifactKey::message("charter")));
             }
             other => panic!("expected Final, got {:?}", other.kind()),
         }
