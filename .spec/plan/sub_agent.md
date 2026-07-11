@@ -57,8 +57,8 @@ exist in the tree. The real starting point:
 | `/report` shape | **Three-stage** `fetcher → charter → finalizer` — the `finalizer` combines the fetcher's data with the `charter`'s schema-checked chart artifacts into the final HTML (§10). |
 | Sub-agent orchestrator ↔ runtime | **Pipeline sits *behind* `AgentPort`** — a `PipelineAgentPort` replaces `LlmAgentPort`; guardrails/intent/memory/audit are preserved. |
 | Tool set | **Closed, hand-authored `ToolId` enum** + registry, resolved at boot (contract §1.3, §2.2). Auto-discovery is replaced. Each grant additionally binds an explicit wire name (`mcp_name`) when it differs from the canonical `ToolId` string (§4). |
-| Streaming | Terminal stage streams (reuse the existing loop, narrowed to the agent's tool grant); upstream stages run buffered via the abstract non-streaming loop. |
-| async-openai | Build the capability adapter against the **0.40** already in the tree; treat the contract's 0.41.1 pin as a separate, deferred bump (see §8). |
+| Streaming | An injected **`EventSink`** (same idiom as the runtime's `TurnEmit`) with a **no-op** for the buffered path. *All* stages emit **process** events (`Stage*` / `Tool*` / reasoning) onto it; only the **terminal** stage additionally streams **content tokens**. Buffered-vs-streaming is a capability choice at wiring — the normative `run(payload)->Result` morphism is unchanged. Per-turn sink injection via **mechanism A** (sink baked into per-turn capabilities), `task_local` as escape hatch (§8.5). |
+| async-openai | Build the adapter against the **0.40** already in the tree. A survey (§8.7) shows **0.40 → 0.41.1 is near-zero blast radius but unlocks nothing we need** — reasoning tokens are absent from the streaming delta in *every* version; the fix is the **`byot`** feature (already in 0.40.3), not a bump. Reasoning is **dropped for the first cut**. |
 | `output` default | **Position-derived when unset**, per the amended contract (§1.1/§2.4/§4 of `Contract.md`): a stage's `Final` vs `Intermediate` shape is computed from whether it is terminal in every pipeline that references it. Ambiguous position (terminal in one pipeline, not in another) fails resolution and demands an explicit value. This removed a real footgun — `output` and pipeline position could previously disagree — and, for our two pipelines below, means **no agent needs to set `output` at all**. |
 
 ---
@@ -315,28 +315,301 @@ granted tool subsets, that is wrong.
 - **Exit check:** boot fails deterministically when `OPENROUTER_API_KEY` is unset for an
   OpenRouter agent; an all-Ollama config boots with no secrets.
 
-## 8. LLM factory + streaming reconciliation
+## 8. LLM factory + the streaming event architecture
+
+### 8.1 The LLM factory
 
 - Implement `src/agent/llm.rs`: one `OpenAiLlm` per **distinct** `ResolvedLlm` (dedup — many
   agents may share one config; build one client per distinct config, not per agent).
-- **Two execution shapes, one isolation boundary:**
-  - **Buffered stages** (all non-terminal, e.g. report `fetcher`) use the contract's abstract,
-    non-streaming `run_llm_loop` over `LlmCapability::chat` — clean and unit-testable.
-  - **Terminal stage** (the user-visible one) must stream tokens. Reuse the existing streaming
-    loop in [`llm_connector/agent.rs`](../../src/llm_connector/agent.rs), **generalized** to
-    take the terminal agent's *resolved tool subset* (`Arc<Vec<ChatCompletionTool>>` narrowed to
-    its grant) + its `ResolvedLlm` params, instead of the global tool list. The dispatch guard
-    still rejects out-of-grant calls, so isolation holds in both shapes.
-- **async-openai version.** The contract's reference adapter pins **0.41.1**; the live crate is
-  on **0.40** and the streaming loop we are reusing is 0.40. Build the adapter against **0.40**
-  to avoid a crate-wide churn during migration. The 0.41.1 bump (which also touches
-  `model.rs`, `appstate.rs`, and the existing loop) is a **separate, isolated, deferred step** —
-  the payload/behavioral rules are what bind; the adapter version is advisory (payload §0, §3.7).
 - **Global attribution block.** OpenRouter `HTTP-Referer` / `X-Title` identify the *app*, not a
   per-agent provider — keep them as one app-level block (they already live in
   [`client.rs::build_client`](../../src/llm_connector/client.rs)), not per-`ResolvedLlm`.
-- **Exit check:** a live smoke test against one real model per available provider kind; a unit
-  test asserting one client is built for two agents sharing a `ResolvedLlm`.
+- **Exit check (factory):** a live smoke test against one real model per available provider kind;
+  a unit test asserting one client is built for two agents sharing a `ResolvedLlm`.
+
+### 8.2 Streaming is an *effect sink*, not an LLM feature
+
+The naïve framings both fail. "Thread a streamer through the sub-agents" breaks the normative
+morphism (§8.5). "Streaming is an LLM capability" is directionally right but incomplete — the
+pipeline has **three** event sources and the LLM owns only one:
+
+| Event source | Owns | Emits | Examples |
+|---|---|---|---|
+| LLM turn | `chat()` (streaming adapter) | reasoning/content deltas, tool-call *intent* | `ReasoningDelta`, `ContentDelta`, `ToolCallProposed` |
+| Tool execution | the tool (a `StreamingTool` wrapper) | tool started, produced, rejected-retry | `ToolStarted`, `ToolProduced`, `ToolRejected` |
+| Pipeline stage | the `Orchestrator` | stage transitions | `StageStarted`, `StageProduced`, `StageFinished` |
+
+"Tool `bill_revenue` returned N rows" and "now the `finalizer` is writing" originate **outside**
+`chat()`. So generalize: define **one injected `EventSink` + one tagged `AgentEvent` enum**, and
+have each of the three boundaries emit to it. This is not a new idiom — it is exactly the runtime's
+existing [`TurnEmit = &dyn Fn(TurnEvent) + Send + Sync`](../../src/runtime/turn.rs) sink ("single
+orchestration, two consumption styles — no second frame loop, no drift"), one layer down.
+
+```rust
+// src/agent/events.rs (as implemented)
+pub enum AgentEvent {
+    // pipeline framing — emitted by the Orchestrator, from OUTSIDE run()
+    StageStarted  { agent: SubAgentId, input: PayloadKind },   // the kind handed to the stage
+    StageProduced { agent: SubAgentId, keys: Vec<ArtifactKey> },// newly-present keys (diffed), sorted
+    StageFinished { agent: SubAgentId },
+    // llm turn — emitted by the streaming adapter (id known here, from the stream)
+    ReasoningDelta { text: String },            // its OWN channel (dropped for now — §8.7)
+    ContentDelta   { text: String },
+    ToolArgsDelta  { id: String, fragment: String },   // raw json fragment (optional UI sugar)
+    ToolCallProposed { id: String, name: String },     // args assembled + parsed
+    // tool execution — emitted by the StreamingTool wrapper (NO id: see note)
+    ToolStarted  { name: String },
+    ToolProduced { name: String, target: ArtifactKey },
+    ToolRejected { name: String, reason: String },
+    // terminal
+    Finished { assistant: String },
+    Error    { message: String },               // a DELIVERABLE frame, never a dropped socket
+}
+
+pub trait EventSink: Send + Sync { fn emit(&self, ev: AgentEvent); }
+pub struct NullSink;                             // buffered path + every unit test
+impl EventSink for NullSink { fn emit(&self, _: AgentEvent) {} }
+pub struct ChannelSink(pub tokio::sync::mpsc::Sender<AgentEvent>);
+impl EventSink for ChannelSink { fn emit(&self, ev: AgentEvent) { let _ = self.0.try_send(ev); } }
+```
+
+> **Why the execution events carry no `id`.** The normative `Tool::call(&self, arguments)` does
+> **not** thread the model's tool-call id, so the `StreamingTool` wrapper cannot know it — adding it
+> would change the tool contract. The id lives on the adapter-emitted `ToolCallProposed` /
+> `ToolArgsDelta` (where the stream *does* carry it); a consumer correlates proposed→executed by
+> name and order. This kept the tool trait untouched, consistent with Path A's "core signatures
+> unchanged" property.
+
+`emit` is **sync fire-and-forget** to match the house `&dyn Fn` sink; `try_send` on a bounded
+channel drops on a full buffer and never stalls token generation. If lossless delivery is required,
+use an unbounded channel or hand the blocking send to a spawned drainer — a later refinement, not
+a launch requirement.
+
+- `AgentEvent` **supersedes the monolith's [`LlmEvent`](../../src/llm_connector/agent.rs)** at the
+  sub-agent layer: it keeps `Token`→`ContentDelta`, `ToolCalled`/`ToolResult`→`ToolStarted`/
+  `ToolProduced`, `Done`→`Finished`, `Error`→`Error`, and **adds** `ReasoningDelta`, the `Stage*`
+  trio, and artifact-keyed tool results. `LlmEvent::Clear` (the "these were thinking tokens, clear
+  the answer buffer" hack) exists only because today thinking and answer share one stream; once
+  `ReasoningDelta` ships (§8.7) reasoning gets its own channel and `Clear` can be retired.
+- **The seam to the runtime (reconciles with §9).** The wire contract stays the runtime's
+  [`TurnEvent`](../../src/runtime/turn.rs) (`IntentResolved` / `Token` / `Clear` / `Done` /
+  `Error`) → SSE. `PipelineAgentPort` (§9) is the sole translation point: it maps `AgentEvent →
+  TurnEvent`, exposing user-facing frames (`ContentDelta→Token`, `Finished→Done`, `Error→Error`)
+  and keeping internal ones (`Stage*`, `Tool*`, `ReasoningDelta` until productized) as audit-only,
+  exactly as the monolith marks `ToolCalled`/`ToolResult` "must not expose." Richness lives in the
+  sub-agent layer; the browser protocol is unchanged.
+- **All stages emit *process* events; only the terminal stage streams *content tokens*.** A
+  buffered upstream stage (the `fetcher`) still emits `Stage*` + `Tool*` — the user watches data
+  being fetched — but its LLM runs the non-streaming `chat`. The terminal stage (`analyst` /
+  `finalizer`) additionally streams `ContentDelta`. Buffered-vs-streaming is a **capability choice
+  at wiring**, not a fork in the loop; the tool-dispatch isolation guard runs identically in both.
+
+### 8.3 The streaming adapter (the one genuinely new transport)
+
+A decorator over the buffered `Arc<dyn LlmCapability>` **cannot** stream — the inner `chat()`
+returns a fully-materialized `LlmResponse`, so a wrapper only ever sees the final value. Token
+streaming must happen *at the transport*: a sibling `StreamingOpenAiLlm` that calls
+`client.chat().create_stream(...)`, emits deltas as chunks arrive, and returns the **assembled**
+`LlmResponse`. From `run_llm_loop`'s view nothing changes — it still receives one complete response.
+The buffered `OpenAiLlm` and the `LlmCapability` trait are untouched; streaming is an additive
+sibling selected at wiring.
+
+```rust
+async fn chat(&self, messages, tools) -> Result<LlmResponse, AgentError> {
+    let mut stream = self.client.chat().create_stream(req).await?;   // 0.40 supports this
+    let (mut content, mut acc) = (String::new(), BTreeMap::<u32, ToolBuf>::new());
+    while let Some(chunk) = stream.next().await {
+        let delta = /* chunk?.choices[0].delta */;
+        if let Some(t) = delta.content { content.push_str(&t); self.sink.emit(ContentDelta{text:t}); }
+        for tc in delta.tool_calls.unwrap_or_default() {          // universal fragment assembly:
+            let buf = acc.entry(tc.index).or_default();            //   name-once,
+            // set buf.id/buf.name once; buf.args.push_str(fragment); emit ToolArgsDelta          //   args as raw-string deltas,
+        }                                                          //   keyed by index,
+    }                                                             //   parse at close.
+    if acc.is_empty() { Ok(LlmResponse::Message(content)) }
+    else { /* serde_json::from_str each buf.args, emit ToolCallProposed, Ok(ToolCalls(..)) */ }
+}
+```
+
+Tool-call **args are never structured JSON on the wire** — always a partial-JSON *string* you
+concatenate per `index` and parse only at the terminal signal (`finish_reason == "tool_calls"`).
+Buffer as `String`; do not attempt incremental structural parsing. This is confirmed identical
+across every framework surveyed (§8.4) and is what the monolith's `ToolSlot` already does.
+
+### 8.4 Prior art — the converged streaming event taxonomy (recorded)
+
+Five mature agent/LLM streaming protocols were surveyed; they converge on the **same** shape: a
+*lifecycle envelope* (`start … finish`) wrapping *typed content channels*, each channel a
+`start → delta* → end` triad tagged with an identity, **reasoning as its own channel (never folded
+into text)**, tool args as raw-JSON-string fragments assembled by key and parsed at close, and an
+explicit terminal event that separates *semantic* failure from *transport* teardown.
+
+| Concept | Vercel AI SDK | OpenAI Responses | Anthropic Messages | LangChain `astream_events` | OpenRouter (chat) |
+|---|---|---|---|---|---|
+| assistant text | `text-delta` | `response.output_text.delta` | `text_delta` | `on_chat_model_stream` | `delta.content` |
+| **reasoning** | `reasoning-delta` | `response.reasoning_text.delta` | `thinking_delta` (+`signature_delta`) | (in chunk) | `delta.reasoning` |
+| tool-call args | `tool-input-delta` | `response.function_call_arguments.delta` | `input_json_delta` | `tool_call_chunks` | `delta.tool_calls[].function.arguments` |
+| tool result | `tool-output-available` | function-output item | tool_result (next msg) | `on_tool_end` | (next msg) |
+| step/block boundary | `start-step`/`finish-step` | `response.output_item.added/done` | `content_block_start/stop` | parent/child `run_id` | — |
+| terminal | `finish` + `[DONE]` | `response.completed` + `[DONE]` | `message_stop` | iterator exhaustion | `finish_reason` + `[DONE]` |
+
+Cross-cutting lessons baked into §8.2's `AgentEvent`:
+- **Reasoning is a distinct variant**, not text (`ReasoningDelta`), and carries an optional trailing
+  signature in the providers that sign it (Anthropic/OpenRouter).
+- **Every block carries an identity** so interleaved blocks demux; we key tool args by the delta
+  `index` (`ToolBuf` map), mirroring `tool_calls[].index`.
+- **Sink injection: nobody threads a param through business logic.** The three real mechanisms are
+  *return-a-stream* (Vercel; every provider HTTP body), *inject a writer/handle once at the
+  boundary* (Vercel `createUIMessageStream({execute(writer)})`; our `TurnEmit`/`EventSink`), and
+  *ambient context propagation* (LangChain flattens a nested graph into one ordered stream via a
+  callback handler carried on **contextvars** → an `asyncio.Queue`). Rust analogs: `impl Stream`,
+  an `mpsc::Sender`, and `tokio::task_local!` respectively — this is precisely the A-vs-B choice in
+  §8.5.
+- **Separate semantic failure from transport teardown.** A mid-stream error must be a *deliverable
+  frame* (`AgentEvent::Error` → `TurnEvent::Error`), never merely a dropped socket — LangChain's
+  exception-only model is the one to avoid for a browser SSE protocol.
+
+Sources: Vercel AI SDK stream protocol (`ai-sdk.dev/docs/ai-sdk-ui/stream-protocol`); OpenAI
+Responses & Assistants streaming-events reference (`developers.openai.com/api/reference`);
+Anthropic Messages streaming (`platform.claude.com/docs/en/build-with-claude/streaming`);
+LangChain `astream_events` (`reference.langchain.com` / `docs.langchain.com/oss/python/langchain/streaming`);
+OpenRouter reasoning-tokens & streaming (`openrouter.ai/docs`).
+
+### 8.5 Injecting the per-turn sink into a boot-built pipeline — A vs B
+
+The pipeline is a boot-built, `Arc`-shared graph; the sink is per-turn. The normative morphism
+`async fn(AgentPayload) -> Result<AgentPayload, AgentError>` (payload contract) **forbids** adding a
+`sink` parameter to `SubAgent::run` — that would break the contract. So the sink cannot flow through
+`run()`. **Stage-level** events sidestep this entirely: the `Orchestrator` receives the sink as an
+explicit argument (exactly as `run_agent_turn` receives `TurnEmit`) and emits `Stage*` from *outside*
+each `stage.run(acc)` call — no morphism change. Only the **inner** token/tool events must reach the
+capabilities *without* passing through `run()`. Two mechanisms do that:
+
+**Mechanism A — bake the sink into per-turn capabilities.** The port builds a per-turn terminal
+stage whose LLM adapter and tool wrappers carry the turn's sink. The expensive parts (`reqwest`
+client, `McpHandle`) are `Arc`-cheap, so this **re-wraps** shared transports, it does not rebuild
+clients.
+
+```rust
+// inside PipelineAgentPort::stream_turn, per turn:
+let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+let llm  = Arc::new(StreamingOpenAiLlm::new(shared_transport.clone(), sink.clone()));  // holds sink
+let tools = grant.iter()
+    .map(|t| Box::new(StreamingTool::new(t.clone(), sink.clone())) as Box<dyn Tool>)
+    .collect();
+let terminal = ConfiguredAgent::new(&cfg, llm, tools, OutputShape::Final);
+// SubAgent::run / run_llm_loop / ConfiguredAgent signatures are UNCHANGED — the morphism stays
+// run(payload) -> Result<payload>; the effect rides on the injected capabilities.
+orchestrator.run_emitting(&pipeline_id, payload, &*sink).await   // orch emits Stage* from outside
+
+// the tool wrapper — delegates schema()/target() so dispatch-by-name is intact:
+#[async_trait] impl Tool for StreamingTool {
+    fn schema(&self) -> ToolSchema { self.inner.schema() }
+    fn target(&self) -> ArtifactKey { self.inner.target() }
+    async fn call(&self, args) -> Result<ToolOutcome, AgentError> {
+        let name = self.name.clone();          // captured at construction (avoids re-deriving schema)
+        self.sink.emit(AgentEvent::ToolStarted { name: name.clone() });
+        let out = self.inner.call(args).await;
+        match &out {
+            Ok(ToolOutcome::Produced(_))     => self.sink.emit(ToolProduced { name, target: self.target }),
+            Ok(ToolOutcome::Rejected{reason})=> self.sink.emit(ToolRejected { name, reason: reason.clone() }),
+            Err(_) => {}                       // fatal error surfaces via `?` in the loop
+        }
+        out
+    }
+}
+```
+
+**Mechanism B — ambient sink via `tokio::task_local!`.** The port sets the sink once for the turn,
+then runs the **shared, unmodified** boot-built pipeline; the adapter and a tiny `emit()` helper
+read the ambient sink; unscoped → no-op. This is the LangChain-contextvars pattern.
+
+```rust
+tokio::task_local! { static SINK: Arc<dyn EventSink>; }
+
+// port: set once, run the SHARED Arc graph as-is (no per-turn rebuild):
+SINK.scope(Arc::new(ChannelSink(tx)), async move {
+    orchestrator.run(&pipeline_id, payload).await
+}).await
+
+// adapter + loop call this directly — no sink field, no param, no signature change anywhere:
+fn emit(ev: AgentEvent) { let _ = SINK.try_with(|s| s.emit(ev)); }   // Err when unscoped → drop
+```
+
+| Property | A — sink on capabilities | B — `task_local` ambient |
+|---|---|---|
+| Normative morphism `run(payload)->Result` | preserved | preserved |
+| `chat` / `run_llm_loop` / `run` signatures | unchanged | unchanged |
+| Per-turn work in the port | re-wrap Arc-cheap transports into a per-turn terminal stage | none — one shared pipeline + `SINK.scope` |
+| Dataflow visibility | **explicit** (sink is a visible ctor arg) | **implicit** (ambient, contextvars-style) |
+| Test emission | pass a `Vec`-collecting sink to the adapter ctor | run the unit inside `SINK.scope(collector, …)` |
+| Failure if misused | forget to wrap a tool → *that* tool is silent, visible at the wiring site | forget `.scope`, or emit from a `tokio::spawn`ed sub-task → `try_with` Errs → silently no-op |
+| Concurrency across `.await` | sink moves with the value; always correct | propagates within a task, but **spawned sub-tasks need explicit re-`scope`** (real gotcha) |
+| House-style fit | matches the contract's capability-injection thesis (agents are pure fns of payload given injected caps) | new mechanism — the codebase uses explicit `TurnEmit`, not `task_local`, today |
+
+**Decision: A.** It preserves *both* the normative morphism and the capability-injection thesis the
+whole contract rests on; the per-turn cost is re-wrapping Arc-cheap transports (not rebuilding
+clients); and its failure mode is a *visible* omission at the wiring site rather than a silent
+ambient drop. Reserve **B** as the escape hatch **iff** per-turn terminal-stage assembly in the port
+becomes a real burden (e.g. many stages each needing the sink) — accepting implicit dataflow and the
+`spawn`-must-re-`scope` gotcha. Stage-level events are emitted by the `Orchestrator` under an
+explicit sink arg in **either** case.
+
+### 8.6 async-openai version — buffered adapter
+
+- Build the buffered + streaming adapter against the **0.40** already in the tree. The contract's
+  reference pins **0.41.1**, but a survey (§8.7) confirms **0.40 → 0.41.1 is near-zero blast radius**
+  (module paths and every builder type unchanged) **and buys nothing** we need — so the bump stays a
+  cosmetic, deferred, isolated step, not a prerequisite for streaming.
+
+### 8.7 Reasoning-token streaming — survey result (decision: dropped for now)
+
+**Decision: reasoning tokens are dropped for the first cut** (`ReasoningDelta` is defined but
+unemitted). The survey answers *how* to unlock it later, and rules out the obvious-but-wrong path:
+
+- **A version bump does NOT solve it.** Verified against source: even the latest **0.41.1**'s
+  `ChatCompletionStreamResponseDelta` has fields `{ content, function_call(dep), tool_calls, role,
+  refusal }` — **no `reasoning` / `reasoning_content`** in any 0.40–0.41.1 version. The struct has no
+  `deny_unknown_fields` and no `#[serde(flatten)]` catch-all, so OpenRouter's `delta.reasoning` /
+  `delta.reasoning_details[]` are **silently discarded**. `reasoning_effort` exists but is a
+  *request* param, not a response field.
+- **The real fix (no bump): the `byot` "Bring Your Own Types" feature — already present in 0.40.3.**
+  Add `"byot"` to the crate's features (the required `async-openai-macros 0.3.0` is already resolved
+  in `Cargo.lock`), then use `client.chat().create_stream_byot::<_, StreamChunk>(req)` with a
+  flattened, extended delta to capture the OpenRouter fields, reusing the client's auth / base URL /
+  SSE parsing:
+
+  ```rust
+  #[derive(Deserialize)]
+  struct DeltaExt {
+      #[serde(flatten)] base: async_openai::types::chat::ChatCompletionStreamResponseDelta,
+      reasoning: Option<String>,                       // OpenRouter extension
+      reasoning_details: Option<Vec<ReasoningDetail>>, // structured blocks (optional)
+  }
+  // + your StreamChunk { choices: Vec<Choice { delta: DeltaExt, finish_reason, .. }>, .. }
+  ```
+
+  Flatten works because the base delta derives `Deserialize` without `deny_unknown_fields`. Blast
+  radius: one feature flag + one module; no version bump, no other file touched.
+- **First-class alternative (larger change): the Responses API.** async-openai's `responses` module
+  (present in 0.40.3) models `ResponseReasoningTextDelta` (`"response.reasoning_text.delta"`) etc. as
+  first-class stream events — but that targets a `/responses` endpoint, a bigger architectural move
+  and dependent on OpenRouter's Responses support. Reserve for if/when we leave chat-completions.
+
+**Sequencing:** ship `ContentDelta` + `Stage*` + `Tool*` on stock 0.40 first; add `ReasoningDelta`
+behind the `byot` delta when reasoning UX is wanted (and retire `Clear` at that point — §8.2).
+
+### 8.8 Exit checks (streaming)
+
+- A unit test drives the streaming adapter with a scripted chunk stream (via a fake transport or
+  `byot` fixture) and asserts the emitted `AgentEvent` sequence into a `Vec`-collecting sink:
+  interleaved `ContentDelta`s, then assembled `ToolCallProposed`, then `Finished`.
+- A unit test drives a two-stage pipeline with a collecting sink and asserts `StageStarted(fetcher)`
+  … `ToolProduced` … `StageFinished(fetcher)` … `StageStarted(finalizer)` … `ContentDelta`* …
+  `Finished` arrive in one correctly-ordered stream (mechanism A: mock caps carry the sink).
+- A live smoke test streams one real terminal-stage turn and confirms `ContentDelta`→`Token`→SSE
+  parity with `/report/stream` on `main`; a mid-turn induced fault surfaces as a delivered
+  `Error` frame, not a dropped connection.
 
 ## 9. Bridge the pipeline behind `AgentPort` (the runtime seam)
 
@@ -349,9 +622,12 @@ expects — guardrails, intent, memory, and audit are untouched.
   1. builds the `Initial` payload from `input.prompt` + `input.history`;
   2. runs the selected pipeline's **upstream** stages buffered (Kleisli `?`; a `Mismatch` or
      `UnknownTool` surfaces as an `AgentTurnFrame::Error`), accumulating artifacts;
-  3. runs the **terminal** stage as a stream, mapping its `LlmEvent`s to `AgentTurnFrame`
-     (`Token` / `Clear` / `ToolCalled` / `ToolResult` / `Done` / `Error`) exactly as
-     `LlmAgentPort` does today.
+  3. runs the **terminal** stage as a stream, translating the sub-agent layer's `AgentEvent`s
+     (§8.2) into the runtime's `TurnEvent`s — this port is the **single** `AgentEvent → TurnEvent`
+     translation point: user-facing frames (`ContentDelta→Token`, `Finished→Done`, `Error→Error`)
+     surface; internal ones (`Stage*`, `Tool*`, `ReasoningDelta`) stay audit-only, exactly as the
+     monolith marks `ToolCalled`/`ToolResult` "must not expose." The per-turn `EventSink` reaches
+     the terminal stage's capabilities via mechanism A (§8.5).
 - **Pipeline selection** is per-route (§10): the handler passes the `PipelineId` into the port.
   `AppState` holds the resolved sub-agent `Orchestrator` (replacing the single `tools` +
   `instructions` fields; `GenerationConfig` assembly moves inside the pipeline).
@@ -482,8 +758,10 @@ stages = ["fetcher", "charter", "finalizer"]
 
 ## Deferred beyond this plan
 
-- **async-openai 0.40 → 0.41.1** — crate-wide bump; do it in an isolated commit after the
-  pipeline path is stable (§8).
+- **async-openai 0.40 → 0.41.1** — cosmetic bump only. §8.7 confirms it is near-zero blast radius
+  (module paths + all builder types unchanged) **and buys nothing** — the streaming delta still
+  lacks a `reasoning` field. Not a prerequisite for anything; do it in an isolated commit whenever
+  convenient (or never). Reasoning streaming is unlocked by the **`byot`** feature, not this bump.
 - **`#[tool]` proc-macro + `inventory` auto-registration** — ergonomic tool definition
   (schema derive + `Tool` impl + link-time collection), reconciled with the closed set by the
   boot completeness check (tool contract §3/§6). Explicit registration ships first.
@@ -494,8 +772,12 @@ stages = ["fetcher", "charter", "finalizer"]
   under its own `id`. Cheap; add when a real collision risk appears.
 - **Pipeline routing beyond per-route** — header/path/LLM-classifier selection once more than
   the two fixed pipelines exist.
-- **Multi-stage streaming** — token semantics if a non-terminal stage should also emit
-  user-visible tokens. Terminal-only streaming first.
+- **Multi-stage *content* streaming** — every stage already emits **process** events (`Stage*` /
+  `Tool*`) from the first cut (§8.2); what stays deferred is a *non-terminal* stage emitting
+  user-visible **content tokens** (`ContentDelta` surfaced as `Token`). Terminal-only content
+  streaming first.
+- **Reasoning-token streaming** — `ReasoningDelta` is defined but unemitted; unlock via the `byot`
+  extended delta (§8.7), and retire `LlmEvent::Clear` once reasoning has its own channel.
 - **`AgentError::Capability` taxonomy** (payload §6) — retryable vs fatal, so the runtime can
   route around a failed stage.
 - **Caller-requested intermediate projection** — a request-time knob (e.g. a query param or
