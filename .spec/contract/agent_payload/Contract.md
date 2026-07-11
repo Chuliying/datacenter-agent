@@ -5,6 +5,18 @@ implementation is [`agent_payload.rs`](./agent_payload.rs), which compiles, is
 clippy-clean, and whose async test suite encodes the rules below. Its async-openai adapter
 compiles against async-openai **0.41.1** behind `--features openai`.
 
+> **Amendment — time-as-data · open artifact keys · lossless provenance.** §1/§2/§4 below carry
+> three changes made during the port, all in service of **observability, reproducibility, and
+> auditability**: (a) every payload variant carries a turn timestamp `now`, stamped once at the
+> boundary and threaded as data (§1, §2.6); (b) `ArtifactKey` is an **open `{agent}.{name}`
+> string** rather than a closed compile-time enum (§1, §4); and (c) `FinalResult` carries the
+> full `artifacts` map, so a stage's message and every upstream product survive the terminal
+> boundary rather than being dropped (§2.6). The authoritative implementation of these three is
+> the live port under [`src/agent/`](../../../src/agent/) (`payload.rs`, `clock.rs`); the
+> reference [`agent_payload.rs`](./agent_payload.rs) in this folder predates them. The **detailed
+> design** (the `Clock`, the A→B decision, the open-key tradeoffs, the capture control) lives in
+> the [implementation plan](../../plan/sub_agent.md) §12.
+
 ---
 
 ## 0. What this contract binds
@@ -41,13 +53,19 @@ can reason about a payload without carrying its whole body.
 
 ### The variant bodies
 
-- **`InitialPrompt`** — `prompt: String` plus `history: Vec<Exchange>`. There is no system
-  prompt: each agent carries its own designed instruction. History is a plain `Vec` — a
+Every variant additionally carries a **turn timestamp** `now: DateTime<FixedOffset>` (see
+*Supporting types* below).
+
+- **`InitialPrompt`** — `prompt: String`, `history: Vec<Exchange>`, and `now`. There is no
+  system prompt: each agent carries its own designed instruction. History is a plain `Vec` — a
   `Vec` already models "empty", so no `Option`.
-- **`IntermediateData`** — `prompt: String` (the instruction, carried forward) plus
-  `artifacts: HashMap<ArtifactKey, ArtifactValue>`, the KV surface wired between agents.
-- **`FinalResult`** — `user: String` and `assistant: String`. Its **own type** (not
-  `Exchange`) so metadata (stop reason, token usage, latency) can accrete here later.
+- **`IntermediateData`** — `prompt: String` (the instruction, carried forward), `artifacts:
+  HashMap<ArtifactKey, ArtifactValue>` (the KV surface wired between agents), and `now`.
+- **`FinalResult`** — `user: String`, `assistant: String` (the terminal *projection* the user
+  sees), `now`, **and `artifacts: HashMap<ArtifactKey, ArtifactValue>`** — the full accumulated
+  provenance, carried *through* the terminal boundary rather than dropped (§2.6). Its **own
+  type** (not `Exchange`) so metadata (stop reason, token usage, latency) can accrete here
+  later. It derives `PartialEq` but **not `Eq`** (an `ArtifactValue::Number` holds an `f64`).
 
 ### Supporting types
 
@@ -56,11 +74,24 @@ can reason about a payload without carrying its whole body.
   extension point.
 - **`ArtifactValue`** — a **closed enum** (`Text`, `Json`, `Number`, …). `Display` is the
   "cast to string if you don't care about the type" view; a `match` is the checked
-  "downcast". Being closed is what lets the whole payload derive `Clone` + `Serialize`.
-- **`ArtifactKey`** — a **compile-time enum**, so a mistyped key is a compile error. Each
-  variant is namespaced by producer and renders to a canonical dotted string
-  (`fetcher.records`) used as *both* its log form and its serialized form (JSON object keys
-  must be strings).
+  "downcast". Being closed is what lets the whole payload derive `Clone` + `Serialize`, and it
+  is already what makes an artifact "anything castable to a string" (§4).
+- **`ArtifactKey`** — an **open, producer-namespaced string key**, `{agent}.{name}` (e.g.
+  `fetcher.records`, `analyst.message`). Any agent freely names its outputs — there is no
+  closed set to extend — so a tool result, an agent's own message, or any computed value are
+  keyed uniformly. The `agent` half is the producer namespace (§2.5); the canonical dotted
+  string is *both* the log form and the serialized form (JSON object keys must be strings), via
+  `Display` / `FromStr` (split on the *first* dot) and a `serde(into/try_from = "String")`
+  transparent representation. **This trades the earlier compile-time-enum guarantee** — a
+  mistyped key is now a *runtime* key, not a compile error — for an open key space; the named
+  constructors (`fetcher_records()`, `charts_spec()`, `message(agent)`) keep the well-known
+  wires in one place so a typo has a single blast radius.
+- **The turn timestamp `now`** — a `DateTime<FixedOffset>` stamped **once at the boundary** and
+  threaded through every stage unchanged. It is *data*, not an ambient read: this is what makes
+  a run reproducible (a fixture can pin it for byte-identical replay), observable (it shows up in
+  every serialized payload), and auditable end to end (§2.6). Each LLM stage *renders* it into a
+  `# Current Time` header so the model can tell an in-progress trailing period from a genuine
+  drop. The mechanism (the `Clock` at the boundary, the shared formatter) is plan §12.1.
 
 ---
 
@@ -113,7 +144,30 @@ and fan-out (one input through two branches) safe — no shared mutable state.
 Each `ArtifactKey` carries its producing agent and renders to a greppable dotted form. Two
 agents cannot collide on a key, and every log line and serialized payload attributes each
 entry to a producer. **Only the orchestration designer mints keys** — the LLM never invents
-one, because it has no capability to choose a key name.
+one, because it has no capability to choose a key name. (Opening the key type to a
+`{agent}.{name}` string, §1, kept this rule: the string is minted in code by the designer; the
+LLM still names nothing.)
+
+### 2.6 The pipeline is auditable: nothing load-bearing is silently dropped
+
+Two properties make a run reconstructable after the fact — the **observability, reproducibility,
+and auditability** the payload exists to support:
+
+- **Provenance is lossless across the terminal boundary.** `FinalResult` carries the full
+  `artifacts` map, not just the user-facing `assistant` string. An agent's own **message** may
+  be captured as a first-class artifact keyed `{agent}.message` (the open key space of §1 is
+  what lets prose sit beside tool results), so a stage whose product *is* prose — an analyst's
+  report feeding a downstream finalizer — is preserved rather than lost when its `Intermediate`
+  is reshaped, and the terminal result records what every stage contributed. *Whether* a given
+  stage's message is captured is a producer-side control, not a payload rule (it lives in the
+  [sub-agent contract](../sub_agent/Contract.md) §1.1); the payload rule is only that a captured
+  message and the accumulated artifacts **survive to `Final`** rather than being dropped at the
+  boundary.
+- **Time is data, stamped once.** `now` is fixed at the boundary and threaded unchanged, so
+  every stage agrees on one instant, an audit record of the response carries when the turn
+  occurred, and a replay with a pinned clock is byte-reproducible. A stage **never reads an
+  ambient clock** — that would make its output depend on hidden state and break the "pure
+  function of its payload" property (§3.6).
 
 ---
 
@@ -191,8 +245,10 @@ surface changes across releases.
 | Question | Decision | Rationale |
 |---|---|---|
 | What the contract binds | **The payload + behavioral rules**; agent code is advisory | The compiler enforces the shared value; implementation is free to vary. |
-| Artifact value representation | **Closed enum** with `Display` | Retains the typed value *and* keeps the payload `Clone` + `Serialize`. |
-| Artifact key type | **Compile-time enum** | A mistyped key is a compile error; keys are minted only by the designer. |
+| Artifact value representation | **Closed enum** with `Display` | Retains the typed value *and* keeps the payload `Clone` + `Serialize`; `Display` makes it string-castable. |
+| Artifact key type | **Open `{agent}.{name}` string key** (was a compile-time enum) | An open key space lets any produced value — tool result, agent message, computed value — be keyed uniformly; named constructors localize the well-known wires. Trades compile-time typo detection for openness. |
+| Turn time | **`now: DateTime<FixedOffset>` on every variant**, stamped once at the boundary, threaded as data | Deterministic, observable, reproducible, auditable — vs. an ambient clock read inside a stage. |
+| Final provenance | **`FinalResult` carries the full `artifacts` map** (+ a stage's message may be captured as `{agent}.message`) | Lossless provenance to the terminal boundary; the answer is auditable back to what produced it. No `Eq` (an `f64` lives under `ArtifactValue::Number`). |
 | Prior turns field | **`Vec<Exchange>`** (no `Option`) | A `Vec` already models empty. |
 | Final result type | **Distinct `FinalResult`** | Reserves room for future metadata. |
 | Error model | **Fallible morphism** → `Result<_, AgentError>` | Kleisli arrows; error-threaded composition; the falling convention. |
@@ -205,7 +261,8 @@ surface changes across releases.
 ## 5. Responsibility boundaries
 
 - **Orchestration designer** — owns the `ArtifactKey`/`ArtifactValue` surfaces, mints every
-  key, grants each agent its tool set, wires each tool's result to an artifact slot (via
+  key (now an open `{agent}.{name}` string, by convention namespaced to the producing agent —
+  §2.5), grants each agent its tool set, wires each tool's result to an artifact slot (via
   `Tool::target`), and assembles + validates the pipeline graph.
 - **Sub-agent** — transforms one payload into another, exposing to its LLM *only* its granted
   tools, reading *only* granted artifacts, and returning a typed mismatch when handed a
@@ -228,6 +285,7 @@ surface changes across releases.
   transport/wiring failures.
 - **Output-key validator** — the concrete "output references only provided keys" check (the
   enforceable half of §2.3) is not yet written.
-- **`ArtifactValue` / `ArtifactKey` variants** — expected to grow as agents and wires are
-  added.
+- **`ArtifactValue` variants** — the value enum stays **closed** and is expected to grow as
+  agents and wires are added (`Rows`, `Table`, `Bytes`, …). `ArtifactKey` is now **open** (§1),
+  so key names grow freely without a contract edit.
 - **async-openai version** — pinned to 0.41.1; revisit the adapter on upgrade.

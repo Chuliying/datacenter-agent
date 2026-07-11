@@ -60,6 +60,9 @@ exist in the tree. The real starting point:
 | Streaming | An injected **`EventSink`** (same idiom as the runtime's `TurnEmit`) with a **no-op** for the buffered path. *All* stages emit **process** events (`Stage*` / `Tool*` / reasoning) onto it; only the **terminal** stage additionally streams **content tokens**. Buffered-vs-streaming is a capability choice at wiring — the normative `run(payload)->Result` morphism is unchanged. Per-turn sink injection via **mechanism A** (sink baked into per-turn capabilities), `task_local` as escape hatch (§8.5). |
 | async-openai | Build the adapter against the **0.40** already in the tree. A survey (§8.7) shows **0.40 → 0.41.1 is near-zero blast radius but unlocks nothing we need** — reasoning tokens are absent from the streaming delta in *every* version; the fix is the **`byot`** feature (already in 0.40.3), not a bump. Reasoning is **dropped for the first cut**. |
 | `output` default | **Position-derived when unset**, per the amended contract (§1.1/§2.4/§4 of `Contract.md`): a stage's `Final` vs `Intermediate` shape is computed from whether it is terminal in every pipeline that references it. Ambiguous position (terminal in one pipeline, not in another) fails resolution and demands an explicit value. This removed a real footgun — `output` and pipeline position could previously disagree — and, for our two pipelines below, means **no agent needs to set `output` at all**. |
+| Turn time | **Time-as-data (option B)** — a `Clock` stamps `now` once at the boundary; every payload variant carries it; stages *render* it, never read a clock. Detail: §12.1. |
+| Artifact key | **Open `{agent}.{name}` string** (was a closed enum), so any produced value — tool result, agent message, computed value — is keyed uniformly; `ToolId` stays closed. Detail: §12.2. |
+| Message capture | **Per-stage `capture_message`, default-on, suppress throwaway**; `FinalResult` carries the full provenance map. Detail: §12.3. |
 
 ---
 
@@ -260,7 +263,9 @@ granted tool subsets, that is wrong.
   tools** and compose *those* instruction blocks (deduplicated) into its system prompt,
   alongside the agent's own `instruction`. A no-tool agent (e.g. the report `finalizer`) gets none.
 - Keep the existing "Current Time" + base-prompt assembly (`generation_config`); only the
-  instructions source changes from one global block to the per-agent server set.
+  instructions source changes from one global block to the per-agent server set. (The
+  `# Current Time` block is now emitted by the shared `current_time_header` formatter, §12.1 — the
+  sub-agent stages, the legacy path, and the eval runner all call it so the format cannot drift.)
 - **Exit check:** an agent granted tools from server A only never sees server B's instructions;
   an agent spanning A+B sees both, once each; the no-tool `finalizer` sees neither.
 
@@ -619,7 +624,9 @@ expects — guardrails, intent, memory, and audit are untouched.
 - **`PipelineAgentPort`** (`src/agent/port.rs`) implements
   [`runtime::turn::AgentPort`](../../src/runtime/orchestrator.rs) (the module renamed in §2):
   `stream_turn(input) -> BoxStream<AgentTurnFrame>`. It:
-  1. builds the `Initial` payload from `input.prompt` + `input.history`;
+  1. builds the `Initial` payload from `input.prompt` + `input.history`, stamping the boundary
+     `now` from a `Clock` the port holds (`InitialPrompt.now = clock.now()`, a `SystemClock` in
+     prod — §12.1), so the pipeline itself never reads a clock;
   2. runs the selected pipeline's **upstream** stages buffered (Kleisli `?`; a `Mismatch` or
      `UnknownTool` surfaces as an `AgentTurnFrame::Error`), accumulating artifacts;
   3. runs the **terminal** stage as a stream, translating the sub-agent layer's `AgentEvent`s
@@ -753,6 +760,108 @@ stages = ["fetcher", "charter", "finalizer"]
 - Update `config/config.toml` (including the §2 `[runtime.input]` key), add the `[llm.default]`
   / `[[mcp_server]]` / `[[sub_agent]]` / `[[pipeline]]` blocks, and refresh `README` +
   `docs/reference/endpoints/*` and `docs/reference/modules/runtime-turn.md`.
+
+## 12. Time-awareness, open artifact keys, and message capture (landed in `src/agent/`)
+
+Three design changes went into `src/agent/` while prototyping the pipeline, **ahead of the
+`AgentPort` wiring (§9)**. Each is small, additive, and already tested + clippy-clean; this
+section is the detailed record. The big-idea rationale — observability, reproducibility,
+auditability — lives in the [payload contract](../contract/agent_payload/Contract.md) §2.6 and
+the [sub-agent contract](../contract/sub_agent/Contract.md) §1.1/§4; this section is the *how*.
+
+### 12.1 Time as payload data — the injected `Clock`, then time-as-data (option B)
+
+**The bug (a regression, not a new feature).** An LLM has no clock. Handed revenue that ends in
+the current, in-progress month, it reads the partial figure as a severe drop and warns about it.
+The legacy serving path already fixed this — [`AppState::generation_config`](../../src/appstate.rs)
+and the eval runner both prepend a `# Current Time` header — but the sub-agent port dropped that
+injection, so this restores parity.
+
+**Two designs were weighed:**
+- **A — injected `Clock` capability.** A `Clock` held by `ConfiguredAgent`; each stage reads
+  `clock.now()` as it runs.
+- **B — time as payload data.** A `Clock` stamps `now` **once at the boundary** into
+  `InitialPrompt.now`; it threads through `IntermediateData.now` / `FinalResult.now` unchanged;
+  each stage *renders* the carried `now`, never reading a clock itself.
+
+**Decision: B**, for deterministic functional style plus observability / reproducibility /
+auditability — one turn has exactly one `now`, a fixture can pin it (byte-reproducible replay),
+and the timestamp is visible in every serialized payload rather than hidden in a per-stage
+side-read. The `Clock` survives, but only at the **boundary** (production) or in a **fixture**
+(tests) — never inside a stage.
+
+**Implementation** ([`clock.rs`](../../src/agent/clock.rs), [`payload.rs`](../../src/agent/payload.rs)):
+- `Clock` trait — `fn now(&self) -> DateTime<FixedOffset>`.
+- `SystemClock { offset }` — the real clock, `Utc::now().with_timezone(&offset)` with an
+  **explicit** default offset of Asia/Taipei `+08:00` (`FixedOffset::east_opt(8*3600)`; Taiwan
+  observes no DST, so a fixed offset is exact and needs no tz database). Reading UTC-then-offset
+  rather than `Local::now()` keeps the reported day correct even when the container `TZ` is unset
+  (containers default to UTC) — the near-midnight mislabel case.
+- `FixedClock(DateTime<FixedOffset>)` — pins an instant for unit tests and eval replay.
+- `current_time_header<Tz>(now) -> String` — the **one** shared formatter for the
+  `"# Current Time\n{YYYY-MM-DD HH:MM:SS ±ZZ:ZZ}\n\n"` block, generic over the timezone so the
+  legacy `DateTime<Local>` path (`appstate.rs`, `runtime/eval/runner.rs`) and the sub-agent
+  stages all call it and cannot drift. The engine prepends it to the system prompt:
+  `format!("{}{}", current_time_header(&now), instruction)`.
+- `now: DateTime<FixedOffset>` added to all three payload variants; `chrono`'s `serde` feature is
+  enabled so payloads still derive `Serialize`/`Deserialize` (no `Cargo.lock` churn).
+- **Boundary stamp.** In production the `PipelineAgentPort` (§9) sets `InitialPrompt.now =
+  clock.now()`; the integration tests do it explicitly (`now: SystemClock::default().now()`).
+
+### 12.2 `ArtifactKey`: closed enum → open `{agent}.{name}` string
+
+**Why.** While wiring the finalizer it became clear an `Intermediate → Final` reshape *drops* an
+agent's message (only tool artifacts were keyed), and that the artifact contract should hold
+**anything castable to a string** — a tool result, an LLM message, or any computed value. The
+value side (`ArtifactValue`) was already string-castable via `Display`; the blocker was the
+*key* side — a **closed compile-time enum** that could not name "the analyst's message" without a
+contract edit per new wire.
+
+**Change** ([`payload.rs`](../../src/agent/payload.rs)) — `ArtifactKey` becomes an open struct
+`{ agent: String, name: String }` rendering `{agent}.{name}`:
+- `Display` writes `"{agent}.{name}"`; `FromStr` splits on the **first** dot (the producer
+  namespace has no dot; the slot name may), rejecting a dotless string; `serde(into/try_from =
+  "String")` makes it a transparent JSON string key (JSON object keys must be strings).
+- Named constructors keep the well-known wires in one place: `fetcher_records()`,
+  `fetcher_schema()`, `charts_spec()`, and `message(agent)` (`{agent}.message`).
+- **Costs, accepted deliberately.** `ArtifactKey` loses `Copy` (it owns `String`s) — call sites
+  that relied on copy now `.clone()`/`.cloned()`, and `render_material` sorts by `Ord` — and a
+  mistyped key is now a **runtime** key rather than a compile error. The named constructors
+  contain the typo blast radius; **`ToolId` stays a closed enum**, so the *tool set* remains
+  typo-checked even though the *artifact key space* opened.
+
+### 12.3 Message auto-capture, controlled per stage
+
+**The asymmetry it fixes.** With open keys, a stage's message can be a first-class artifact
+(`{id}.message`). Capturing *every* stage's message unconditionally, though, floods the map with
+throwaway notes (the fetcher's "已取得營收", the charter's "已產生圖表"). So capture is a
+**per-stage control**, default-on:
+- `SubAgentConfig.capture_message: bool` ([`config.rs`](../../src/agent/config.rs)) — documented
+  **default on**; set `false` for a tool-only stage whose message is throwaway.
+- `ConfiguredAgent` reads it and guards the insert
+  ([`engine.rs`](../../src/agent/engine.rs)): after `run_llm_loop`, it merges tool artifacts
+  append-only, then `if self.capture_message { artifacts.insert(ArtifactKey::message(&id),
+  Text(text)) }`.
+- **`FinalResult` now carries `artifacts`** too (it previously held only `user`/`assistant`), so
+  a terminal stage keeps the full provenance map instead of dropping it. `FinalResult` drops
+  `Eq` (an `f64` lives under `ArtifactValue::Number`).
+- **Pipeline wiring** ([`pipeline.rs`](../../src/agent/pipeline.rs)) — the `/agent` pipeline
+  (`fetcher → analyst → charter → finalizer`) sets `analyst` → `true` (its message *is* the
+  report the pure-logic `finalizer` reads) and `fetcher` / `charter` → `false` (throwaway notes).
+  The composed test asserts the *curated* provenance directly: `analyst.message` +
+  `fetcher.records` + `charts.spec` present; `fetcher.message` / `charter.message` absent.
+
+### 12.4 How this amends the earlier sections
+
+- **§3 (land contracts as code)** — the ported `payload.rs` carries the open `ArtifactKey`, the
+  `now` fields, and `FinalResult.artifacts`; `config.rs` carries `capture_message`. The reference
+  `.spec/contract/*/*.rs` predate these; the live `src/agent/` modules are authoritative.
+- **§6 (TOML loader)** — a missing `capture_message` maps to the documented default (`true`); add
+  it to the raw `[[sub_agent]]` serde struct with a `#[serde(default = …true…)]`.
+- **§9 (AgentPort wiring)** — the port is the boundary that stamps `InitialPrompt.now =
+  clock.now()` (step 1); it holds the `Clock`, so the pipeline never reads one.
+- **§10 (pipelines)** — each `[[sub_agent]]` gains an authored `capture_message` (prose stages
+  on, tool-only stages off).
 
 ---
 

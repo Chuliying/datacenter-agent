@@ -95,10 +95,19 @@ config schema — it *is* Rust. `SubAgentConfig`:
 | `tools` | `Vec<ToolId>` | The **granted tool set** — the isolation boundary (payload §2.3). Closed set, resolved at boot (§2.2). Empty = a no-tool agent. |
 | `accepts` | `Vec<PayloadKind>` | Which payload variants this agent consumes; drives its self-check (§2.4). |
 | `output` | `Option<OutputShape>` | Execution-time shaping of the outgoing payload. `None` (the common case) derives the shape from the agent's position in whichever pipeline(s) reference it — see §2.4. An explicit value overrides the derivation. **Not** a static `produces` — see §2.4. |
+| `capture_message` | `bool` | Whether this stage's model **message** is captured as a first-class artifact keyed `{id}.message`. **Default on**; set `false` for a tool-only stage whose message is a throwaway note. The *control* is here; the payload contract owns the *guarantee* that a captured message survives to `Final` (payload §2.6 — lossless provenance). |
 
 `llm = None` here means **inherit the default LLM verbatim** (§2.1), *not* "no LLM" — a
 config-defined agent always has one. The LLM-absent case of §1.1 is reached only by writing a
 code-defined agent, which has no `SubAgentConfig` at all.
+
+`capture_message` defaults **on**: the common case is a stage whose message is meaningful (an
+analyst's report), so it is captured as `{id}.message` and rides the payload as lossless
+provenance. An author suppresses it (`false`) only for a tool-only stage whose message is a
+throwaway confirmation (a fetcher's "已取得營收"), keeping the artifact map — and the terminal
+`Final`'s provenance — free of noise. This field is the producer-side *control*; the payload
+contract owns the *guarantee* that a captured message survives to `Final` (payload §2.6). Its
+detailed rationale and the pipeline wiring are plan §12.3.
 
 There is **no `produces` field**. Static produces→accepts wiring validation is removed on
 purpose (§2.4): composition safety is a runtime property, which is what lets a sub-agent be
@@ -121,8 +130,9 @@ default base URL and auth style:
 
 ### 1.3 `ToolId` and the registry — a closed set, resolved at boot
 
-Tools are named by a logical **`ToolId`** — a **closed enum** (parity with `ArtifactKey`: a
-typo is a compile/parse error), decoupled from any backend. A designer-owned **`ToolRegistry`**
+Tools are named by a logical **`ToolId`** — a **closed enum**, so a typo is a compile/parse
+error (the *tool set* stays closed even though the payload contract opened `ArtifactKey` to a
+`{agent}.{name}` string), decoupled from any backend. A designer-owned **`ToolRegistry`**
 maps each `ToolId` to a concrete `Tool` (schema + `target: ArtifactKey` + call impl). **MCP is
 one backend**; **code-backed sinks/validators** (e.g. a `SchemaTool<T>` that schema-checks the
 model's structured output) are another. `ToolId` (which *grants* a tool) stays distinct from
@@ -306,6 +316,7 @@ stages = ["fetcher"]
 | Sub-agent anatomy | **Three optional components — LLM, Tools, Logic** | Extends the earlier LLM+Tools model; "Logic" names the procedure so a pure-logic agent (no LLM/tools) is first-class. |
 | Sub-agent provenance | **Config-defined *or* code-defined, unified by the `SubAgent` trait** | Config = prompt+capabilities over the built-in Logic; code = handcrafted Logic for what a prompt can't express. Both compose identically. |
 | Built-in Logics | **One (the LLM tool-loop)** for now | A different procedure is a code agent today; a config-selectable Logic registry is a deferred extension (§6). |
+| Message capture | **Per-stage `capture_message`, default on; suppress throwaway** | A prose stage's message survives as `{id}.message` provenance (payload §2.6); a tool-only stage opts out so its note doesn't clutter the map. |
 
 ---
 

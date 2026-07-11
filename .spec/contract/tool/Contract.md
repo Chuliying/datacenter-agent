@@ -70,8 +70,10 @@ The distinction is load-bearing: rejection is the normal, expected path for sche
 
 ### 1.3 `ToolId` — a closed logical name, decoupled from the backend
 
-Tools are named by a **`ToolId`** — a closed enum (parity with `ArtifactKey`: a typo is a
-compile/parse error). A `ToolId` is distinct from:
+Tools are named by a **`ToolId`** — a closed enum, so a mistyped tool name is a compile/parse
+error. (The **tool set stays closed** even though the payload contract opened `ArtifactKey` to a
+`{agent}.{name}` string — a typo'd *artifact key* is now a runtime key, but a typo'd *tool name*
+is still caught at compile time.) A `ToolId` is distinct from:
 - its **backend** (which server, or which code type serves it), and
 - its **`target: ArtifactKey`** (the slot its result fills).
 
