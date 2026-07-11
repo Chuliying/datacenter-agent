@@ -46,7 +46,8 @@ use crate::agent::payload::{
 use crate::mcp_client::McpHandle;
 
 // ===========================================================================
-// ToolId — the closed logical name (parity with ArtifactKey: a typo is a parse error)
+// ToolId — the closed logical name (a typo is a parse error; unlike the now-open ArtifactKey,
+// the tool set stays closed so every grant is boot-checked)
 // ===========================================================================
 
 /// The logical identifier of a tool, decoupled from any backend.
@@ -321,7 +322,7 @@ where
     }
 
     fn target(&self) -> ArtifactKey {
-        self.target
+        self.target.clone()
     }
 
     async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError> {
@@ -343,7 +344,7 @@ where
 }
 
 /// Builds the `emit_chart` sink: a [`SchemaTool`] over [`ChartBatch`] whose validated value lands
-/// at [`ArtifactKey::ChartsSpec`].
+/// at [`ArtifactKey::charts_spec()`].
 ///
 /// This is the report `charter`'s only tool and is **code-backed, not MCP** — the model calls it
 /// with one or two falcon charts, a malformed shape is `Rejected` and fed back until valid
@@ -362,7 +363,7 @@ pub fn emit_chart_tool() -> SchemaTool<ChartBatch> {
         "Emit the report's charts. Call once, passing one or two falcon charts (bar/line/pie) \
          built strictly from the fetched numbers. Skip it entirely — call no tool — for \
          chit-chat, greetings, or single-value answers.",
-        ArtifactKey::ChartsSpec,
+        ArtifactKey::charts_spec(),
     )
 }
 
@@ -455,7 +456,7 @@ impl Tool for McpTool {
     }
 
     fn target(&self) -> ArtifactKey {
-        self.target
+        self.target.clone()
     }
 
     async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError> {
@@ -527,7 +528,7 @@ impl Tool for StreamingTool {
     }
 
     fn target(&self) -> ArtifactKey {
-        self.target
+        self.target.clone()
     }
 
     async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError> {
@@ -538,7 +539,7 @@ impl Tool for StreamingTool {
         match &outcome {
             Ok(ToolOutcome::Produced(_)) => self.sink.emit(AgentEvent::ToolProduced {
                 name: self.name.clone(),
-                target: self.target,
+                target: self.target.clone(),
             }),
             Ok(ToolOutcome::Rejected { reason }) => self.sink.emit(AgentEvent::ToolRejected {
                 name: self.name.clone(),
@@ -602,7 +603,7 @@ mod tests {
         let tool = SchemaTool::<ChartSpec>::sink(
             "emit_chart",
             "emit a chart",
-            ArtifactKey::FetcherRecords,
+            ArtifactKey::fetcher_records(),
         );
         assert_eq!(tool.schema().name, "emit_chart");
         assert!(tool.schema().parameters.get("properties").is_some());
@@ -618,7 +619,7 @@ mod tests {
         let tool = SchemaTool::<ChartSpec>::sink(
             "emit_chart",
             "emit a chart",
-            ArtifactKey::FetcherRecords,
+            ArtifactKey::fetcher_records(),
         );
         let bad = serde_json::json!({ "chart_type": "donut" });
         match tool.call(bad).await {
@@ -632,7 +633,7 @@ mod tests {
         let calc = SchemaTool::<CalcArgs>::new(
             "calculate",
             "arithmetic",
-            ArtifactKey::FetcherSchema,
+            ArtifactKey::fetcher_schema(),
             |args: CalcArgs| match args.op.as_str() {
                 "div" if args.b == 0.0 => Err("division by zero".into()),
                 "div" => Ok(ArtifactValue::Number(args.a / args.b)),
@@ -658,7 +659,7 @@ mod tests {
     async fn emit_chart_tool_targets_charts_spec_and_validates_the_batch() {
         let tool = emit_chart_tool();
         assert_eq!(tool.schema().name, "emit_chart");
-        assert_eq!(tool.target(), ArtifactKey::ChartsSpec);
+        assert_eq!(tool.target(), ArtifactKey::charts_spec());
 
         // A valid one-chart batch produces the serialized batch.
         let good = serde_json::json!({
@@ -693,7 +694,7 @@ mod tests {
                 Box::new(SchemaTool::<ChartSpec>::sink(
                     "emit_chart",
                     "",
-                    ArtifactKey::FetcherRecords,
+                    ArtifactKey::fetcher_records(),
                 ))
             }),
         )
@@ -719,7 +720,7 @@ mod tests {
                     Box::new(SchemaTool::<ChartSpec>::sink(
                         "emit_chart",
                         "",
-                        ArtifactKey::FetcherRecords,
+                        ArtifactKey::fetcher_records(),
                     ))
                 })
             )
@@ -770,7 +771,7 @@ mod tests {
             }
         }
         fn target(&self) -> ArtifactKey {
-            ArtifactKey::FetcherRecords
+            ArtifactKey::fetcher_records()
         }
         async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
             Ok(self.outcome.clone())
@@ -798,7 +799,7 @@ mod tests {
                 },
                 AgentEvent::ToolProduced {
                     name: "fixed".into(),
-                    target: ArtifactKey::FetcherRecords,
+                    target: ArtifactKey::fetcher_records(),
                 },
             ]
         );
@@ -840,6 +841,6 @@ mod tests {
             sink,
         );
         assert_eq!(tool.schema().name, "fixed");
-        assert_eq!(tool.target(), ArtifactKey::FetcherRecords);
+        assert_eq!(tool.target(), ArtifactKey::fetcher_records());
     }
 }

@@ -129,10 +129,6 @@ pub struct ConfiguredAgent {
     tools: Vec<Box<dyn Tool>>,
     accepts: &'static [PayloadKind],
     output: OutputShape,
-    /// When set on an [`OutputShape::Intermediate`] stage, the model's final message is recorded
-    /// under this key (see [`capturing_message`](Self::capturing_message)). `None` keeps the
-    /// default behaviour: a non-terminal stage carries only tool-produced artifacts.
-    capture: Option<ArtifactKey>,
 }
 
 impl ConfiguredAgent {
@@ -165,28 +161,7 @@ impl ConfiguredAgent {
             tools,
             accepts: intern_accepts(&cfg.accepts),
             output,
-            capture: None,
         }
-    }
-
-    /// Records the model's final message under `key` when this stage's output is
-    /// [`OutputShape::Intermediate`] — the seam a **prose-producing non-terminal stage** (the
-    /// `analyst`) uses to hand its report to a downstream stage.
-    ///
-    /// An `Intermediate` stage otherwise keeps only *tool-produced* artifacts and **drops** the
-    /// model's message (payload §2.4: `Intermediate` carries working data, `Final` carries the
-    /// user-facing prose). A prose stage has no tool to write through, so its report would be lost
-    /// at the boundary; capturing the message into an artifact key is how prose survives into the
-    /// next stage. It is a no-op for an `OutputShape::Final` stage, whose message already becomes
-    /// the user-facing `assistant`.
-    ///
-    /// # Arguments
-    ///
-    /// - `key`: the artifact slot the model's final message is recorded under.
-    #[must_use]
-    pub fn capturing_message(mut self, key: ArtifactKey) -> Self {
-        self.capture = Some(key);
-        self
     }
 
     /// Renders granted artifacts into a deterministic material block.
@@ -203,7 +178,7 @@ impl ConfiguredAgent {
     /// Returns the rendered block, one `[key] value` line per artifact in key order.
     fn render_material(artifacts: &HashMap<ArtifactKey, ArtifactValue>) -> String {
         let mut entries: Vec<(&ArtifactKey, &ArtifactValue)> = artifacts.iter().collect();
-        entries.sort_by_key(|(k, _)| **k);
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b)); // ArtifactKey: Ord (no longer Copy)
         entries
             .iter()
             .map(|(k, v)| format!("[{k}] {v}\n"))
@@ -254,25 +229,30 @@ impl SubAgent for ConfiguredAgent {
         // dispatch inside the loop (payload §2.3).
         let (text, produced) = run_llm_loop(&self.llm, &system, &user, &self.tools).await?;
 
+        // Assemble this stage's full output: everything carried in, plus every tool artifact, plus
+        // the stage's own **message** as a first-class artifact keyed `{id}.message`. Nothing is
+        // dropped — an Intermediate carries it forward and a Final keeps it as provenance, so the
+        // artifact map is lossless across every boundary (open-key contract).
+        let mut artifacts = incoming;
+        artifacts.extend(produced); // append-only merge
+        artifacts.insert(
+            ArtifactKey::message(&self.id.0),
+            ArtifactValue::Text(text.clone()),
+        );
+
         match self.output {
-            OutputShape::Intermediate => {
-                let mut artifacts = incoming;
-                artifacts.extend(produced); // append-only merge
-                if let Some(key) = self.capture {
-                    // A prose stage's own message, keyed under its namespace so the next stage can
-                    // read it — otherwise an Intermediate boundary drops the model's text.
-                    artifacts.insert(key, ArtifactValue::Text(text));
-                }
-                Ok(AgentPayload::Intermediate(IntermediateData {
-                    prompt,
-                    artifacts,
-                    now,
-                }))
-            }
+            OutputShape::Intermediate => Ok(AgentPayload::Intermediate(IntermediateData {
+                prompt,
+                artifacts,
+                now,
+            })),
+            // The message is *also* surfaced as the user-facing `assistant`; the artifact map rides
+            // along as provenance (payload B / open-key auditability).
             OutputShape::Final => Ok(AgentPayload::Final(FinalResult {
                 user: prompt,
                 assistant: text,
                 now,
+                artifacts,
             })),
         }
     }
@@ -328,6 +308,7 @@ impl SubAgent for HelloWorld {
             user,
             assistant: "hello world.".to_string(),
             now,
+            artifacts: HashMap::new(), // a logic-only agent produces no artifacts
         }))
     }
 }
@@ -469,7 +450,7 @@ impl Orchestrator {
             // Snapshot the artifact keys before the stage, so `StageProduced` reports only what
             // this stage added (not what it carried forward).
             let before: HashSet<ArtifactKey> = match &acc {
-                AgentPayload::Intermediate(d) => d.artifacts.keys().copied().collect(),
+                AgentPayload::Intermediate(d) => d.artifacts.keys().cloned().collect(),
                 _ => HashSet::new(),
             };
             sink.emit(AgentEvent::StageStarted {
@@ -491,8 +472,8 @@ impl Orchestrator {
                 let mut keys: Vec<ArtifactKey> = d
                     .artifacts
                     .keys()
-                    .copied()
-                    .filter(|k| !before.contains(k))
+                    .filter(|k| !before.contains(*k))
+                    .cloned()
                     .collect();
                 keys.sort(); // deterministic order (HashMap iteration is not stable)
                 if !keys.is_empty() {
@@ -566,7 +547,7 @@ mod tests {
             }
         }
         fn target(&self) -> ArtifactKey {
-            ArtifactKey::FetcherRecords
+            ArtifactKey::fetcher_records()
         }
         async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
             Ok(ToolOutcome::Produced(ArtifactValue::Json(
@@ -622,7 +603,7 @@ mod tests {
                 assert_eq!(d.prompt, "revenue please");
                 let rows = d
                     .artifacts
-                    .get(&ArtifactKey::FetcherRecords)
+                    .get(&ArtifactKey::fetcher_records())
                     .expect("fetcher.records must be produced");
                 assert!(matches!(rows, ArtifactValue::Json(_)));
             }
@@ -643,6 +624,7 @@ mod tests {
                 user: "u".into(),
                 assistant: "a".into(),
                 now: fixed_now(),
+                artifacts: HashMap::new(),
             }))
             .await;
         assert!(matches!(
@@ -674,7 +656,7 @@ mod tests {
         );
         let mut artifacts = HashMap::new();
         artifacts.insert(
-            ArtifactKey::FetcherRecords,
+            ArtifactKey::fetcher_records(),
             ArtifactValue::Text("revenue=12345".into()),
         );
         let out = writer
@@ -694,9 +676,10 @@ mod tests {
     // ── an Intermediate prose stage captures its message into an artifact ──
 
     #[tokio::test]
-    async fn capturing_message_records_the_model_message_into_an_artifact() {
-        // The analyst's shape: no tools, Intermediate output, prose captured so it survives the
-        // boundary (a plain Intermediate stage would drop the message entirely).
+    async fn a_stages_message_is_auto_captured_as_a_first_class_artifact() {
+        // The analyst's shape: no tools, Intermediate output. Its message is captured under
+        // `{id}.message` automatically (open-key contract), so an Intermediate boundary is lossless
+        // — no per-agent wiring needed.
         let cfg = SubAgentConfig {
             id: SubAgentId("analyst".into()),
             instruction: "analyse the material".into(),
@@ -710,12 +693,11 @@ mod tests {
             ScriptedLlm::arc(vec![LlmResponse::Message("## Analysis\nRevenue is up.".into())]),
             vec![],
             OutputShape::Intermediate,
-        )
-        .capturing_message(ArtifactKey::AnalystReport);
+        );
 
         let mut artifacts = HashMap::new();
         artifacts.insert(
-            ArtifactKey::FetcherRecords,
+            ArtifactKey::fetcher_records(),
             ArtifactValue::Json(serde_json::json!({ "revenue": 12345 })),
         );
         let out = analyst
@@ -729,13 +711,13 @@ mod tests {
 
         match out {
             AgentPayload::Intermediate(d) => {
-                // The captured prose is present…
+                // The message landed at `analyst.message` with no capture wiring…
                 assert_eq!(
-                    d.artifacts.get(&ArtifactKey::AnalystReport),
+                    d.artifacts.get(&ArtifactKey::message("analyst")),
                     Some(&ArtifactValue::Text("## Analysis\nRevenue is up.".into()))
                 );
                 // …and the upstream material is carried forward untouched (append-only).
-                assert!(d.artifacts.contains_key(&ArtifactKey::FetcherRecords));
+                assert!(d.artifacts.contains_key(&ArtifactKey::fetcher_records()));
             }
             other => panic!("expected Intermediate, got {:?}", other.kind()),
         }
@@ -978,11 +960,13 @@ mod tests {
                 },
                 AgentEvent::ToolProduced {
                     name: "bill_revenue".into(),
-                    target: ArtifactKey::FetcherRecords,
+                    target: ArtifactKey::fetcher_records(),
                 },
                 AgentEvent::StageProduced {
                     agent: SubAgentId("fetcher".into()),
-                    keys: vec![ArtifactKey::FetcherRecords],
+                    // open-key contract: the fetcher's own message is captured too, alongside the
+                    // tool artifact (sorted: `fetcher.message` < `fetcher.records`).
+                    keys: vec![ArtifactKey::message("fetcher"), ArtifactKey::fetcher_records()],
                 },
                 AgentEvent::StageFinished {
                     agent: SubAgentId("fetcher".into()),

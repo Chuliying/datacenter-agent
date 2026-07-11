@@ -158,7 +158,7 @@ async fn terminal_stage_streams_its_answer_from_the_datacenter() {
         stream_tool.clone(),
         description,
         parameters,
-        ArtifactKey::FetcherRecords,
+        ArtifactKey::fetcher_records(),
     ));
     let tools = StreamingTool::wrap_all(vec![mcp_tool], sink.clone());
 

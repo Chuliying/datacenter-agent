@@ -25,7 +25,7 @@
 //!
 //! - the `fetcher` (buffered LLM) calls `bill_revenue` — you see `ToolStarted` / `ToolProduced`;
 //! - the `analyst` (streaming LLM) writes its report — you see it stream token-by-token as
-//!   `ContentDelta`, captured into `analyst.report`;
+//!   `ContentDelta`, auto-captured as the `analyst.message` artifact;
 //! - the `charter` (buffered LLM) may call `emit_chart` — you see `ToolStarted` / `ToolProduced`;
 //! - the `finalizer` (pure logic) concatenates the report with each chart as a ```` ```falcon-chart ````
 //!   block and the run emits the terminal `Finished`.
@@ -161,7 +161,7 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
         "bill_revenue",
         description,
         parameters,
-        ArtifactKey::FetcherRecords,
+        ArtifactKey::fetcher_records(),
     ));
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &fetcher_config(),
@@ -169,15 +169,12 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
         StreamingTool::wrap_all(vec![fetch_mcp], sink.clone()),
         OutputShape::Intermediate,
     ));
-    let analyst: Arc<dyn SubAgent> = Arc::new(
-        ConfiguredAgent::new(
-            &analyst_config(),
-            streaming.clone(),
-            vec![],
-            OutputShape::Intermediate,
-        )
-        .capturing_message(ArtifactKey::AnalystReport),
-    );
+    let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &analyst_config(),
+        streaming.clone(),
+        vec![],
+        OutputShape::Intermediate,
+    ));
     let charter: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &charter_config(),
         buffered.clone(),

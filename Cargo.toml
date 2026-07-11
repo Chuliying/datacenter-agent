@@ -23,7 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 anyhow = "1"
 async-trait = "0.1"
-chrono = "0.4"
+# `serde` feature: the payload's per-turn `now` (DateTime<FixedOffset>) is serialized end to end
+# for reproducibility/auditability (agent payload contract, PART A).
+chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 sha2 = "0.10"
 thiserror = "2"

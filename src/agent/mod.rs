@@ -40,6 +40,17 @@
 //! - [`events`] — the streaming event model: one injected [`EventSink`](events::EventSink)
 //!   carrying one tagged [`AgentEvent`](events::AgentEvent), emitted by the LLM adapter, the
 //!   tool wrapper, and the orchestrator (plan §8).
+//! - [`clock`] — time as an injected capability ([`Clock`](clock::Clock) /
+//!   [`SystemClock`](clock::SystemClock)) plus the shared `# Current Time` header
+//!   ([`current_time_header`](clock::current_time_header)), so a stage is time-aware yet
+//!   deterministic under a fixed clock.
+//! - [`chart`] — the **falcon-chart** protocol ([`ChartBatch`](chart::ChartBatch) /
+//!   [`FalconChart`](chart::FalconChart)): the shared `serde` + `schemars` type the `charter`'s
+//!   `emit_chart` sink validates and the `finalizer` renders (plan §10).
+//! - [`pipeline`] — the `/agent` analytics pipeline (fetcher → analyst → charter →
+//!   [`Finalizer`](pipeline::Finalizer)), decomposing the monolith's single turn into four
+//!   composable sub-agents, with the pure-logic [`render_report`](pipeline::render_report)
+//!   assembly (plan §10).
 //!
 //! Nothing here is wired into [`AppState`](crate::appstate::AppState) yet.
 //! The modules are dormant, unit-tested groundwork.
@@ -50,9 +61,12 @@
 //! - Tool contract — `.spec/contract/tool`
 //! - Sub-agent contract — `.spec/contract/sub_agent`
 
+pub mod chart;
+pub mod clock;
 pub mod config;
 pub mod engine;
 pub mod events;
 pub mod llm;
 pub mod payload;
+pub mod pipeline;
 pub mod tools;

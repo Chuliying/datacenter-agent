@@ -32,6 +32,7 @@
 #![allow(dead_code)] // groundwork: not every artifact key / value variant is wired yet.
 
 use async_trait::async_trait;
+use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -74,39 +75,80 @@ impl fmt::Display for ArtifactValue {
     }
 }
 
-/// The *strict* artifact key: a compile-time enum, so a mistyped key is a compile error.
+/// An **open, producer-namespaced** artifact key: `{agent}.{name}`.
 ///
-/// Variants are namespaced by producer and render to a canonical dotted string
-/// (`fetcher.records`).
-/// That string is *both* the log form and the serialized form — JSON object keys must be
-/// strings.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+/// Any agent freely names its outputs — there is no closed set to extend — so a tool result, an
+/// agent's own message, or any computed value can all be keyed uniformly. The `agent` half is the
+/// producer namespace (contract §2.5); the canonical dotted string (`fetcher.records`,
+/// `analyst.message`) is *both* the log form and the serialized form (JSON object keys are
+/// strings).
+///
+/// Prefer the named constructors ([`fetcher_records`](Self::fetcher_records),
+/// [`charts_spec`](Self::charts_spec), [`message`](Self::message)) for the well-known wires so the
+/// vocabulary stays in one place; use [`new`](Self::new) for anything else.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
-pub enum ArtifactKey {
-    FetcherRecords,
-    FetcherSchema,
-    WriterDraft,
-    // EXTEND: one variant per wire the orchestration designer connects.
+pub struct ArtifactKey {
+    agent: String,
+    name: String,
+}
+
+impl ArtifactKey {
+    /// Builds a key `{agent}.{name}` from an arbitrary producer + slot.
+    pub fn new(agent: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            agent: agent.into(),
+            name: name.into(),
+        }
+    }
+
+    /// The artifact holding an agent's own **message** — the prose its reasoning produced, keyed
+    /// `{agent}.message`. Captured for every LLM stage so an `Intermediate` boundary never drops
+    /// it (the analyst's report is exactly this).
+    pub fn message(agent: &str) -> Self {
+        Self::new(agent, "message")
+    }
+
+    /// The `fetcher`'s data records wire (`fetcher.records`).
+    pub fn fetcher_records() -> Self {
+        Self::new("fetcher", "records")
+    }
+
+    /// The `fetcher`'s schema wire (`fetcher.schema`).
+    pub fn fetcher_schema() -> Self {
+        Self::new("fetcher", "schema")
+    }
+
+    /// The `charter`'s schema-validated chart batch (`charts.spec`), a serialized
+    /// [`ChartBatch`](crate::agent::chart::ChartBatch) from the `emit_chart` sink.
+    pub fn charts_spec() -> Self {
+        Self::new("charts", "spec")
+    }
+
+    /// The producer namespace (the `agent` half).
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// The slot name (the `name` half).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 impl fmt::Display for ArtifactKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ArtifactKey::FetcherRecords => "fetcher.records",
-            ArtifactKey::FetcherSchema => "fetcher.schema",
-            ArtifactKey::WriterDraft => "writer.draft",
-        })
+        write!(f, "{}.{}", self.agent, self.name)
     }
 }
 
 impl std::str::FromStr for ArtifactKey {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "fetcher.records" => Ok(ArtifactKey::FetcherRecords),
-            "fetcher.schema" => Ok(ArtifactKey::FetcherSchema),
-            "writer.draft" => Ok(ArtifactKey::WriterDraft),
-            other => Err(format!("unknown ArtifactKey: {other}")),
+        // Split on the *first* dot: the producer namespace cannot contain one, the slot name may.
+        match s.split_once('.') {
+            Some((agent, name)) if !agent.is_empty() && !name.is_empty() => Ok(Self::new(agent, name)),
+            _ => Err(format!("artifact key must be `agent.name`, got: {s:?}")),
         }
     }
 }
@@ -131,6 +173,17 @@ impl TryFrom<String> for ArtifactKey {
 pub struct InitialPrompt {
     pub prompt: String,
     pub history: Vec<Exchange>,
+    /// The wall-clock instant this turn began, in an explicit offset (Asia/Taipei `+08:00` by
+    /// default).
+    ///
+    /// Stamped **once at the boundary** and threaded as data — never read ambiently inside a stage
+    /// — so every stage shares one consistent `now`, an eval fixture can pin it for
+    /// reproducibility, and the value is auditable end to end. Each LLM stage renders it into a
+    /// `# Current Time` header ([`current_time_header`](crate::agent::clock::current_time_header))
+    /// so the model can tell an in-progress trailing period from a genuine drop.
+    ///
+    /// This is the seed of a broader per-turn context (request id, locale, tenant) — extend here.
+    pub now: DateTime<FixedOffset>,
 }
 
 /// Intermediate working data — never the user-facing output.
@@ -141,15 +194,29 @@ pub struct InitialPrompt {
 pub struct IntermediateData {
     pub prompt: String,
     pub artifacts: HashMap<ArtifactKey, ArtifactValue>,
+    /// The turn's timestamp, carried forward unchanged from [`InitialPrompt::now`] so every stage
+    /// agrees on `now` (see there).
+    pub now: DateTime<FixedOffset>,
 }
 
 /// The user-facing result.
 ///
 /// Its own type (not `Exchange`) so metadata can land here later.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `assistant` is the terminal *projection* (what the user sees); `artifacts` carries the full,
+/// lossless provenance the pipeline accumulated — every stage's tool outputs and messages — so the
+/// result is auditable end to end and a caller can inspect what produced the answer. (No `Eq`:
+/// [`ArtifactValue::Number`] holds an `f64`.)
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FinalResult {
     pub user: String,
     pub assistant: String,
+    /// The turn's timestamp (see [`InitialPrompt::now`]), stamped onto the terminal result so an
+    /// audit record of the response carries when the turn occurred.
+    pub now: DateTime<FixedOffset>,
+    /// The accumulated artifact map — full provenance, carried through the terminal boundary
+    /// rather than dropped. The producer decides what (if anything) a caller-facing view exposes.
+    pub artifacts: HashMap<ArtifactKey, ArtifactValue>,
     // EXTEND: stop_reason, token usage, latency, ...
 }
 
@@ -448,7 +515,7 @@ mod tests {
             }
         }
         fn target(&self) -> ArtifactKey {
-            ArtifactKey::FetcherRecords
+            ArtifactKey::fetcher_records()
         }
         async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
             Ok(ToolOutcome::Produced(ArtifactValue::Text("echoed".into())))
@@ -457,12 +524,18 @@ mod tests {
 
     #[test]
     fn artifact_key_round_trips_through_its_dotted_string() {
-        assert_eq!(ArtifactKey::FetcherRecords.to_string(), "fetcher.records");
+        assert_eq!(ArtifactKey::fetcher_records().to_string(), "fetcher.records");
         assert_eq!(
             "fetcher.records".parse::<ArtifactKey>().unwrap(),
-            ArtifactKey::FetcherRecords
+            ArtifactKey::fetcher_records()
         );
-        assert!("nope.nope".parse::<ArtifactKey>().is_err());
+        // an arbitrary `agent.name` is valid now — the key space is open…
+        assert_eq!(
+            "custom.slot".parse::<ArtifactKey>().unwrap(),
+            ArtifactKey::new("custom", "slot")
+        );
+        // …but a string with no namespace dot is not a key.
+        assert!("nodot".parse::<ArtifactKey>().is_err());
     }
 
     #[tokio::test]
@@ -481,7 +554,7 @@ mod tests {
         let (text, produced) = run_llm_loop(&llm, "sys", "go", &tools).await.unwrap();
         assert_eq!(text, "done");
         assert_eq!(
-            produced.get(&ArtifactKey::FetcherRecords),
+            produced.get(&ArtifactKey::fetcher_records()),
             Some(&ArtifactValue::Text("echoed".into()))
         );
     }

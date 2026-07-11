@@ -86,7 +86,7 @@ pub struct FalconChart {
 /// The `emit_chart` argument — **one or two** charts submitted in a single call.
 ///
 /// A batch (rather than one-chart-per-call) is what lets a single sink slot
-/// ([`ArtifactKey::ChartsSpec`](crate::agent::payload::ArtifactKey::ChartsSpec)) hold the whole
+/// ([`ArtifactKey::charts_spec`](crate::agent::payload::ArtifactKey::charts_spec)) hold the whole
 /// chart part: a per-call sink would overwrite its slot on a second chart. An empty `charts`
 /// (or not calling the tool at all) means "no chart" — the chit-chat / single-value case.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Default)]

@@ -123,7 +123,7 @@ async fn fetcher_fetches_real_data_from_the_datacenter() {
         fetcher_tool.clone(),
         description,
         parameters,
-        ArtifactKey::FetcherRecords,
+        ArtifactKey::fetcher_records(),
     ));
 
     let cfg = SubAgentConfig {
@@ -157,7 +157,7 @@ async fn fetcher_fetches_real_data_from_the_datacenter() {
         AgentPayload::Intermediate(data) => {
             let records = data
                 .artifacts
-                .get(&ArtifactKey::FetcherRecords)
+                .get(&ArtifactKey::fetcher_records())
                 .expect("fetcher must produce a `fetcher.records` artifact from the tool result");
             eprintln!("fetcher.records =\n{records}");
             assert!(
