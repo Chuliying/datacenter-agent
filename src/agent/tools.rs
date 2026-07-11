@@ -38,6 +38,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
+use crate::agent::chart::ChartBatch;
 use crate::agent::events::{AgentEvent, EventSink};
 use crate::agent::payload::{
     AgentError, ArtifactKey, ArtifactValue, Tool, ToolOutcome, ToolSchema,
@@ -341,6 +342,30 @@ where
     }
 }
 
+/// Builds the `emit_chart` sink: a [`SchemaTool`] over [`ChartBatch`] whose validated value lands
+/// at [`ArtifactKey::ChartsSpec`].
+///
+/// This is the report `charter`'s only tool and is **code-backed, not MCP** — the model calls it
+/// with one or two falcon charts, a malformed shape is `Rejected` and fed back until valid
+/// ("loop until valid" for free, tool contract), and the serialized [`ChartBatch`] becomes the
+/// `charts.spec` artifact the `finalizer` renders.
+///
+/// The advertised name is the canonical [`ToolId::EmitChart`] string, keeping the LLM-facing
+/// vocabulary in one place.
+///
+/// # References
+///
+/// - Sub-agent plan §10 — `emit_chart` is a code-registered `SchemaTool` sink
+pub fn emit_chart_tool() -> SchemaTool<ChartBatch> {
+    SchemaTool::<ChartBatch>::sink(
+        ToolId::EmitChart.to_string(),
+        "Emit the report's charts. Call once, passing one or two falcon charts (bar/line/pie) \
+         built strictly from the fetched numbers. Skip it entirely — call no tool — for \
+         chit-chat, greetings, or single-value answers.",
+        ArtifactKey::ChartsSpec,
+    )
+}
+
 // ===========================================================================
 // McpTool — the MCP data-fetch backend
 // ===========================================================================
@@ -624,6 +649,36 @@ mod tests {
         assert!(matches!(
             calc.call(ok).await.unwrap(),
             ToolOutcome::Produced(ArtifactValue::Number(_))
+        ));
+    }
+
+    // ── emit_chart: the charter's sink, advertised name + validate/reject ──
+
+    #[tokio::test]
+    async fn emit_chart_tool_targets_charts_spec_and_validates_the_batch() {
+        let tool = emit_chart_tool();
+        assert_eq!(tool.schema().name, "emit_chart");
+        assert_eq!(tool.target(), ArtifactKey::ChartsSpec);
+
+        // A valid one-chart batch produces the serialized batch.
+        let good = serde_json::json!({
+            "charts": [{
+                "version": 1, "chartType": "bar", "title": "近兩月營收",
+                "data": [{ "name": "5月", "value": 120 }, { "name": "6月", "value": 180 }]
+            }]
+        });
+        match tool.call(good).await.unwrap() {
+            ToolOutcome::Produced(ArtifactValue::Json(v)) => {
+                assert_eq!(v["charts"][0]["chartType"], "bar");
+            }
+            other => panic!("expected Produced(Json), got {other:?}"),
+        }
+
+        // A malformed chart type is a retryable rejection, not a crash.
+        let bad = serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
+        assert!(matches!(
+            tool.call(bad).await.unwrap(),
+            ToolOutcome::Rejected { .. }
         ));
     }
 

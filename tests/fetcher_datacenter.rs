@@ -41,6 +41,7 @@ use std::sync::Arc;
 
 use datacenter_agent::agent::config::{OutputShape, SubAgentConfig, SubAgentId};
 use datacenter_agent::agent::config::{Provider, ResolvedLlm};
+use datacenter_agent::agent::clock::{Clock, SystemClock};
 use datacenter_agent::agent::engine::{ConfiguredAgent, SubAgent};
 use datacenter_agent::agent::llm::OpenAiLlm;
 use datacenter_agent::agent::payload::{
@@ -144,6 +145,7 @@ async fn fetcher_fetches_real_data_from_the_datacenter() {
         .run(AgentPayload::Initial(InitialPrompt {
             prompt,
             history: vec![],
+            now: SystemClock::default().now(), // stamp the turn once at the boundary
         }))
         .await
         .expect("fetcher run should succeed");

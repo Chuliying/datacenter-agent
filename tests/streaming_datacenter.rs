@@ -48,6 +48,7 @@ use std::sync::Arc;
 use datacenter_agent::agent::config::{
     OutputShape, PipelineConfig, PipelineId, Provider, ResolvedLlm, SubAgentConfig, SubAgentId,
 };
+use datacenter_agent::agent::clock::{Clock, SystemClock};
 use datacenter_agent::agent::engine::{resolve_pipeline, ConfiguredAgent, Orchestrator, SubAgent};
 use datacenter_agent::agent::events::{AgentEvent, ChannelSink, EventSink};
 use datacenter_agent::agent::llm::StreamingOpenAiLlm;
@@ -193,6 +194,7 @@ async fn terminal_stage_streams_its_answer_from_the_datacenter() {
             AgentPayload::Initial(InitialPrompt {
                 prompt,
                 history: vec![],
+                now: SystemClock::default().now(), // stamp the turn once at the boundary
             }),
             &*sink,
         )

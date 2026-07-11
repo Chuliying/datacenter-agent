@@ -222,11 +222,12 @@ impl AppState {
             _ => base_system.to_string(),
         };
 
-        // Make LLM time-aware
-        let now_str = chrono::Local::now()
-            .format("%Y-%m-%d %H:%M:%S %:z")
-            .to_string();
-        let system = format!("# Current Time\n{now_str}\n\n{system_base}");
+        // Make LLM time-aware. The header format is shared with the sub-agent path and the eval
+        // runner via `current_time_header`, so the three cannot drift.
+        let system = format!(
+            "{}{system_base}",
+            crate::agent::clock::current_time_header(&chrono::Local::now())
+        );
 
         GenerationConfig {
             system,

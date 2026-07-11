@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::agent::clock::current_time_header;
 use crate::agent::config::{
     OutputShape, PipelineConfig, PipelineId, ResolveError, SubAgentConfig, SubAgentId,
 };
@@ -128,6 +129,10 @@ pub struct ConfiguredAgent {
     tools: Vec<Box<dyn Tool>>,
     accepts: &'static [PayloadKind],
     output: OutputShape,
+    /// When set on an [`OutputShape::Intermediate`] stage, the model's final message is recorded
+    /// under this key (see [`capturing_message`](Self::capturing_message)). `None` keeps the
+    /// default behaviour: a non-terminal stage carries only tool-produced artifacts.
+    capture: Option<ArtifactKey>,
 }
 
 impl ConfiguredAgent {
@@ -160,7 +165,28 @@ impl ConfiguredAgent {
             tools,
             accepts: intern_accepts(&cfg.accepts),
             output,
+            capture: None,
         }
+    }
+
+    /// Records the model's final message under `key` when this stage's output is
+    /// [`OutputShape::Intermediate`] — the seam a **prose-producing non-terminal stage** (the
+    /// `analyst`) uses to hand its report to a downstream stage.
+    ///
+    /// An `Intermediate` stage otherwise keeps only *tool-produced* artifacts and **drops** the
+    /// model's message (payload §2.4: `Intermediate` carries working data, `Final` carries the
+    /// user-facing prose). A prose stage has no tool to write through, so its report would be lost
+    /// at the boundary; capturing the message into an artifact key is how prose survives into the
+    /// next stage. It is a no-op for an `OutputShape::Final` stage, whose message already becomes
+    /// the user-facing `assistant`.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`: the artifact slot the model's final message is recorded under.
+    #[must_use]
+    pub fn capturing_message(mut self, key: ArtifactKey) -> Self {
+        self.capture = Some(key);
+        self
     }
 
     /// Renders granted artifacts into a deterministic material block.
@@ -204,12 +230,13 @@ impl SubAgent for ConfiguredAgent {
             });
         }
 
-        // Assemble the user turn + carry-forward artifacts (append-only, payload §2.4).
-        let (prompt, incoming) = match input {
-            AgentPayload::Initial(p) => (p.prompt, HashMap::new()),
-            AgentPayload::Intermediate(d) => (d.prompt, d.artifacts),
+        // Assemble the user turn + carry-forward artifacts (append-only, payload §2.4). `now` is
+        // turn data, threaded through unchanged so every stage shares one timestamp (payload B).
+        let (prompt, incoming, now) = match input {
+            AgentPayload::Initial(p) => (p.prompt, HashMap::new(), p.now),
+            AgentPayload::Intermediate(d) => (d.prompt, d.artifacts, d.now),
             // Excluded by the accept-check above unless an agent explicitly accepts Final.
-            AgentPayload::Final(f) => (f.user, HashMap::new()),
+            AgentPayload::Final(f) => (f.user, HashMap::new(), f.now),
         };
         let material = Self::render_material(&incoming);
         let user = if material.is_empty() {
@@ -218,23 +245,34 @@ impl SubAgent for ConfiguredAgent {
             format!("{prompt}\n\nMaterial:\n{material}")
         };
 
+        // Make the stage time-aware: prepend a `# Current Time` header from the turn's `now` so the
+        // model can tell an in-progress trailing period (e.g. the current month) from a genuine
+        // drop. Deterministic — `now` came in with the payload, not from an ambient clock.
+        let system = format!("{}{}", current_time_header(&now), self.instruction);
+
         // The LLM chooses among *only* the granted tools; out-of-set calls are rejected at
         // dispatch inside the loop (payload §2.3).
-        let (text, produced) =
-            run_llm_loop(&self.llm, &self.instruction, &user, &self.tools).await?;
+        let (text, produced) = run_llm_loop(&self.llm, &system, &user, &self.tools).await?;
 
         match self.output {
             OutputShape::Intermediate => {
                 let mut artifacts = incoming;
                 artifacts.extend(produced); // append-only merge
+                if let Some(key) = self.capture {
+                    // A prose stage's own message, keyed under its namespace so the next stage can
+                    // read it — otherwise an Intermediate boundary drops the model's text.
+                    artifacts.insert(key, ArtifactValue::Text(text));
+                }
                 Ok(AgentPayload::Intermediate(IntermediateData {
                     prompt,
                     artifacts,
+                    now,
                 }))
             }
             OutputShape::Final => Ok(AgentPayload::Final(FinalResult {
                 user: prompt,
                 assistant: text,
+                now,
             })),
         }
     }
@@ -275,19 +313,21 @@ impl SubAgent for HelloWorld {
     }
 
     async fn run(&self, input: AgentPayload) -> Result<AgentPayload, AgentError> {
-        if !self.accepts().contains(&input.kind()) {
-            return Err(AgentError::Mismatch {
-                expected: self.accepts(),
-                got: input.kind(),
-            });
-        }
-        let user = match input {
-            AgentPayload::Initial(p) => p.prompt,
-            _ => String::new(),
+        // Accept-check and destructure in one: only Initial is accepted, and its `now` is threaded
+        // onto the terminal result so the response carries the turn's timestamp.
+        let (user, now) = match input {
+            AgentPayload::Initial(p) => (p.prompt, p.now),
+            other => {
+                return Err(AgentError::Mismatch {
+                    expected: self.accepts(),
+                    got: other.kind(),
+                })
+            }
         };
         Ok(AgentPayload::Final(FinalResult {
             user,
             assistant: "hello world.".to_string(),
+            now,
         }))
     }
 }
@@ -483,7 +523,13 @@ mod tests {
     use crate::agent::events::test_support::CollectingSink;
     use crate::agent::payload::{InitialPrompt, ToolCall, ToolOutcome, ToolSchema};
     use crate::agent::tools::StreamingTool;
+    use chrono::{DateTime, FixedOffset};
     use std::sync::Mutex;
+
+    /// A pinned turn timestamp — payload B makes `now` deterministic input, so tests fix it here.
+    fn fixed_now() -> DateTime<FixedOffset> {
+        DateTime::parse_from_rfc3339("2026-07-11T09:30:00+08:00").unwrap()
+    }
 
     /// A scripted LLM: hand it the turns to replay, and an agent becomes deterministic.
     struct ScriptedLlm {
@@ -566,6 +612,7 @@ mod tests {
             .run(AgentPayload::Initial(InitialPrompt {
                 prompt: "revenue please".into(),
                 history: vec![],
+                now: fixed_now(),
             }))
             .await
             .unwrap();
@@ -595,6 +642,7 @@ mod tests {
             .run(AgentPayload::Final(FinalResult {
                 user: "u".into(),
                 assistant: "a".into(),
+                now: fixed_now(),
             }))
             .await;
         assert!(matches!(
@@ -633,11 +681,143 @@ mod tests {
             .run(AgentPayload::Intermediate(IntermediateData {
                 prompt: "write it".into(),
                 artifacts,
+                now: fixed_now(),
             }))
             .await
             .unwrap();
         match out {
             AgentPayload::Final(f) => assert_eq!(f.assistant, "THE REPORT"),
+            other => panic!("expected Final, got {:?}", other.kind()),
+        }
+    }
+
+    // ── an Intermediate prose stage captures its message into an artifact ──
+
+    #[tokio::test]
+    async fn capturing_message_records_the_model_message_into_an_artifact() {
+        // The analyst's shape: no tools, Intermediate output, prose captured so it survives the
+        // boundary (a plain Intermediate stage would drop the message entirely).
+        let cfg = SubAgentConfig {
+            id: SubAgentId("analyst".into()),
+            instruction: "analyse the material".into(),
+            llm: None,
+            tools: vec![],
+            accepts: vec![PayloadKind::Intermediate],
+            output: None,
+        };
+        let analyst = ConfiguredAgent::new(
+            &cfg,
+            ScriptedLlm::arc(vec![LlmResponse::Message("## Analysis\nRevenue is up.".into())]),
+            vec![],
+            OutputShape::Intermediate,
+        )
+        .capturing_message(ArtifactKey::AnalystReport);
+
+        let mut artifacts = HashMap::new();
+        artifacts.insert(
+            ArtifactKey::FetcherRecords,
+            ArtifactValue::Json(serde_json::json!({ "revenue": 12345 })),
+        );
+        let out = analyst
+            .run(AgentPayload::Intermediate(IntermediateData {
+                prompt: "analyse it".into(),
+                artifacts,
+                now: fixed_now(),
+            }))
+            .await
+            .unwrap();
+
+        match out {
+            AgentPayload::Intermediate(d) => {
+                // The captured prose is present…
+                assert_eq!(
+                    d.artifacts.get(&ArtifactKey::AnalystReport),
+                    Some(&ArtifactValue::Text("## Analysis\nRevenue is up.".into()))
+                );
+                // …and the upstream material is carried forward untouched (append-only).
+                assert!(d.artifacts.contains_key(&ArtifactKey::FetcherRecords));
+            }
+            other => panic!("expected Intermediate, got {:?}", other.kind()),
+        }
+    }
+
+    // ── a stage is time-aware: the payload's `now` lands in the system prompt ──
+
+    /// An LLM that records the system message it was handed, so a test can assert what the stage
+    /// actually sent — here, that the `# Current Time` header carried the payload's `now`.
+    struct CapturingLlm {
+        system: Mutex<Option<String>>,
+    }
+    impl CapturingLlm {
+        fn arc() -> Arc<Self> {
+            Arc::new(Self {
+                system: Mutex::new(None),
+            })
+        }
+    }
+    #[async_trait]
+    impl LlmCapability for CapturingLlm {
+        async fn chat(
+            &self,
+            messages: &[LlmMessage],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmResponse, AgentError> {
+            if let Some(LlmMessage::System(s)) = messages.first() {
+                *self.system.lock().unwrap() = Some(s.clone());
+            }
+            Ok(LlmResponse::Message("ok".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_prepends_the_payloads_now_as_a_current_time_header() {
+        let llm = CapturingLlm::arc();
+        let dyn_llm: Arc<dyn LlmCapability> = llm.clone();
+        let agent = ConfiguredAgent::new(&fetcher_config(), dyn_llm, vec![], OutputShape::Final);
+
+        // `now` is deterministic *input* — no ambient clock, no wiring override (payload B).
+        agent
+            .run(AgentPayload::Initial(InitialPrompt {
+                prompt: "revenue".into(),
+                history: vec![],
+                now: fixed_now(),
+            }))
+            .await
+            .unwrap();
+
+        let system = llm
+            .system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the LLM should have been handed a system message");
+        assert!(
+            system.starts_with("# Current Time\n2026-07-11 09:30:00 +08:00\n\n"),
+            "system prompt must open with the turn's time header, got:\n{system}"
+        );
+        // the agent's own instruction still follows the header
+        assert!(system.contains("You fetch data using the available tools."));
+    }
+
+    #[tokio::test]
+    async fn now_threads_unchanged_onto_the_terminal_result() {
+        // Payload B's auditability guarantee: the turn's `now` reaches the Final result verbatim.
+        let agent = ConfiguredAgent::new(
+            &fetcher_config(),
+            ScriptedLlm::arc(vec![LlmResponse::Message("done".into())]),
+            vec![],
+            OutputShape::Final,
+        );
+        let out = agent
+            .run(AgentPayload::Initial(InitialPrompt {
+                prompt: "hi".into(),
+                history: vec![],
+                now: fixed_now(),
+            }))
+            .await
+            .unwrap();
+        match out {
+            AgentPayload::Final(f) => assert_eq!(f.now, fixed_now()),
             other => panic!("expected Final, got {:?}", other.kind()),
         }
     }
@@ -662,6 +842,7 @@ mod tests {
                 AgentPayload::Initial(InitialPrompt {
                     prompt: "hi".into(),
                     history: vec![],
+                    now: fixed_now(),
                 }),
             )
             .await
@@ -777,6 +958,7 @@ mod tests {
                 AgentPayload::Initial(InitialPrompt {
                     prompt: "revenue".into(),
                     history: vec![],
+                    now: fixed_now(),
                 }),
                 &*sink,
             )
