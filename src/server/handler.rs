@@ -35,12 +35,10 @@ use super::dto::{
 use super::error::AppError;
 use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
-use crate::agent::config::{Provider, ResolvedLlm};
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
 use crate::agent::pipeline::agent_pipeline_id;
 use crate::agent::wiring::build_insight_pipeline;
-use crate::appstate::LlmDefaults;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
 
@@ -147,7 +145,7 @@ pub async fn insight(
         let user_prompt = req.prompt.clone();
 
         // Assemble the pipeline buffered (no sink) and thread the payload through it.
-        let resolved = resolved_insight_llm(&state.llm);
+        let resolved = state.llm.resolved();
         let orchestrator = build_insight_pipeline(
             state.mcp.clone(),
             &state.tools,
@@ -309,7 +307,7 @@ pub async fn insight_stream(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
     let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
 
-    let resolved = resolved_insight_llm(&state.llm);
+    let resolved = state.llm.resolved();
     let orchestrator = build_insight_pipeline(
         state.mcp.clone(),
         &state.tools,
@@ -424,22 +422,6 @@ fn stream_frame_from_llm_event(ev: llm_connector::LlmEvent) -> Option<StreamFram
 /// report) are never dropped by [`ChannelSink`]'s `try_send`; a lossless channel is a later
 /// refinement (plan §8.2).
 const INSIGHT_STREAM_BUFFER: usize = 8192;
-
-/// Bridge the environment's [`LlmDefaults`] onto the sub-agent layer's [`ResolvedLlm`].
-///
-/// Every `/insight` stage runs on OpenRouter (the deployment's single provider today) with the
-/// shared model and sampling params.
-fn resolved_insight_llm(llm: &LlmDefaults) -> ResolvedLlm {
-    ResolvedLlm {
-        provider: Provider::OpenRouter,
-        base_url: llm.base_url.clone(),
-        model: llm.model.clone(),
-        temperature: llm.temperature,
-        top_p: llm.top_p,
-        max_tokens: llm.max_tokens,
-        api_key: Some(llm.api_key.clone()),
-    }
-}
 
 /// Build the pipeline's `Initial` payload, stamping the turn's `now` once at this boundary
 /// (plan §12.1) and carrying prior turns forward as [`Exchange`]es.

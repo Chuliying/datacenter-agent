@@ -79,6 +79,22 @@ impl LlmDefaults {
             max_tokens: get_env_with_default("OPENROUTER_MAX_TOKENS", 4096_u32),
         })
     }
+
+    /// Bridge these env-sourced defaults onto the sub-agent layer's fully-resolved LLM.
+    ///
+    /// The deployment runs a single OpenRouter provider today, so every sub-agent pipeline
+    /// (`/insight`, the greeting) shares this one resolution.
+    pub fn resolved(&self) -> crate::agent::config::ResolvedLlm {
+        crate::agent::config::ResolvedLlm {
+            provider: crate::agent::config::Provider::OpenRouter,
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_tokens: self.max_tokens,
+            api_key: Some(self.api_key.clone()),
+        }
+    }
 }
 
 /// Runtime-loaded prompts.
@@ -97,9 +113,11 @@ pub struct PromptBank {
     pub agent_system: String,
     /// System prompt for the HTML report `/report` + `/report/stream` endpoints.
     pub report_system: String,
-    /// System prompt for the greeting generator.
-    pub greeting_system: String,
-    /// User-side stub passed alongside `greeting_system`.
+    /// Greeting pipeline — the data-fetch stage's system prompt.
+    pub greeting_fetcher_system: String,
+    /// Greeting pipeline — the C-suite greeting writer (terminal stage) system prompt.
+    pub greeting_analyst_system: String,
+    /// Greeting pipeline — the boot-time request prompt (the `Initial` payload's prompt).
     pub greeting_user: String,
 }
 
@@ -109,12 +127,18 @@ impl PromptBank {
     /// # Errors
     ///
     /// Returns `Err` if any of `agent_system`, `report_system`,
-    /// `greeting_system`, or `greeting_user` is missing from the loaded config.
+    /// `greeting_fetcher_system`, `greeting_analyst_system`, or `greeting_user`
+    /// is missing from the loaded config.
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
             report_system: cfg.get_prompt_by_id("report_system")?.to_string(),
-            greeting_system: cfg.get_prompt_by_id("greeting_system")?.to_string(),
+            greeting_fetcher_system: cfg
+                .get_prompt_by_id("greeting_fetcher_system")?
+                .to_string(),
+            greeting_analyst_system: cfg
+                .get_prompt_by_id("greeting_analyst_system")?
+                .to_string(),
             greeting_user: cfg.get_prompt_by_id("greeting_user")?.to_string(),
         })
     }

@@ -59,11 +59,13 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use async_openai::types::chat::ChatCompletionTool;
 
-use crate::agent::config::{OutputShape, PipelineConfig, ResolvedLlm, SubAgentId};
+use crate::agent::config::{
+    OutputShape, PipelineConfig, PipelineId, ResolvedLlm, SubAgentConfig, SubAgentId,
+};
 use crate::agent::engine::{resolve_pipeline, ConfiguredAgent, Orchestrator, SubAgent};
 use crate::agent::events::EventSink;
 use crate::agent::llm::{OpenAiLlm, StreamingOpenAiLlm};
-use crate::agent::payload::{ArtifactKey, LlmCapability, Tool};
+use crate::agent::payload::{ArtifactKey, LlmCapability, PayloadKind, Tool};
 use crate::agent::pipeline::{
     agent_pipeline_id, analyst_config, charter_config, fetcher_config, Finalizer,
 };
@@ -125,12 +127,7 @@ pub fn build_insight_pipeline(
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
     let mut fetcher_cfg = fetcher_config();
-    if let Some(instr) = mcp_instructions.filter(|s| !s.trim().is_empty()) {
-        fetcher_cfg.instruction = format!(
-            "{}\n\n# MCP server conventions (apply to all tools)\n{instr}",
-            fetcher_cfg.instruction
-        );
-    }
+    fetcher_cfg.instruction = compose_with_mcp(&fetcher_cfg.instruction, mcp_instructions);
 
     // ── the four stages; upstream shapes are Intermediate, the finalizer is the terminal Final ──
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
@@ -177,6 +174,107 @@ pub fn build_insight_pipeline(
     let mut orchestrator = Orchestrator::new();
     orchestrator.insert(pipeline.id, stages);
     Ok(orchestrator)
+}
+
+/// The pipeline id the greeting pipeline is registered under.
+pub fn greeting_pipeline_id() -> PipelineId {
+    PipelineId("greeting".into())
+}
+
+/// Builds the greeting pipeline as a runnable [`Orchestrator`], registered under
+/// [`greeting_pipeline_id`].
+///
+/// A two-stage `fetcher → analyst` chain, always **buffered** (greetings are produced by a
+/// boot-time background task, not streamed): the fetcher pulls a broad datacenter snapshot with its
+/// granted tools, and the **terminal** analyst turns that material into one short C-suite greeting
+/// — its model message *is* the `Final` answer. There is no charter/finalizer: a greeting has no
+/// charts.
+///
+/// # Arguments
+///
+/// - `mcp` / `discovered` / `mcp_instructions`: as for [`build_insight_pipeline`].
+/// - `fetcher_grant`: the datacenter tools the greeting fetcher may call (shares the `/insight`
+///   fetcher's grant — the same broad snapshot).
+/// - `fetcher_instruction` / `analyst_instruction`: the two greeting stage prompts.
+/// - `resolved`: the fully-resolved LLM both stages run on.
+///
+/// # Errors
+///
+/// As for [`build_insight_pipeline`]: a granted MCP tool absent from the server, an LLM client that
+/// fails to build, or an unresolvable stage reference.
+pub fn build_greeting_pipeline(
+    mcp: McpHandle,
+    discovered: &[ChatCompletionTool],
+    mcp_instructions: Option<&str>,
+    fetcher_grant: &[String],
+    fetcher_instruction: &str,
+    analyst_instruction: &str,
+    resolved: &ResolvedLlm,
+) -> Result<Orchestrator> {
+    let fetcher_tools = build_stage_tools("fetcher", fetcher_grant, &mcp, discovered)?;
+    let llm: Arc<dyn LlmCapability> =
+        Arc::new(OpenAiLlm::from_resolved(resolved).context("build greeting LLM")?);
+
+    let fetcher_cfg = SubAgentConfig {
+        id: SubAgentId("fetcher".into()),
+        instruction: compose_with_mcp(fetcher_instruction, mcp_instructions),
+        llm: None,
+        tools: vec![],
+        accepts: vec![PayloadKind::Initial],
+        output: None,
+        capture_message: false, // tool-only stage — its note is throwaway
+    };
+    let analyst_cfg = SubAgentConfig {
+        id: SubAgentId("analyst".into()),
+        instruction: analyst_instruction.to_string(),
+        llm: None,
+        tools: vec![],
+        accepts: vec![PayloadKind::Intermediate],
+        output: None,
+        capture_message: false, // terminal — its message *is* the greeting (the Final answer)
+    };
+
+    let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &fetcher_cfg,
+        llm.clone(),
+        fetcher_tools,
+        OutputShape::Intermediate,
+    ));
+    let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &analyst_cfg,
+        llm,
+        vec![], // the analyst writes from provided material; no tools
+        OutputShape::Final,
+    ));
+
+    let agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = [
+        (SubAgentId("fetcher".into()), fetcher),
+        (SubAgentId("analyst".into()), analyst),
+    ]
+    .into_iter()
+    .collect();
+
+    let pipeline = PipelineConfig {
+        id: greeting_pipeline_id(),
+        stages: vec![SubAgentId("fetcher".into()), SubAgentId("analyst".into())],
+    };
+    let stages = resolve_pipeline(&pipeline, &agents)
+        .map_err(|e| anyhow!("resolve greeting pipeline: {e}"))?;
+
+    let mut orchestrator = Orchestrator::new();
+    orchestrator.insert(pipeline.id, stages);
+    Ok(orchestrator)
+}
+
+/// Appends the MCP server's handshake conventions to a tool-bearing stage's instruction (parity
+/// with the legacy prompt assembly). Returns the instruction unchanged when there are none.
+fn compose_with_mcp(instruction: &str, mcp_instructions: Option<&str>) -> String {
+    match mcp_instructions.filter(|s| !s.trim().is_empty()) {
+        Some(instr) => {
+            format!("{instruction}\n\n# MCP server conventions (apply to all tools)\n{instr}")
+        }
+        None => instruction.to_string(),
+    }
 }
 
 /// Validates the `/insight` tool grants against the discovered set — the **fail-fast at boot**

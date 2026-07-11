@@ -14,33 +14,54 @@
 
 //! Greeting generating task.
 //!
-//! Spawns background tasks during server startup. Each runs the greeting
-//! prompt through the MCP tool-calling loop and appends the resulting short
-//! welcome paragraph to [`AppState::greetings`].
+//! Spawns background tasks during server startup. Each runs the two-stage greeting pipeline
+//! (fetcher → analyst) and appends the resulting short C-suite welcome paragraph to
+//! [`AppState::greetings`].
 //!
 //! `GET /greeting` then serves a random pick.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tracing::{error, info, warn};
 
 use super::AppState;
-use crate::llm_connector;
+use crate::agent::clock::{Clock, SystemClock};
+use crate::agent::payload::{AgentPayload, InitialPrompt};
+use crate::agent::wiring::{build_greeting_pipeline, greeting_pipeline_id};
 
-/// Build one greeting by running the greeting prompt through the MCP loop.
+/// Build one greeting by running the two-stage greeting pipeline (fetcher → analyst).
 ///
-/// Uses the `greeting_system` prompt and the `greeting_user` stub with no history.
-///
-/// The model decides whether to call any data tools to make the welcome data-aware.
+/// The fetcher pulls a broad datacenter snapshot with its granted tools (the `/insight` fetcher's
+/// grant); the **terminal** analyst turns that material into one short executive greeting — its
+/// model message is the `Final` answer. Buffered: greetings are collected at boot, not streamed.
 pub async fn build_one_greeting(state: &AppState) -> Result<String> {
-    let cfg = state.generation_config(
-        &state.prompts.greeting_system,
-        state.prompts.greeting_user.clone(),
-        Vec::new(),
-    );
+    let orchestrator = build_greeting_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.insight_grants.fetcher,
+        &state.prompts.greeting_fetcher_system,
+        &state.prompts.greeting_analyst_system,
+        &state.llm.resolved(),
+    )
+    .context("build greeting pipeline")?;
 
-    llm_connector::generate(cfg, state.tools.clone(), state.mcp.clone())
+    let initial = AgentPayload::Initial(InitialPrompt {
+        prompt: state.prompts.greeting_user.clone(),
+        history: Vec::new(),
+        now: SystemClock::default().now(),
+    });
+
+    match orchestrator
+        .run(&greeting_pipeline_id(), initial)
         .await
-        .context("greeting LLM call failed")
+        .context("greeting pipeline run failed")?
+    {
+        AgentPayload::Final(result) => Ok(result.assistant),
+        other => bail!(
+            "greeting pipeline did not produce a final result (got {:?})",
+            other.kind()
+        ),
+    }
 }
 
 /// Spawn background tasks to generate greetings.

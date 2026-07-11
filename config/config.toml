@@ -24,10 +24,11 @@ version = 1
 # the call site that depends on it.
 #
 # Currently implemented, good for reference:
-#   * agent_system    — analytics agent system prompt for /agent and /agent/stream.
-#   * report_system   — HTML report generator system prompt for /report and /report/stream.
-#   * greeting_system — greeting system prompt for /greeting.
-#   * greeting_user   — greeting user prompt for /greeting.
+#   * agent_system              — legacy monolith analytics prompt (eval baseline).
+#   * report_system             — HTML report generator prompt for /report + /report/stream.
+#   * greeting_fetcher_system   — greeting pipeline: the data-fetch stage.
+#   * greeting_analyst_system   — greeting pipeline: the C-suite greeting writer (terminal).
+#   * greeting_user             — greeting pipeline: the boot-time request prompt.
 
 [prompts.agent_system]
 file = "prompt_guide/agent_system.md"
@@ -35,8 +36,11 @@ file = "prompt_guide/agent_system.md"
 [prompts.report_system]
 file = "prompt_guide/report_system.md"
 
-[prompts.greeting_system]
-file = "prompt_guide/greeting_system.md"
+[prompts.greeting_fetcher_system]
+file = "prompt_guide/greeting_fetcher_system.md"
+
+[prompts.greeting_analyst_system]
+file = "prompt_guide/greeting_analyst_system.md"
 
 [prompts.greeting_user]
 file = "prompt_guide/greeting_user.md"
