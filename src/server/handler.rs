@@ -310,7 +310,7 @@ pub async fn agent_stream(
 ///
 /// Mirrors [`agent`] but drives the `report_system` prompt, which produces a
 /// self-contained HTML report wrapped in a `falcon-report` fenced block. The
-/// output ceiling is raised to [`REPORT_MAX_TOKENS`] to fit a full document.
+/// output ceiling is raised to `REPORT_MAX_TOKENS` to fit a full document.
 pub async fn report(
     State(state): State<AppState>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,

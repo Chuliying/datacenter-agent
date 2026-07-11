@@ -89,7 +89,7 @@ pub struct IntentResolvedData {
 /// Success response for `GET /greeting`.
 ///
 /// This is one random pre-generated greeting paragraph from
-/// [`crate::server::state::AppState::greetings`].
+/// [`crate::appstate::AppState::greetings`].
 #[derive(Debug, Clone, Serialize)]
 pub struct GreetingResponse {
     pub greeting: String,
