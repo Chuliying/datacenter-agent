@@ -38,10 +38,10 @@ use crate::appstate::AppRuntime;
 use crate::llm_connector;
 use crate::model::GenerationConfig;
 use crate::runtime::audit::{AuditCtx, AuditWriter};
+use crate::runtime::schema::AgentTurnInput;
 use crate::runtime::turn::{
     run_agent_turn, AgentTurnDeps, AgentTurnOutcome, LlmAgentPort, TurnEvent,
 };
-use crate::runtime::schema::AgentTurnInput;
 
 /// Upper bound on the user prompt, in UTF-8 characters.
 pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
