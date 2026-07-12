@@ -2,7 +2,7 @@
 
 > **文件類型**：documentation source of truth。PRD 定義完成後的 target state 並逐項標建置狀態；Spec、QA、endpoint 與 module 頁描述目前 worktree。  
 > **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
-> **對應版本**：PRD v1.3.0 · Spec v1.3.0 · QA v1.3.0（2026-06-30）
+> **對應版本**：PRD v1.4.0 · Spec v1.4.0 · QA v1.4.0（2026-07-11）
 
 ## 1. 文件權威與邊界
 

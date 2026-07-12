@@ -1,10 +1,10 @@
 # datacenter-agent Runtime 平台 PRD
 
 **Story ID**：S-RUNTIME-01  
-**版本**：v1.3.0  
+**版本**：v1.4.0  
 **狀態**：Target-state product source of truth  
-**對應現況 Spec**：[spec v1.3.0](./spec/spec.md)
-**對應現況 QA**：[qa v1.3.0](./tests/qa-plan.md)
+**對應現況 Spec**：[spec v1.4.0](./spec/spec.md)
+**對應現況 QA**：[qa v1.4.0](./tests/qa-plan.md)
 **Source**：產品目標來自本頁；建置狀態以 [`src/`](../../src/lib.rs)、[`config/`](../../config/config.toml) 與 [QA evidence](./tests/qa-plan.md) 驗證
 
 > 本 PRD 描述**全部完成後的產品樣貌**。每條需求都標示目前建置狀態，未完成不代表已上線。現況技術行為以 [Spec](./spec/spec.md) 為準；部分完成／待建置 項目的執行順序以 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 為準。
@@ -17,6 +17,7 @@
 | v1.1.0 | 2026-06-29 | 改為 target-state PRD；逐項標建置狀態並連結現況證據/計劃 | v1.1.0 |
 | v1.2.0 | 2026-06-29 | 加入 Capability/Evidence architecture、Evidence Pack contract 與 Final LLM isolation | v1.2.0 |
 | v1.3.0 | 2026-06-29 | output format 改由 capability config 決定（避免 markdown 隱性硬編）；明列 Platform Control Plane／infra 為 non-goal | v1.2.0 |
+| v1.4.0 | 2026-07-11 | 新增 FR-014 HTML 報表產生器與圖表輸出（`/report`、`/report/stream`）並註記其現況繞過 runtime；新增 member intent 至 analytics 能力範圍；登錄 FR-015 本地去識別化／逆向還原（Privacy Proxy，待建置）與 NFR-010 PII egress 控制 | v1.4.0 |
 
 ## 1. 狀態定義
 
@@ -97,7 +98,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 
 | 原則 | 完成樣貌 | 現況 |
 |---|---|---|
-| 單一推理權威 | input/policy/memory/audit/orchestration 都在 Rust runtime | 部分完成 legacy/runtime 雙路徑仍有契約差異 |
+| 單一推理權威 | input/policy/memory/audit/orchestration 都在 Rust runtime | 部分完成 legacy/runtime 雙路徑仍有契約差異；`/report` 端點目前亦繞過 runtime（FR-014） |
 | Config 負責內容與組合 | stage/guardrail/extractor/evaluator 依 config dispatch | 部分完成 ID 有驗證，但多數沒有 dispatch |
 | 機制可插拔 | registry builder 回傳真正會被 AppState/request path 使用的 component | 部分完成 部分 backend 已接線 |
 | Secure by default | 最小 CORS、標準 bearer、secret-safe log、tenant-safe memory | 部分完成／待建置 |
@@ -264,6 +265,29 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 
 現況：OpenRouter Final LLM 直接收到 MCP tool schemas，並在多輪 tool-calling loop 中要求 tool execution；repo 沒有 Evidence Pack、Evidence Hub、Prompt Builder、Capability Gateway 或 Output Validator contract；輸出格式隱含寫死為 markdown，無 capability 級 `output_format` 選擇。
 
+### FR-014：HTML 報表產生器與圖表輸出 — 部分完成
+
+完成樣貌：
+
+- `/report` 回 JSON、`/report/stream` 回 SSE，與 `/agent` 對稱；由 `report_system` prompt 驅動，產生單一 `falcon-report` fenced block（完整 self-contained HTML 文件）。
+- 報表 HTML 內建設計系統 `<style>`，KPI/表格/meta 由 tool 資料寫入；圖表（bar/line）資料 inline 於 `<script>`，唯一外部資源為 Chart.js CDN。
+- 「不得杜撰數字」為硬規則：所有數值嚴格來自 tool 結果或既有對話；資料不足即省略或明示，tool 失敗即回報無法取得。
+- 部分期間（最新的未完成週/月）標記 `data-partial="true"` 並以 `(部分)` 標示、排除於趨勢線之外。
+- output-token ceiling 由 capability config 決定（報表遠大於 chat 預設），且與 `/agent` 共用同一 prompt/body validation 與 error contract。
+
+現況缺口：`/report` 兩端點**繞過 runtime orchestrator**（直接呼叫 `llm_connector`，無 intent/guardrails/memory/runtime-audit），Final LLM 一樣直接持有 MCP tools（見 FR-013）；prompt cap 沿用 legacy 2000 字（非 runtime 4000）；`REPORT_MAX_TOKENS` 為 handler 常數而非 capability config；無 Router-level contract test。此為 sub-agent 化前的**過渡能力**。
+
+### FR-015：本地去識別化 / 逆向還原（Privacy Proxy）— 待建置／待決策
+
+完成樣貌：
+
+- 敏感文本（合約等）出境雲端 LLM 前，於本機完成去識別化：偵測台灣／多語 PII（人名、公司名、身分證、統編、電話、email、地址、銀行帳號）並以一致代稱 `⟦PERSON_1⟧` 遮罩，只有 `[TAG]` 出境。
+- 回應在本機逆向還原（streaming-aware，容錯 tag 變體），對照表加密持久化並可跨 session／重啟還原、TTL 清理。
+- 偵測為 hybrid（Rust 規則 + checksum，選配本地 Ollama NER），永不呼叫雲端做偵測；殘留掃描與 fail-closed 語意保證原文不外洩。
+- 以 `[runtime.privacy]` config 開關；停用時完全 inert，零行為改變。涵蓋 `/agent`、`/report` 與 tool I/O 等所有出境路徑。
+
+現況：尚未實作；能力邊界、對照表信任邊界與 PII 範圍屬 **待決策**。完整需求與技術設計見 [Privacy Proxy 功能 PRD](./features/privacy-proxy/prd.md) 與 [spec](./features/privacy-proxy/spec.md)。
+
 ## 6. 非功能需求
 
 | ID | 目標 | 狀態 |
@@ -277,6 +301,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 | NFR-007 Evidence | 每條已完成項有 contract test；CI negative gate 會真的 fail | 部分完成 |
 | NFR-008 Capability isolation | Final LLM type/port 不可取得 MCP/DB/RAG handles 或 credentials | 待建置 |
 | NFR-009 Evidence integrity | Evidence Pack 有 provenance、freshness、classification、digest、budget 與 citation mapping | 待建置 |
+| NFR-010 PII egress control | 啟用 Privacy Proxy 時，原文 PII 不得離開本機；只有代稱出境，殘留掃描 fail-closed，還原/遮罩留稽核（不記原文） | 待建置 |
 
 ## 7. Target error contract
 
@@ -312,6 +337,8 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 | AC-011 | runtime disabled 時壞 config 不阻擋 legacy startup | 已完成 | false/0 skip runtime build + invalid refs regression test | I08 |
 | AC-012 | 每個已完成 claim 都有對應 contract test 與 truthful docs | 部分完成 | test fn 存在但多個外部 contract 未覆蓋 | I08 |
 | AC-013 | Final LLM 無 MCP/DB/RAG access；只能消費 versioned Skill Package + validated Evidence Pack，且輸出 citation 可追溯 | 待建置 | current LLM receives tools directly；相關 types/modules 不存在 | I09 |
+| AC-014 | `/report`、`/report/stream` 產生合法 `falcon-report` HTML（含選配 Chart.js 圖表），數字皆源自 tool 資料，且與 `/agent` 共用 validation/error contract | 部分完成 | member intent pipeline test 已有；報表端點無 Router-level／輸出契約 test，且繞過 runtime | 見 §FR-014 |
+| AC-015 | Privacy Proxy 啟用時原文 PII 不出境、可逆還原、可 config 開關且停用時 inert | 待建置 | 尚未實作；細節見 privacy-proxy 功能文件 | features/privacy-proxy |
 
 ## 9. 成功指標
 
@@ -343,5 +370,6 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - [Documentation source of truth](./index.md)
 - [Current implementation spec](./spec/spec.md)
 - [Current QA evidence](./tests/qa-plan.md)
+- [Privacy Proxy 功能 PRD](./features/privacy-proxy/prd.md)｜[Privacy Proxy 功能 spec](./features/privacy-proxy/spec.md)
 - [Code change plan](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)
 - [Historical migration documents](../agent-runtime-rust-port/prd.md)

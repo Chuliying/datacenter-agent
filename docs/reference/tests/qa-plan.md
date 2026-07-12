@@ -1,8 +1,8 @@
 # datacenter-agent 現況測試與 Coverage
 
-**QA 版本**：v1.3.0
-**對應 Target PRD**：[`../prd.md`](../prd.md) v1.3.0
-**對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.3.0
+**QA 版本**：v1.4.0
+**對應 Target PRD**：[`../prd.md`](../prd.md) v1.4.0
+**對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.4.0
 **狀態**：Current test inventory；不是未實作測試的完成聲明  
 **Source**：[`src/**` module tests](../../../src/lib.rs)、[`tests/runtime_contract.rs`](../../../tests/runtime_contract.rs)、[`tests/llm_connector.rs`](../../../tests/llm_connector.rs)、[`.github/workflows/runtime.yml`](../../../.github/workflows/runtime.yml)
 
@@ -22,6 +22,15 @@
 | `docker build -t datacenter-agent:blocker-fix .` + config presence check | exit 0；final image 含 top-level、prompt、runtime config |
 
 兩個 ignored 項目：外部 LLM/MCP live test，以及一個 doc test。一般 `cargo test` 不執行 live test。
+
+### v1.4.0 快照狀態（2026-07-11）
+
+本次 v1.4.0 文件更新的環境**沒有 Rust toolchain**（`cargo`/`rustc` 不可用），因此**未重跑**測試套件；上表 92 passed 仍是 2026-06-30 最後一次 CI-verified run。v1.4.0 的變更以**原始碼檢視**確認，尚待在 CI 重跑取得新的聚合數字：
+
+- 新增 2 個 member intent pipeline 測試（見 §4.1 TC-U17／TC-U18），存在於 `src/runtime/input/pipeline.rs`。
+- `/report`、`/report/stream` 端點與 `REPORT_MAX_TOKENS`、`falcon-report` 輸出契約**目前沒有任何自動化測試**（見 §6、§8）。
+
+在 CI 或具備 toolchain 的環境重跑 `cargo test` 後，應以新結果取代 2026-06-30 快照並更新計數。
 
 ## 2. 測試層級定義
 
@@ -51,6 +60,8 @@
 | AC-011 | runtime disabled隔離invalid runtime config | `appstate::explicit_rollback_skips_invalid_runtime_config` | **covered** |
 | AC-012 | 每個完成claim有contract test與truthful docs | test inventory/doc link review | **partial**：沒有CI-enforcedclaim/status gate |
 | AC-013 | Final LLM 無 MCP/DB/RAG access，只消費 validated Evidence Pack | none | **missing**：current LLM直接持有tools + McpHandle；相關types/modules不存在 |
+| AC-014 | `/report` 產生合法 `falcon-report` HTML、數字源自 tool、共用 validation/error contract | member intent pipeline tests（TC-U17/U18） | **partial**：intent 已測；報表端點、`REPORT_MAX_TOKENS`、HTML/圖表輸出、繞過 runtime 皆無 test |
+| AC-015 | Privacy Proxy 原文不出境、可逆還原、config 可開關且停用時 inert | none | **missing**：尚未實作；驗收見 privacy-proxy 功能 qa |
 
 ## 4. Rust test source inventory
 
@@ -72,6 +83,8 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | TC-U14 | `pipeline::extracts_time_metric_asset_and_rank_slots` | current hard-coded pipeline functions |
 | TC-U15 | `pipeline::unknown_option_prefix_warns_and_falls_back_to_text` | fallback warning |
 | TC-U16 | `pipeline::unknown_asset_warns_without_hardcoded_allowance` | config asset behavior |
+| TC-U17 | `pipeline::member_growth_prompt_classifies_as_member_and_is_answerable` | member intent 分類且清過 answer_normal gate |
+| TC-U18 | `pipeline::revenue_growth_prompt_stays_on_revenue_not_member` | `營收成長` 歸 revenue，不誤入 member |
 
 ### 4.2 Guardrails
 
@@ -163,6 +176,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | runtime 4000 | accepted | input_guard test | no handler test |
 | runtime 4001 | runtime error | input_guard test | no REST/SSE status test |
 | runtime 2001 | accepted | explicit parity-diff test | covered |
+| `/report` prompt 2000 | legacy helper cap（非 runtime 4000） | none | gap（端點無 test） |
 | body >64 KiB | Router rejects before handler; exact final mapping not pinned | none | gap |
 | history omitted | `[]` | crate integration test | covered |
 | memory max turns | oldest removed | store test | covered |
@@ -205,6 +219,8 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 12. Final LLM isolation test：`FinalLlmPort` API/compile dependency不接受tools、MCP/DB/RAG handles或credentials。
 13. Output Validator tests：schema failure、unknown/missing citation、repair budget、insufficient-evidence refusal。
 14. End-to-end controlled flow：fake Evidence Hub/Gateway產pack，Final LLM只收compiled prompt，published claims可回指evidence id。
+15. `/report` 端點契約：Router-level auth/2000 cap/JSON rejection、`REPORT_MAX_TOKENS` 生效、`falcon-report` fenced-block 與 self-contained HTML 輸出、繞過 runtime 的行為斷言（不經 injection/answer policy/memory）。
+16. Privacy Proxy（FR-015）：PII 偵測/checksum、tag 穩定與 streaming 還原容錯、殘留掃描 fail-closed、對照表加解密與 TTL、`[runtime.privacy]` 停用時 inert；細節見 privacy-proxy 功能 qa。
 
 實作與先後依賴見 [程式修改計劃](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)。
 
@@ -226,10 +242,13 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 - 所有 route status/limits/timeouts 已有 contract test。
 - live LLM/MCP 與 deployment probes 已驗收。
 - Evidence Pack、Capability Gateway、Prompt Builder、Final LLM isolation或Output Validator已實作。
+- `/report`、`/report/stream` 的端點行為（`falcon-report` HTML、圖表、`REPORT_MAX_TOKENS`、繞過 runtime）已有任何自動化 test。
+- Privacy Proxy（FR-015）任何部分已實作或驗收。
 
 ## 10. Related documents
 
 - [Reference root](../index.md)
 - [Reverse PRD](../prd.md)
 - [Technical spec](../spec/spec.md)
+- [Privacy Proxy 功能文件](../features/privacy-proxy/prd.md)（FR-015，規劃中）
 - [Code change plan](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)
