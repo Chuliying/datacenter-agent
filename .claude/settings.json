@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .agent/skills/_shared/bootstrap/check.sh --platform claude-code --project-root \"$CLAUDE_PROJECT_DIR\" # skill-commons-managed",
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}

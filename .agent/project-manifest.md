@@ -1,3 +1,12 @@
+## skill-commons bootstrap
+
+- submodule_path: .agent/skills/_shared
+- platforms: claude-code, codex
+- delivery_mode: team-sprint
+- capability_packs:
+
+> `.agent/skills/_shared`（skill-commons v0.7.1）與生成的 `.claude/skills/`、`.codex/skills/` 依 ADR-001 由 `.gitignore` 排除，為本地 pinned clone；版本以此區塊與 onboarding 紀錄為準。
+
 ## Project Identity
 - `name`: `datacenter-agent`
 - `type`: `Rust HTTP API Service / Analytics Agent`
@@ -34,6 +43,12 @@
 - `framework`: `axum 0.8 / tokio / rmcp 0.17`
 - `build_cmd`: `cargo build --release`
 - `format_cmd`: `cargo fmt`
+
+## Capabilities
+- `has_ui`: `false`（後端服務，無 UI）
+- `has_api`: `true`（axum HTTP/SSE JSON API）
+- `typed_contracts`: `true`（Rust DTO：`src/server/dto.rs`、`src/model.rs`）
+- `has_e2e`: `false`（目前無 e2e harness）
 
 ## Git Workflow
 - `base_branch`: `main`
