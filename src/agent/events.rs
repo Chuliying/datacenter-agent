@@ -107,6 +107,21 @@ pub enum AgentEvent {
         /// The advertised tool name.
         name: String,
     },
+    /// Token usage for one completed LLM turn, reported by the provider (`include_usage` on the
+    /// streaming request). Surfaces the **hidden** budget behind a silent burn: `reasoning` is the
+    /// reasoning-model tokens counted inside `completion` but never streamed as content — often the
+    /// real cause of a `truncated at token limit` with an otherwise empty stream.
+    Usage {
+        /// Prompt (input) tokens.
+        prompt: u32,
+        /// Completion (output) tokens — this **includes** `reasoning`.
+        completion: u32,
+        /// Reasoning tokens (a subset of `completion`), when the model reports them; `None` for a
+        /// non-reasoning model or a provider that omits the breakdown.
+        reasoning: Option<u32>,
+        /// Total tokens (`prompt` + `completion`).
+        total: u32,
+    },
 
     // ── tool execution — emitted by the StreamingTool wrapper ──
     /// A granted tool began executing.

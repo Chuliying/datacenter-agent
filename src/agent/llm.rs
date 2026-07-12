@@ -39,15 +39,18 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, FinishReason, FunctionCall, FunctionObject, ToolChoiceOptions,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionStreamOptions,
+    ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
+    ChatCompletionTools, CompletionUsage, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, FinishReason, FunctionCall, FunctionObject, ReasoningEffort,
+    ToolChoiceOptions,
 };
 use async_openai::Client;
 use async_trait::async_trait;
 use futures::StreamExt;
+use tracing::info;
 
-use crate::agent::config::ResolvedLlm;
+use crate::agent::config::{ReasoningEffort as ConfigReasoningEffort, ResolvedLlm};
 use crate::agent::events::{AgentEvent, EventSink};
 use crate::agent::payload::{
     AgentError, LlmCapability, LlmMessage, LlmResponse, ToolCall, ToolSchema,
@@ -65,6 +68,17 @@ pub struct OpenAiLlm {
     temperature: f32,
     top_p: f32,
     max_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Maps the config-side reasoning ladder onto the vendor's `reasoning_effort` enum.
+fn to_reasoning_effort(effort: ConfigReasoningEffort) -> ReasoningEffort {
+    match effort {
+        ConfigReasoningEffort::Minimal => ReasoningEffort::Minimal,
+        ConfigReasoningEffort::Low => ReasoningEffort::Low,
+        ConfigReasoningEffort::Medium => ReasoningEffort::Medium,
+        ConfigReasoningEffort::High => ReasoningEffort::High,
+    }
 }
 
 impl OpenAiLlm {
@@ -91,6 +105,7 @@ impl OpenAiLlm {
             temperature: resolved.temperature,
             top_p: resolved.top_p,
             max_tokens: resolved.max_tokens,
+            reasoning_effort: resolved.reasoning_effort.map(to_reasoning_effort),
         })
     }
 }
@@ -244,6 +259,7 @@ fn build_request(
     temperature: f32,
     top_p: f32,
     max_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
     messages: &[LlmMessage],
     tools: &[ToolSchema],
 ) -> Result<CreateChatCompletionRequest, AgentError> {
@@ -259,6 +275,12 @@ fn build_request(
         .temperature(temperature)
         .top_p(top_p)
         .max_tokens(max_tokens);
+
+    // Lower (or raise) the reasoning budget when the stage asks for it; otherwise leave the
+    // provider default by sending no `reasoning_effort` at all.
+    if let Some(effort) = reasoning_effort {
+        builder.reasoning_effort(effort);
+    }
 
     if !tools.is_empty() {
         builder.tools(to_request_tools(tools)).tool_choice(
@@ -286,6 +308,40 @@ fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
     }
 }
 
+/// The reasoning-token count inside a usage report, when the provider breaks it out.
+///
+/// Reasoning tokens are billed and counted in `completion_tokens` but never streamed as content —
+/// so this is the "hidden" budget behind a silent truncation.
+fn reasoning_tokens(usage: &CompletionUsage) -> Option<u32> {
+    usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens)
+}
+
+/// Lifts a provider [`CompletionUsage`] into the network-free [`AgentEvent::Usage`] (pure, so the
+/// mapping — including the reasoning-token breakdown — is unit-testable without a transport).
+fn usage_event(usage: &CompletionUsage) -> AgentEvent {
+    AgentEvent::Usage {
+        prompt: usage.prompt_tokens,
+        completion: usage.completion_tokens,
+        reasoning: reasoning_tokens(usage),
+        total: usage.total_tokens,
+    }
+}
+
+/// Logs one turn's token usage at INFO — the per-turn accounting both adapters share, so token
+/// spend is visible in the server logs for both the buffered and streaming paths.
+fn log_usage(usage: &CompletionUsage) {
+    info!(
+        prompt = usage.prompt_tokens,
+        completion = usage.completion_tokens,
+        reasoning = reasoning_tokens(usage),
+        total = usage.total_tokens,
+        "llm.usage"
+    );
+}
+
 #[async_trait]
 impl LlmCapability for OpenAiLlm {
     async fn chat(
@@ -298,6 +354,7 @@ impl LlmCapability for OpenAiLlm {
             self.temperature,
             self.top_p,
             self.max_tokens,
+            self.reasoning_effort.clone(),
             messages,
             tools,
         )?;
@@ -308,6 +365,11 @@ impl LlmCapability for OpenAiLlm {
             .create(request)
             .await
             .map_err(|e| AgentError::Capability(format!("chat completion: {e}")))?;
+
+        // Token accounting for this turn (the buffered path has no sink, so this is log-only).
+        if let Some(usage) = &response.usage {
+            log_usage(usage);
+        }
 
         let message = response
             .choices
@@ -459,6 +521,7 @@ pub struct StreamingOpenAiLlm {
     temperature: f32,
     top_p: f32,
     max_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
     sink: Arc<dyn EventSink>,
 }
 
@@ -475,6 +538,7 @@ impl StreamingOpenAiLlm {
             temperature: resolved.temperature,
             top_p: resolved.top_p,
             max_tokens: resolved.max_tokens,
+            reasoning_effort: resolved.reasoning_effort.map(to_reasoning_effort),
             sink,
         })
     }
@@ -487,14 +551,22 @@ impl LlmCapability for StreamingOpenAiLlm {
         messages: &[LlmMessage],
         tools: &[ToolSchema],
     ) -> Result<LlmResponse, AgentError> {
-        let request = build_request(
+        let mut request = build_request(
             &self.model,
             self.temperature,
             self.top_p,
             self.max_tokens,
+            self.reasoning_effort.clone(),
             messages,
             tools,
         )?;
+        // Ask the provider for a final usage chunk (sent before `[DONE]`, even when the turn stops
+        // at the token limit), so token spend — including the hidden reasoning tokens behind a
+        // silent burn — is always surfaced.
+        request.stream_options = Some(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        });
 
         let mut stream = self
             .client
@@ -506,18 +578,31 @@ impl LlmCapability for StreamingOpenAiLlm {
         let sink = &*self.sink;
         let mut acc = StreamAccumulator::default();
         let mut finish_reason: Option<FinishReason> = None;
+        let mut usage: Option<CompletionUsage> = None;
 
         while let Some(frame) = stream.next().await {
             let chunk =
                 frame.map_err(|e| AgentError::Capability(format!("chat stream frame: {e}")))?;
-            let Some(choice) = chunk.choices.into_iter().next() else {
-                continue;
-            };
-            acc.push(extract_frame(choice.delta), sink);
-            if let Some(reason) = choice.finish_reason {
-                finish_reason = Some(reason);
-                break;
+            // The usage chunk arrives last, with an empty `choices` array — capture it before the
+            // choice check (which would otherwise skip that chunk entirely).
+            if let Some(u) = chunk.usage {
+                usage = Some(u);
             }
+            if let Some(choice) = chunk.choices.into_iter().next() {
+                acc.push(extract_frame(choice.delta), sink);
+                if let Some(reason) = choice.finish_reason {
+                    // Record the stop reason but keep draining: the usage chunk follows this one,
+                    // and the stream ends right after it.
+                    finish_reason = Some(reason);
+                }
+            }
+        }
+
+        // Surface the turn's token usage *before* any truncation error, so a silently-burned budget
+        // (e.g. reasoning tokens) is visible on the wire and in the logs even on the failure path.
+        if let Some(u) = &usage {
+            sink.emit(usage_event(u));
+            log_usage(u);
         }
 
         // A truncated / filtered turn is a fatal capability error, not a silently-partial answer.
@@ -554,6 +639,7 @@ mod tests {
             top_p: 0.1,
             max_tokens: 256,
             api_key: Some("sk-test".into()),
+            reasoning_effort: None,
         }
     }
 
@@ -591,6 +677,24 @@ mod tests {
     }
 
     #[test]
+    fn build_request_serializes_reasoning_effort_only_when_set() {
+        let msgs = [LlmMessage::User("hi".into())];
+        // Set ⇒ the provider control reaches the wire, lowercased (`minimal`).
+        let req =
+            build_request("m", 0.2, 0.1, 256, Some(ReasoningEffort::Minimal), &msgs, &[]).unwrap();
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["reasoning_effort"], "minimal");
+
+        // Unset ⇒ send nothing, so the provider default stands.
+        let req_default = build_request("m", 0.2, 0.1, 256, None, &msgs, &[]).unwrap();
+        let v_default = serde_json::to_value(&req_default).unwrap();
+        assert!(
+            v_default.get("reasoning_effort").is_none() || v_default["reasoning_effort"].is_null(),
+            "reasoning_effort must be omitted when None, got {v_default:?}"
+        );
+    }
+
+    #[test]
     fn extracts_function_tool_calls_and_parses_arguments() {
         let calls = vec![ChatCompletionMessageToolCalls::Function(
             ChatCompletionMessageToolCall {
@@ -605,6 +709,47 @@ mod tests {
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].name, "bill_revenue");
         assert_eq!(extracted[0].arguments["year"], serde_json::json!(2026));
+    }
+
+    #[test]
+    fn usage_event_surfaces_reasoning_tokens_when_present() {
+        // A reasoning model reports the hidden reasoning-token subset of `completion_tokens`.
+        let usage: CompletionUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1200,
+            "completion_tokens": 8000,
+            "total_tokens": 9200,
+            "completion_tokens_details": { "reasoning_tokens": 7600 }
+        }))
+        .unwrap();
+        assert_eq!(
+            usage_event(&usage),
+            AgentEvent::Usage {
+                prompt: 1200,
+                completion: 8000,
+                reasoning: Some(7600),
+                total: 9200,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_event_reports_no_reasoning_for_a_plain_model() {
+        // No `completion_tokens_details` ⇒ `reasoning` is `None`, not zero-guessed.
+        let usage: CompletionUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150
+        }))
+        .unwrap();
+        assert_eq!(
+            usage_event(&usage),
+            AgentEvent::Usage {
+                prompt: 100,
+                completion: 50,
+                reasoning: None,
+                total: 150,
+            }
+        );
     }
 
     #[test]

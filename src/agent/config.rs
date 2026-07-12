@@ -265,6 +265,29 @@ impl fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// How hard the model should reason before answering, mapped onto the provider's `reasoning_effort`
+/// control.
+///
+/// Reasoning tokens are billed inside the completion budget but never streamed as content, so a
+/// heavy reasoner can silently exhaust `max_tokens` on chain-of-thought a task doesn't need. The
+/// mechanical pipeline stages (a data `fetcher`, a transcribing `composer`) run at
+/// [`Minimal`](Self::Minimal), while stages that genuinely reason (the `analyst`) keep the
+/// provider default.
+///
+/// The ladder mirrors the vendor's `reasoning_effort` levels. `Option::None` on
+/// [`ResolvedLlm::reasoning_effort`] means "send nothing — use the provider default".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReasoningEffort {
+    /// The smallest reasoning budget the provider offers — for mechanical, no-deliberation stages.
+    Minimal,
+    /// A low reasoning budget.
+    Low,
+    /// The provider's medium reasoning budget (typically its default).
+    Medium,
+    /// A high reasoning budget.
+    High,
+}
+
 /// The option-free product of resolution: a fully-resolved LLM ready to construct an
 /// [`LlmCapability`](crate::agent::payload::LlmCapability).
 ///
@@ -283,6 +306,21 @@ pub struct ResolvedLlm {
     pub max_tokens: u32,
     /// The bound secret value, or `None` for keyless providers (Ollama).
     pub api_key: Option<String>,
+    /// The reasoning budget to request, or `None` to leave the provider default. Lowered to
+    /// [`ReasoningEffort::Minimal`] for mechanical stages so they don't burn the output budget on
+    /// reasoning the task doesn't need (see [`with_reasoning_effort`](Self::with_reasoning_effort)).
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ResolvedLlm {
+    /// Returns a copy with `reasoning_effort` set — used to give a mechanical stage (fetch,
+    /// transcribe) a lower reasoning budget than a reasoning stage built from the same resolution.
+    pub fn with_reasoning_effort(&self, effort: ReasoningEffort) -> Self {
+        Self {
+            reasoning_effort: Some(effort),
+            ..self.clone()
+        }
+    }
 }
 
 /// Reads a secret value for `provider` from `env` (a k8s-style key→value map).
@@ -374,6 +412,7 @@ pub fn resolve_llm(
         top_p: over.params.top_p.unwrap_or(default.top_p),
         max_tokens: over.params.max_tokens.unwrap_or(default.max_tokens),
         api_key,
+        reasoning_effort: None, // provider default; lowered per mechanical stage in `wiring`
     })
 }
 
@@ -454,6 +493,7 @@ mod tests {
             top_p: 0.9,
             max_tokens: 1024,
             api_key: Some("default-key".into()),
+            reasoning_effort: None,
         }
     }
 

@@ -93,6 +93,7 @@ impl LlmDefaults {
             top_p: self.top_p,
             max_tokens: self.max_tokens,
             api_key: Some(self.api_key.clone()),
+            reasoning_effort: None, // provider default; mechanical stages are lowered in `wiring`
         }
     }
 }

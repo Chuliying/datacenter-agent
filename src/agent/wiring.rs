@@ -60,7 +60,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_openai::types::chat::ChatCompletionTool;
 
 use crate::agent::config::{
-    OutputShape, PipelineConfig, PipelineId, ResolvedLlm, SubAgentConfig, SubAgentId,
+    OutputShape, PipelineConfig, PipelineId, ReasoningEffort, ResolvedLlm, SubAgentConfig,
+    SubAgentId,
 };
 use crate::agent::engine::{resolve_pipeline, ConfiguredAgent, Orchestrator, SubAgent};
 use crate::agent::events::EventSink;
@@ -78,6 +79,29 @@ const ALL_MCP_TOOLS: &str = "*";
 
 /// The report `composer`'s fixed grant: the built-in `emit_report` sink (code-backed, not MCP).
 const EMIT_REPORT: &str = "emit_report";
+
+/// The reasoning budget for **mechanical** stages — a data `fetcher` (fetch args, no analysis) and
+/// the report `composer` (transcribe fetched numbers into a fixed shape). These tasks need no
+/// chain-of-thought, so the smallest budget stops them silently burning the output token limit on
+/// reasoning (a `truncated at token limit` with an otherwise empty stream). Reasoning stages (the
+/// `analyst`, the `charter`) keep the provider default.
+const MECHANICAL_REASONING: ReasoningEffort = ReasoningEffort::Minimal;
+
+/// Builds one stage's LLM capability: the streaming adapter when `sink` is `Some` (tokens stream
+/// onto it), else the buffered adapter. Factored so a pipeline can build a second, lower-reasoning
+/// client for its mechanical stages from a tweaked [`ResolvedLlm`].
+fn build_stage_llm(
+    resolved: &ResolvedLlm,
+    sink: &Option<Arc<dyn EventSink>>,
+) -> Result<Arc<dyn LlmCapability>> {
+    Ok(match sink {
+        Some(sink) => Arc::new(
+            StreamingOpenAiLlm::from_resolved(resolved, sink.clone())
+                .context("build streaming stage LLM")?,
+        ),
+        None => Arc::new(OpenAiLlm::from_resolved(resolved).context("build buffered stage LLM")?),
+    })
+}
 
 /// Builds the `/insight` pipeline as a runnable [`Orchestrator`], registered under
 /// [`agent_pipeline_id`].
@@ -120,14 +144,12 @@ pub fn build_insight_pipeline(
     let fetcher_tools = build_stage_tools("fetcher", fetcher_grant, &mcp, discovered)?;
     let charter_tools = build_stage_tools("charter", charter_grant, &mcp, discovered)?;
 
-    // ── the LLM capability shared by every stage (streaming or buffered per `sink`) ──
-    let llm: Arc<dyn LlmCapability> = match &sink {
-        Some(sink) => Arc::new(
-            StreamingOpenAiLlm::from_resolved(resolved, sink.clone())
-                .context("build streaming insight LLM")?,
-        ),
-        None => Arc::new(OpenAiLlm::from_resolved(resolved).context("build buffered insight LLM")?),
-    };
+    // ── two LLM clients (streaming or buffered per `sink`): the default for the reasoning stages,
+    //    and a minimal-reasoning one for the mechanical `fetcher` (plan: cut the hidden reasoning
+    //    budget that silently truncated tool-heavy stages) ──
+    let llm = build_stage_llm(resolved, &sink).context("build insight LLM")?;
+    let llm_low = build_stage_llm(&resolved.with_reasoning_effort(MECHANICAL_REASONING), &sink)
+        .context("build minimal-reasoning insight LLM")?;
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
     let mut fetcher_cfg = fetcher_config();
@@ -136,7 +158,7 @@ pub fn build_insight_pipeline(
     // ── the four stages; upstream shapes are Intermediate, the finalizer is the terminal Final ──
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &fetcher_cfg,
-        llm.clone(),
+        llm_low, // mechanical fetch — minimal reasoning
         fetcher_tools,
         OutputShape::Intermediate,
     ));
@@ -148,7 +170,7 @@ pub fn build_insight_pipeline(
     ));
     let charter: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &charter_config(),
-        llm,
+        llm, // chart selection is a judgment — keep the default reasoning budget
         charter_tools,
         OutputShape::Intermediate,
     ));
@@ -223,14 +245,13 @@ pub fn build_report_pipeline(
     let composer_tools =
         build_stage_tools("composer", &[EMIT_REPORT.to_string()], &mcp, discovered)?;
 
-    // ── the LLM capability shared by every LLM stage (streaming or buffered per `sink`) ──
-    let llm: Arc<dyn LlmCapability> = match &sink {
-        Some(sink) => Arc::new(
-            StreamingOpenAiLlm::from_resolved(resolved, sink.clone())
-                .context("build streaming report LLM")?,
-        ),
-        None => Arc::new(OpenAiLlm::from_resolved(resolved).context("build buffered report LLM")?),
-    };
+    // ── two LLM clients (streaming or buffered per `sink`): the default for the reasoning `analyst`,
+    //    and a minimal-reasoning one for the mechanical `fetcher` + `composer`. The composer only
+    //    transcribes fetched numbers into a fixed shape, so full reasoning was ~86% wasted output
+    //    and the cause of the token-limit truncations. ──
+    let llm = build_stage_llm(resolved, &sink).context("build report LLM")?;
+    let llm_low = build_stage_llm(&resolved.with_reasoning_effort(MECHANICAL_REASONING), &sink)
+        .context("build minimal-reasoning report LLM")?;
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
     let mut fetcher_cfg = fetcher_config();
@@ -239,19 +260,19 @@ pub fn build_report_pipeline(
     // ── the four stages; upstream shapes are Intermediate, the renderer is the terminal Final ──
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &fetcher_cfg,
-        llm.clone(),
+        llm_low.clone(), // mechanical fetch — minimal reasoning
         fetcher_tools,
         OutputShape::Intermediate,
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &report_analyst_config(),
-        llm.clone(),
+        llm, // the analyst genuinely reasons — keep the default budget
         vec![], // the analyst only reasons over provided material
         OutputShape::Intermediate,
     ));
     let composer: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &report_composer_config(),
-        llm,
+        llm_low, // mechanical transcription — minimal reasoning
         composer_tools,
         OutputShape::Intermediate,
     ));
@@ -319,8 +340,14 @@ pub fn build_greeting_pipeline(
     resolved: &ResolvedLlm,
 ) -> Result<Orchestrator> {
     let fetcher_tools = build_stage_tools("fetcher", fetcher_grant, &mcp, discovered)?;
+    // Buffered (greetings are boot-time, not streamed): the default client for the reasoning
+    // analyst, a minimal-reasoning one for the mechanical fetcher.
     let llm: Arc<dyn LlmCapability> =
         Arc::new(OpenAiLlm::from_resolved(resolved).context("build greeting LLM")?);
+    let llm_low: Arc<dyn LlmCapability> = Arc::new(
+        OpenAiLlm::from_resolved(&resolved.with_reasoning_effort(MECHANICAL_REASONING))
+            .context("build minimal-reasoning greeting LLM")?,
+    );
 
     let fetcher_cfg = SubAgentConfig {
         id: SubAgentId("fetcher".into()),
@@ -343,13 +370,13 @@ pub fn build_greeting_pipeline(
 
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &fetcher_cfg,
-        llm.clone(),
+        llm_low, // mechanical fetch — minimal reasoning
         fetcher_tools,
         OutputShape::Intermediate,
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &analyst_cfg,
-        llm,
+        llm, // the greeting writer reasons over the snapshot — keep the default budget
         vec![], // the analyst writes from provided material; no tools
         OutputShape::Final,
     ));

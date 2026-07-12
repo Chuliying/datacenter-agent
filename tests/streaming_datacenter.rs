@@ -85,6 +85,12 @@ fn summarize(ev: &AgentEvent) -> String {
         AgentEvent::ToolRejected { name, reason } => format!("[tool rejected] {name}: {reason}"),
         AgentEvent::ToolCallProposed { id, name } => format!("[tool proposed] {name} (#{id})"),
         AgentEvent::ToolArgsDelta { fragment, .. } => format!("[tool args] {fragment}"),
+        AgentEvent::Usage {
+            prompt,
+            completion,
+            reasoning,
+            total,
+        } => format!("[usage] prompt={prompt} completion={completion} reasoning={reasoning:?} total={total}"),
         AgentEvent::ReasoningDelta { text } => format!("[reasoning] {text}"),
         AgentEvent::ContentDelta { text } => format!("[content] {text}"),
         AgentEvent::Finished { assistant } => {
@@ -149,6 +155,7 @@ async fn terminal_stage_streams_its_answer_from_the_datacenter() {
         top_p: 0.1,
         max_tokens: 2048,
         api_key: Some(api_key),
+        reasoning_effort: None,
     };
     let llm: Arc<dyn LlmCapability> = Arc::new(
         StreamingOpenAiLlm::from_resolved(&resolved, sink.clone()).expect("build StreamingOpenAiLlm"),

@@ -29,7 +29,7 @@ use rand::seq::SliceRandom;
 
 use super::dto::{
     AgentRequest, AgentResponse, GreetingResponse, ReadyBody, ReadyChecks, StageData, StagePhase,
-    StreamFrame,
+    StreamFrame, ToolArgsData, ToolCallData, UsageData,
 };
 use super::error::AppError;
 use super::AppState;
@@ -447,10 +447,16 @@ fn insight_error_to_app_error(err: AgentError) -> AppError {
 ///
 /// Each stage's start and completion surface as `stage` frames — the completion carrying a
 /// `success` / `failure` phase, for a green/red indicator — and every LLM stage's tokens stream
-/// live as `token`s (delimited by those stage frames). On the terminal `Finished` the
-/// **complete** finalizer answer (report + `falcon-chart` blocks) is re-sent after a `clear`, so a
-/// consumer always ends with the correct full answer regardless of the intermediate token
-/// previews. The finer-grained tool / reasoning events stay internal for now.
+/// live as `token`s (delimited by those stage frames). While the model composes a tool call, its
+/// argument fragments stream as `tool_args` frames and the assembled call surfaces as a `tool_call`
+/// frame, so a long tool-calling turn (e.g. the fetcher querying the datacenter, or the composer
+/// building the report payload) keeps signalling that the task is still running. On the terminal
+/// `Finished` the **complete** answer (report + charts, or the rendered HTML) is re-sent after a
+/// `clear`, so a consumer always ends with the correct full answer regardless of the intermediate
+/// previews. Each LLM turn's token usage surfaces as a `usage` frame — including the hidden
+/// reasoning tokens, so a truncation is explained rather than mysterious. The remaining tool /
+/// reasoning events (`ToolStarted`, `ToolProduced`, `ReasoningDelta`, `StageProduced`) stay internal
+/// for now.
 fn insight_frames(event: AgentEvent) -> Vec<StreamFrame> {
     match event {
         AgentEvent::StageStarted { agent, .. } => vec![StreamFrame::Stage {
@@ -466,14 +472,37 @@ fn insight_frames(event: AgentEvent) -> Vec<StreamFrame> {
             },
         }],
         AgentEvent::ContentDelta { text } => vec![StreamFrame::Token { data: text }],
+        // Live tool-call progress: argument fragments stream as they arrive; the assembled call
+        // (with its tool name) follows once the model finishes composing it.
+        AgentEvent::ToolArgsDelta { id, fragment } => vec![StreamFrame::ToolArgs {
+            data: ToolArgsData { id, fragment },
+        }],
+        AgentEvent::ToolCallProposed { id, name } => vec![StreamFrame::ToolCall {
+            data: ToolCallData { id, name },
+        }],
+        // Per-turn token accounting — surfaces the hidden reasoning-token budget behind a silent
+        // burn, so a truncation is explained rather than mysterious.
+        AgentEvent::Usage {
+            prompt,
+            completion,
+            reasoning,
+            total,
+        } => vec![StreamFrame::Usage {
+            data: UsageData {
+                prompt,
+                completion,
+                reasoning,
+                total,
+            },
+        }],
         AgentEvent::Finished { assistant } => vec![
             StreamFrame::Clear,
             StreamFrame::Token { data: assistant },
             StreamFrame::Done,
         ],
         AgentEvent::Error { message } => vec![StreamFrame::Error { data: message }],
-        // Internal framing (stage produced, tool + reasoning deltas, proposed calls) is not
-        // surfaced to the browser yet.
+        // Internal framing (stage produced, tool execution, reasoning deltas) is not surfaced to
+        // the browser yet.
         _ => vec![],
     }
 }
@@ -562,6 +591,49 @@ mod tests {
         assert_eq!(
             insight_frames(AgentEvent::ContentDelta { text: "hi".into() }),
             vec![StreamFrame::Token { data: "hi".into() }]
+        );
+        // A tool call's argument fragments stream live (progress during a long tool-calling turn)…
+        assert_eq!(
+            insight_frames(AgentEvent::ToolArgsDelta {
+                id: "call_1".into(),
+                fragment: "{\"seller".into(),
+            }),
+            vec![StreamFrame::ToolArgs {
+                data: ToolArgsData {
+                    id: "call_1".into(),
+                    fragment: "{\"seller".into(),
+                }
+            }]
+        );
+        // …and the assembled call surfaces its tool name so the client can label it.
+        assert_eq!(
+            insight_frames(AgentEvent::ToolCallProposed {
+                id: "call_1".into(),
+                name: "bill_revenue".into(),
+            }),
+            vec![StreamFrame::ToolCall {
+                data: ToolCallData {
+                    id: "call_1".into(),
+                    name: "bill_revenue".into(),
+                }
+            }]
+        );
+        // A turn's token usage surfaces the hidden reasoning budget.
+        assert_eq!(
+            insight_frames(AgentEvent::Usage {
+                prompt: 1200,
+                completion: 8000,
+                reasoning: Some(7600),
+                total: 9200,
+            }),
+            vec![StreamFrame::Usage {
+                data: UsageData {
+                    prompt: 1200,
+                    completion: 8000,
+                    reasoning: Some(7600),
+                    total: 9200,
+                }
+            }]
         );
         // The terminal frame re-sends the COMPLETE answer after a clear, so the finalizer's
         // appended charts (absent from the streamed preview) always reach the client.
