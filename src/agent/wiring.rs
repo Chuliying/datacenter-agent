@@ -67,13 +67,17 @@ use crate::agent::events::EventSink;
 use crate::agent::llm::{OpenAiLlm, StreamingOpenAiLlm};
 use crate::agent::payload::{ArtifactKey, LlmCapability, PayloadKind, Tool};
 use crate::agent::pipeline::{
-    agent_pipeline_id, analyst_config, charter_config, fetcher_config, Finalizer,
+    agent_pipeline_id, analyst_config, charter_config, fetcher_config, report_analyst_config,
+    report_composer_config, report_pipeline_id, Finalizer, Renderer,
 };
-use crate::agent::tools::{emit_chart_tool, McpTool};
+use crate::agent::tools::{emit_chart_tool, emit_report_tool, McpTool};
 use crate::mcp_client::McpHandle;
 
 /// The wildcard grant: "every tool the MCP server advertises".
 const ALL_MCP_TOOLS: &str = "*";
+
+/// The report `composer`'s fixed grant: the built-in `emit_report` sink (code-backed, not MCP).
+const EMIT_REPORT: &str = "emit_report";
 
 /// Builds the `/insight` pipeline as a runnable [`Orchestrator`], registered under
 /// [`agent_pipeline_id`].
@@ -170,6 +174,109 @@ pub fn build_insight_pipeline(
     };
     let stages =
         resolve_pipeline(&pipeline, &agents).map_err(|e| anyhow!("resolve insight pipeline: {e}"))?;
+
+    let mut orchestrator = Orchestrator::new();
+    orchestrator.insert(pipeline.id, stages);
+    Ok(orchestrator)
+}
+
+/// Builds the `/report` pipeline as a runnable [`Orchestrator`], registered under
+/// [`report_pipeline_id`].
+///
+/// A four-stage `fetcher → analyst → composer → renderer` chain. The `fetcher` pulls the datacenter
+/// data (its config grant, shared with `/insight`), the `analyst` writes the executive insight
+/// narrative, the `composer` maps the data + narrative into a schema-validated
+/// [`ReportData`](crate::agent::report::ReportData) via its built-in `emit_report` sink, and the
+/// **terminal** pure-logic [`Renderer`] injects that `report.data` into the boot-loaded HTML
+/// `template`, producing the `falcon-report` `Final` answer. The LLM never writes HTML.
+///
+/// Buffered/streaming is selected by `sink`, exactly as [`build_insight_pipeline`]: the three LLM
+/// stages share one client, streaming their tokens onto `sink` when it is `Some`; the renderer is
+/// pure logic and emits none of its own.
+///
+/// # Arguments
+///
+/// - `mcp` / `discovered` / `mcp_instructions`: as for [`build_insight_pipeline`].
+/// - `fetcher_grant`: the datacenter tools the report fetcher may call (shares the `/insight`
+///   fetcher's grant — the same broad snapshot).
+/// - `resolved`: the fully-resolved LLM every LLM stage runs on.
+/// - `template`: the boot-loaded HTML template the renderer fills (its `__REPORT_DATA_JSON__`
+///   placeholder is validated present at boot, see [`AppState::new`](crate::appstate::AppState)).
+/// - `sink`: `Some` selects the streaming shape; `None` is fully buffered.
+///
+/// # Errors
+///
+/// As for [`build_insight_pipeline`]: a granted MCP tool absent from the server, an LLM client that
+/// fails to build, or an unresolvable stage reference.
+pub fn build_report_pipeline(
+    mcp: McpHandle,
+    discovered: &[ChatCompletionTool],
+    mcp_instructions: Option<&str>,
+    fetcher_grant: &[String],
+    resolved: &ResolvedLlm,
+    template: Arc<String>,
+    sink: Option<Arc<dyn EventSink>>,
+) -> Result<Orchestrator> {
+    // ── resolve each tool-bearing stage's grant into concrete tools ──
+    let fetcher_tools = build_stage_tools("fetcher", fetcher_grant, &mcp, discovered)?;
+    // The composer's only tool is the built-in `emit_report` sink (code-backed, no MCP).
+    let composer_tools =
+        build_stage_tools("composer", &[EMIT_REPORT.to_string()], &mcp, discovered)?;
+
+    // ── the LLM capability shared by every LLM stage (streaming or buffered per `sink`) ──
+    let llm: Arc<dyn LlmCapability> = match &sink {
+        Some(sink) => Arc::new(
+            StreamingOpenAiLlm::from_resolved(resolved, sink.clone())
+                .context("build streaming report LLM")?,
+        ),
+        None => Arc::new(OpenAiLlm::from_resolved(resolved).context("build buffered report LLM")?),
+    };
+
+    // ── the fetcher instruction, composed with the MCP server's conventions when present ──
+    let mut fetcher_cfg = fetcher_config();
+    fetcher_cfg.instruction = compose_with_mcp(&fetcher_cfg.instruction, mcp_instructions);
+
+    // ── the four stages; upstream shapes are Intermediate, the renderer is the terminal Final ──
+    let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &fetcher_cfg,
+        llm.clone(),
+        fetcher_tools,
+        OutputShape::Intermediate,
+    ));
+    let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &report_analyst_config(),
+        llm.clone(),
+        vec![], // the analyst only reasons over provided material
+        OutputShape::Intermediate,
+    ));
+    let composer: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &report_composer_config(),
+        llm,
+        composer_tools,
+        OutputShape::Intermediate,
+    ));
+    let renderer: Arc<dyn SubAgent> = Arc::new(Renderer::with_template(template));
+
+    let agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = [
+        (SubAgentId("fetcher".into()), fetcher),
+        (SubAgentId("analyst".into()), analyst),
+        (SubAgentId("composer".into()), composer),
+        (SubAgentId("renderer".into()), renderer),
+    ]
+    .into_iter()
+    .collect();
+
+    let pipeline = PipelineConfig {
+        id: report_pipeline_id(),
+        stages: vec![
+            SubAgentId("fetcher".into()),
+            SubAgentId("analyst".into()),
+            SubAgentId("composer".into()),
+            SubAgentId("renderer".into()),
+        ],
+    };
+    let stages =
+        resolve_pipeline(&pipeline, &agents).map_err(|e| anyhow!("resolve report pipeline: {e}"))?;
 
     let mut orchestrator = Orchestrator::new();
     orchestrator.insert(pipeline.id, stages);
@@ -374,6 +481,7 @@ fn build_tool(
 fn code_tool(name: &str) -> Option<Box<dyn Tool>> {
     match name {
         "emit_chart" => Some(Box::new(emit_chart_tool())),
+        EMIT_REPORT => Some(Box::new(emit_report_tool())),
         _ => None,
     }
 }
@@ -417,8 +525,9 @@ mod tests {
     }
 
     #[test]
-    fn code_tool_resolves_only_the_built_in_sink() {
+    fn code_tool_resolves_only_the_built_in_sinks() {
         assert!(code_tool("emit_chart").is_some());
+        assert!(code_tool("emit_report").is_some());
         assert!(code_tool("bill_revenue").is_none()); // an MCP name, not code-backed
         assert!(code_tool("nope").is_none());
     }

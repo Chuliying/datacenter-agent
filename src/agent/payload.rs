@@ -125,6 +125,13 @@ impl ArtifactKey {
         Self::new("charts", "spec")
     }
 
+    /// The `composer`'s schema-validated report payload (`report.data`), a serialized
+    /// [`ReportData`](crate::agent::report::ReportData) from the `emit_report` sink — the single
+    /// artifact the `renderer` injects into the HTML template.
+    pub fn report_data() -> Self {
+        Self::new("report", "data")
+    }
+
     /// The producer namespace (the `agent` half).
     pub fn agent(&self) -> &str {
         &self.agent

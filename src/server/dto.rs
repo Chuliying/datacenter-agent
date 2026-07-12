@@ -56,7 +56,8 @@ pub struct AgentResponse {
 /// - `error`: The `data` field carries the error message.
 /// - `done`: Carries no payload, used to indicate the end of the stream.
 /// - `clear`: Carries no payload, used to suggest down stream reset current accumulated tokens.
-/// - `stage`: The `data` field names the sub-agent now running (`/insight/stream` only).
+/// - `stage`: The `data` field names the sub-agent now running (the pipeline streams
+///   `/insight/stream` + `/report/stream`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
 pub enum StreamFrame {
@@ -70,7 +71,8 @@ pub enum StreamFrame {
     Clear,
     /// Sub-agent stage transition. `data` carries the sub-agent id and its lifecycle phase
     /// (`started`, then `success` / `failure` on completion) — enough for a client to show a
-    /// per-stage progress indicator that turns green or red. Emitted only by `/insight/stream`.
+    /// per-stage progress indicator that turns green or red. Emitted by the pipeline streams
+    /// (`/insight/stream`, `/report/stream`).
     Stage { data: StageData },
     /// Intent resolved event, emitted once before any token so the host can
     /// pick the answer topic branch. Mirrors the frontend `intent.resolved`
@@ -92,7 +94,8 @@ pub struct IntentResolvedData {
 /// Payload for the [`StreamFrame::Stage`] event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StageData {
-    /// The sub-agent this transition is about (`fetcher` / `analyst` / `charter` / `finalizer`).
+    /// The sub-agent this transition is about (e.g. `fetcher` / `analyst` / `charter` /
+    /// `finalizer` for `/insight`; `fetcher` / `analyst` / `composer` / `renderer` for `/report`).
     pub agent: String,
     /// Whether the sub-agent just started, or finished with success / failure.
     pub phase: StagePhase,

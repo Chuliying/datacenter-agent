@@ -25,16 +25,16 @@ version = 1
 #
 # Currently implemented, good for reference:
 #   * agent_system              — legacy monolith analytics prompt (eval baseline).
-#   * report_system             — HTML report generator prompt for /report + /report/stream.
 #   * greeting_fetcher_system   — greeting pipeline: the data-fetch stage.
 #   * greeting_analyst_system   — greeting pipeline: the C-suite greeting writer (terminal).
 #   * greeting_user             — greeting pipeline: the boot-time request prompt.
+#
+# The /insight and /report pipeline stage prompts (fetcher/analyst/charter,
+# report_analyst/report_composer) are compiled in via include_str!, so they live under
+# prompt_guide/ but are NOT listed here.
 
 [prompts.agent_system]
 file = "prompt_guide/agent_system.md"
-
-[prompts.report_system]
-file = "prompt_guide/report_system.md"
 
 [prompts.greeting_fetcher_system]
 file = "prompt_guide/greeting_fetcher_system.md"
@@ -72,6 +72,19 @@ fetcher = [
     "station_revenue_ranking",
 ]
 charter = ["emit_chart"]
+
+
+# ──── Report pipeline assets ───
+# The /report pipeline (fetcher → analyst → composer → renderer) renders a self-contained HTML
+# report by injecting the composer's structured data into this template — the LLM never writes
+# HTML. The template must contain the `__REPORT_DATA_JSON__` placeholder (checked at boot); its
+# design tokens (brand palette) are baked into the template's `:root` CSS block, so retuning the
+# brand is a template edit. Omitting this section defaults to `report_template/report.html`.
+#
+# The /report fetcher reuses the `[insight.grants].fetcher` tools above (the same broad snapshot).
+
+[report]
+template = "report_template/report.html"
 
 
 # ──── Runtime capability pack section ───

@@ -54,7 +54,7 @@ exist in the tree. The real starting point:
 |---|---|
 | Term ownership | **Sub-agent layer owns bare `pipeline` / `orchestration`** (Option B). Runtime renamed to `turn` / `input` **first**, behind a behavior-preserving gate (§2). |
 | Agent anatomy | **Three optional components — LLM, Tools, Logic** — behind one `SubAgent` trait unifying **config-defined** (`ConfiguredAgent`) and **code-defined** (`agents.rs`) agents (contract §1.1). The two endpoints are all config; code path is groundwork. |
-| `/report` shape | **Three-stage** `fetcher → charter → finalizer` — the `finalizer` combines the fetcher's data with the `charter`'s schema-checked chart artifacts into the final HTML (§10). |
+| `/report` shape | **Four-stage** `fetcher → analyst → composer → renderer` — the `composer` emits schema-checked [`ReportData`](../../src/agent/report.rs) via its `emit_report` sink, and the pure-logic `renderer` injects it into a boot-loaded HTML template (the LLM never writes HTML). Landed in `src/agent/` (§10). |
 | Sub-agent orchestrator ↔ runtime | **Pipeline sits *behind* `AgentPort`** — a `PipelineAgentPort` replaces `LlmAgentPort`; guardrails/intent/memory/audit are preserved. |
 | Tool set | **Closed, hand-authored `ToolId` enum** + registry, resolved at boot (contract §1.3, §2.2). Auto-discovery is replaced. Each grant additionally binds an explicit wire name (`mcp_name`) when it differs from the canonical `ToolId` string (§4). |
 | Streaming | An injected **`EventSink`** (same idiom as the runtime's `TurnEmit`) with a **no-op** for the buffered path. *All* stages emit **process** events (`Stage*` / `Tool*` / reasoning) onto it; only the **terminal** stage additionally streams **content tokens**. Buffered-vs-streaming is a capability choice at wiring — the normative `run(payload)->Result` morphism is unchanged. Per-turn sink injection via **mechanism A** (sink baked into per-turn capabilities), `task_local` as escape hatch (§8.5). |
@@ -689,71 +689,69 @@ stages = ["analyst"]
 `analyst` is the terminal (and only) stage → it streams. Behavior-preserving vs today's
 `/agent`.
 
-### `report` — fetch → chart → finalize (three stages)
+### `report` — fetch → analyse → compose → render (four stages, **landed** in `src/agent/`)
 
-The report maker splits into three: a data `fetcher`, a `charter` that produces
-**schema-enforced chart artifacts** via a `SchemaTool` sink, and a `finalizer` that **combines
-all upstream artifacts** (data + charts) into the final HTML. The first two run **buffered**;
-the `finalizer` is the **streaming terminal stage** with the raised token ceiling.
+The report maker splits into four: a data `fetcher`, an `analyst` that writes the executive
+**insight narrative** (prose), a `composer` that emits the whole report as **schema-enforced
+structured data** via a `SchemaTool` sink, and a pure-logic `renderer` that **injects that data
+into a boot-loaded HTML template**. The three LLM stages run buffered or streamed (per the
+per-turn sink, §8.5); the `renderer` emits no tokens of its own.
+
+**The economy (the whole point).** A rendered report is ~99% static — the design-system CSS, the
+layout skeleton, and the client-side reader JS. Only a small JSON data block varies. So the LLM
+**never writes HTML**: the `composer` emits only [`ReportData`](../../src/agent/report.rs) via its
+`emit_report` sink, and [`render_report_html`](../../src/agent/pipeline.rs) escapes it and drops it
+into the template's single `__REPORT_DATA_JSON__` placeholder. That is far faster and cheaper than
+regenerating a full document per turn, and the design system can never drift.
 
 ```toml
-[[sub_agent]]
-id = "fetcher"
-instruction = { file = "prompt_guide/agent_system.md" }   # or a dedicated fetch prompt
-tools = [ /* same data-tool grant */ ]
-accepts = ["initial"]
-# non-terminal ⇒ output derives to "intermediate"
-
-[[sub_agent]]
-id = "charter"
-instruction = { file = "prompt_guide/charter_system.md" }
-tools = ["emit_chart"]            # a code-backed SchemaTool sink (NOT an MCP tool)
-accepts = ["intermediate"]        # reads the fetcher's data artifacts
-# non-terminal ⇒ output derives to "intermediate"; the validated chart lands at `charts.spec`
-
-[[sub_agent]]
-id = "finalizer"
-instruction = { file = "prompt_guide/report_system.md" }
-tools = []                        # no tools — it combines, it doesn't fetch or invent
-accepts = ["intermediate"]
-# terminal ⇒ output derives to "final"
-[sub_agent.llm]
-max_tokens = 16384                # replaces the REPORT_MAX_TOKENS override
-
+# fetcher — reuses the /insight fetcher grant ([insight.grants].fetcher, the same broad snapshot)
+# analyst — no tools; reads fetcher.*; captures analyst.message = the insight narrative
+# composer — tools = ["emit_report"] (a code-backed SchemaTool sink); reads fetcher.* + analyst.message;
+#            the validated report lands at `report.data`
+# renderer — a code-defined SubAgent (no LLM, no tools); injects report.data into the boot template
 [[pipeline]]
 id = "report"
-stages = ["fetcher", "charter", "finalizer"]
+stages = ["fetcher", "analyst", "composer", "renderer"]
 ```
 
-- **`emit_chart` is a code-registered sink**, not an MCP tool — it has no `[[mcp_server]]`
-  entry. `ToolId::EmitChart` is backed by a `SchemaTool::<ChartSpec>::sink` in `build_registry()`
-  (§4), targeting a new `ArtifactKey::ChartsSpec` (`charts.spec`). The model calls it with a
-  chart spec; a bad shape is `Rejected` and fed back until valid — "loop until valid" for free.
-- **The `finalizer` is the "combine all stuff" stage** (your decision): its empty grant is the
-  isolation guarantee made concrete (it can't fetch or invent), and it consumes the *merged*
-  artifact map — the fetcher's data plus the charter's `charts.spec` — emitting one HTML report
-  that embeds the validated chart data. This is why chart producers must be **`Intermediate`**:
-  `OutputShape::Final` keeps prose and *drops* artifacts (contract §2.4), so a chart can never be
-  a terminal stage's output — it must flow as an artifact into the finalizer.
-- No agent sets `output`; none is shared across pipelines at different positions, so
-  position-derivation resolves all three cleanly (contract §2.4).
-- `REPORT_MAX_TOKENS` becomes the `finalizer`'s per-agent `llm.max_tokens`;
-  `USER_PROMPT_LENGTH_CAP` stays a cheap HTTP-layer check in `handler.rs`.
-- Streaming: `fetcher` + `charter` buffered, `finalizer` streams token-by-token — same wire
-  contract as `/report/stream` today.
-- **Exit check:** a unit test drives the three-stage pipeline with a mocked LLM + mock data
-  tools + the real `SchemaTool` sink; assert the `charter` rejects a malformed chart then
-  produces `charts.spec`, and the `finalizer` receives both the fetcher's data and the chart
-  artifact and holds zero tools. `/report` yields a `falcon-report` HTML block whose chart data
-  is exactly what the sink validated.
+- **`emit_report` is a code-registered sink** ([`emit_report_tool`](../../src/agent/tools.rs)), not
+  an MCP tool — a `SchemaTool::<ReportData>::sink` targeting the open key
+  [`ArtifactKey::report_data`](../../src/agent/payload.rs) (`report.data`). The model calls it once
+  with the whole structured report; a bad shape is `Rejected` and fed back until valid — "loop
+  until valid" for free. This is the same sink pattern as `/insight`'s `emit_chart`.
+- **The `renderer` is a second Logic-only terminal stage** ([`Renderer`](../../src/agent/pipeline.rs),
+  the sibling of `/insight`'s `Finalizer`): no LLM, no tools — the isolation guarantee made
+  concrete (it can neither fetch nor invent). It reads the required `report.data` (a missing payload
+  is a typed `MissingArtifact`, never a panic), injects it into the template, and wraps the HTML in
+  a `falcon-report` fence — the same wire contract the frontend already renders. Its output is
+  fully determined by `report.data` + the fixed template.
+- **The template is a boot asset, not a prompt** (`[report].template`, default
+  `report_template/report.html`), read at config load and validated at boot to contain the
+  `__REPORT_DATA_JSON__` placeholder (fail-fast, [`AppState::new`](../../src/appstate.rs)). Design
+  tokens (the brand palette) are baked into its `:root` CSS block, so retuning the brand is a
+  template edit — no recompile, no LLM.
+- Chart producers stay **`Intermediate`** for the same reason as `/insight`: `OutputShape::Final`
+  keeps prose and *drops* artifacts (contract §2.4), so `report.data` must flow as an artifact into
+  the renderer, not be a stage's terminal output.
+- `REPORT_MAX_TOKENS` is **gone**: the composer emits a small JSON payload (well under the chat-sized
+  default), and the renderer is code, so no raised ceiling is needed. `USER_PROMPT_LENGTH_CAP` stays
+  a cheap HTTP-layer check in `handler.rs`.
+- **Stage prompts are compiled in** (`report_{analyst,composer}_system.md` via `include_str!`),
+  matching the `/insight` stage prompts (`{fetcher,analyst,charter}_system.md`); the swappable
+  design asset is the runtime-loaded template.
+- **Landed:** unit tests drive the sink (`emit_report` validates + rejects a missing field), the
+  renderer (injects, escapes `<`/`>`, wraps; falls typed on missing `report.data` or a wrong
+  variant), and the template load (the placeholder is present, tokens baked). `/report` yields a
+  `falcon-report` HTML block whose data is exactly what the sink validated.
 
 ## 11. Migration & compatibility
 
 - **Ship §2 first, on its own, behind its gate** — the vocabulary rename is a standalone,
   behavior-preserving commit that precedes all sub-agent code. Nothing downstream starts until
   its gate is green.
-- Ship §10's `agent` (one-stage) and `report` (three-stage `fetcher → charter → finalizer`)
-  pipelines as the default config.
+- Ship §10's `agent` / `insight` (four-stage `fetcher → analyst → charter → finalizer`) and
+  `report` (four-stage `fetcher → analyst → composer → renderer`) pipelines as the default config.
 - Keep the legacy direct path (`should_use_runtime == false` rollback) working until the
   pipeline path is proven in staging, then remove `LlmAgentPort` and the raw `tools` /
   `instructions` `AppState` fields.

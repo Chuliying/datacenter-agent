@@ -76,7 +76,7 @@ impl LlmDefaults {
             app_title: std::env::var("OPENROUTER_APP_TITLE").ok(),
             temperature: get_env_with_default("OPENROUTER_TEMPERATURE", 0.2_f32),
             top_p: 0.1,
-            max_tokens: get_env_with_default("OPENROUTER_MAX_TOKENS", 4096_u32),
+            max_tokens: get_env_with_default("OPENROUTER_MAX_TOKENS", 8192_u32),
         })
     }
 
@@ -111,8 +111,6 @@ pub struct PromptBank {
     /// endpoints now drive the sub-agent pipeline (with its own per-stage prompts under
     /// `config/prompt_guide/`); this prompt still backs the eval baseline runner.
     pub agent_system: String,
-    /// System prompt for the HTML report `/report` + `/report/stream` endpoints.
-    pub report_system: String,
     /// Greeting pipeline — the data-fetch stage's system prompt.
     pub greeting_fetcher_system: String,
     /// Greeting pipeline — the C-suite greeting writer (terminal stage) system prompt.
@@ -126,13 +124,11 @@ impl PromptBank {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if any of `agent_system`, `report_system`,
-    /// `greeting_fetcher_system`, `greeting_analyst_system`, or `greeting_user`
-    /// is missing from the loaded config.
+    /// Returns `Err` if any of `agent_system`, `greeting_fetcher_system`,
+    /// `greeting_analyst_system`, or `greeting_user` is missing from the loaded config.
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
-            report_system: cfg.get_prompt_by_id("report_system")?.to_string(),
             greeting_fetcher_system: cfg
                 .get_prompt_by_id("greeting_fetcher_system")?
                 .to_string(),
@@ -181,6 +177,9 @@ pub struct AppState {
     /// Resolved `/insight` pipeline tool grants (from `[insight.grants]`), validated against the
     /// discovered MCP tool set at boot.
     pub insight_grants: crate::config::InsightGrants,
+    /// The `/report` HTML template body (from `[report].template`), shared read-only. Its
+    /// `__REPORT_DATA_JSON__` placeholder is validated present at boot; the `renderer` fills it.
+    pub report_template: Arc<String>,
 }
 
 /// Runtime dependencies assembled at boot.
@@ -228,6 +227,18 @@ impl AppState {
         )
         .context("validate /insight tool grants")?;
 
+        // Fail fast at boot if the /report template can never be filled — a template without the
+        // data placeholder would render an empty report on every request.
+        if !app_config
+            .report_template
+            .contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER)
+        {
+            anyhow::bail!(
+                "report template is missing the `{}` placeholder — the renderer would have nothing to fill",
+                crate::agent::pipeline::REPORT_DATA_PLACEHOLDER
+            );
+        }
+
         Ok(Self {
             mcp,
             tools,
@@ -239,16 +250,18 @@ impl AppState {
             greetings: Arc::new(Mutex::new(Vec::new())),
             runtime,
             insight_grants: app_config.insight_grants.clone(),
+            report_template: Arc::new(app_config.report_template.clone()),
         })
     }
 
-    /// Assemble a [`GenerationConfig`] for one tool-calling run.
+    /// Assemble a [`GenerationConfig`] for one legacy [`llm_connector`](crate::llm_connector)
+    /// tool-calling run.
     ///
-    /// The effective system prompt is `base_system` with the MCP server's
-    /// conventions appended (when present), mirroring the orchestrator. LLM
-    /// parameters are cloned from [`LlmDefaults`]. Shared by the legacy monolith
-    /// `/report` + `/report/stream` paths and the greeting generator so the wire
-    /// contract and model behaviour stay identical.
+    /// The effective system prompt is `base_system` with the MCP server's conventions appended
+    /// (when present), mirroring the orchestrator, plus a `# Current Time` header. LLM parameters
+    /// are cloned from [`LlmDefaults`]. The `/insight` and `/report` endpoints now drive the
+    /// sub-agent pipeline instead; this helper is retained for the monolith loop's remaining
+    /// callers.
     pub fn generation_config(
         &self,
         base_system: &str,

@@ -47,13 +47,18 @@
 //! - [`chart`] — the **falcon-chart** protocol ([`ChartBatch`](chart::ChartBatch) /
 //!   [`FalconChart`](chart::FalconChart)): the shared `serde` + `schemars` type the `charter`'s
 //!   `emit_chart` sink validates and the `finalizer` renders (plan §10).
+//! - [`report`] — the **report data** protocol ([`ReportData`](report::ReportData)): the shared
+//!   `serde` + `schemars` type the `composer`'s `emit_report` sink validates and the `renderer`
+//!   injects into the boot-loaded HTML template (plan §10).
 //! - [`pipeline`] — the `/insight` analytics pipeline (fetcher → analyst → charter →
-//!   [`Finalizer`](pipeline::Finalizer)), decomposing the monolith's single turn into four
-//!   composable sub-agents, with the pure-logic [`render_report`](pipeline::render_report)
-//!   assembly (plan §10).
-//! - [`wiring`] — the production assembly ([`build_insight_pipeline`](wiring::build_insight_pipeline))
-//!   that turns the boot-discovered MCP tools + the LLM defaults into a runnable
-//!   [`Orchestrator`](engine::Orchestrator) behind the `/insight` + `/insight/stream` handlers.
+//!   [`Finalizer`](pipeline::Finalizer)) and the `/report` pipeline (fetcher → analyst → composer →
+//!   [`Renderer`](pipeline::Renderer)), each decomposing a monolith turn into composable
+//!   sub-agents, with the pure-logic [`render_report`](pipeline::render_report) /
+//!   [`render_report_html`](pipeline::render_report_html) assemblies (plan §10).
+//! - [`wiring`] — the production assembly ([`build_insight_pipeline`](wiring::build_insight_pipeline),
+//!   [`build_report_pipeline`](wiring::build_report_pipeline)) that turns the boot-discovered MCP
+//!   tools + the LLM defaults into a runnable [`Orchestrator`](engine::Orchestrator) behind the
+//!   `/insight` + `/report` handlers.
 //!
 //! The `/insight` endpoints drive [`wiring`] directly (bypassing the runtime turn); routing the
 //! pipeline *behind* the runtime `AgentPort` is the plan's §9 step.
@@ -72,5 +77,6 @@ pub mod events;
 pub mod llm;
 pub mod payload;
 pub mod pipeline;
+pub mod report;
 pub mod tools;
 pub mod wiring;

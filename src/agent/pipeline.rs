@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The `/agent` analytics pipeline: **fetcher → analyst → charter → finalizer**.
+//! The endpoint pipelines: the `/insight` analytics pipeline (**fetcher → analyst → charter →
+//! finalizer**) and the `/report` HTML pipeline (**fetcher → analyst → composer → renderer**).
 //!
 //! The monolith's single `/agent` turn (fetch + analyse + chart in one prompt) is decomposed here
 //! into four cooperating sub-agents, proving the sub-agent approach by construction — each stage is
@@ -37,14 +38,35 @@
 //! their notes are throwaway. The `finalizer` reads the `analyst`'s message as the report body and
 //! carries the whole artifact map onto the `Final` result as provenance.
 //!
+//! ## The `/report` pipeline
+//!
+//! The same shape backs `/report`, but the terminal stage renders a **self-contained HTML report**
+//! instead of markdown:
+//!
+//! | Stage | Kind | Reads | Produces | Shape |
+//! |---|---|---|---|---|
+//! | `fetcher` | [`ConfiguredAgent`] + MCP tools | the user prompt | `fetcher.*` | Intermediate |
+//! | `analyst` | [`ConfiguredAgent`], no tools | `fetcher.*` | `analyst.message` (the insight narrative) | Intermediate |
+//! | `composer` | [`ConfiguredAgent`] + `emit_report` sink | `fetcher.*` + `analyst.message` | `report.data` (schema-validated [`ReportData`](crate::agent::report::ReportData)) | Intermediate |
+//! | `renderer` | [`Renderer`] — pure logic, no LLM | `report.data` + boot template | the `falcon-report` HTML answer | Final |
+//!
+//! The economy: the report HTML is ~99% static (design-system CSS, layout, the client-side reader),
+//! so the LLM never writes HTML — the `composer` emits only the small structured [`ReportData`] via
+//! its `emit_report` sink, and the pure-logic [`Renderer`] ([`render_report_html`]) injects it into
+//! the boot-loaded template's single `__REPORT_DATA_JSON__` placeholder. That is far faster and
+//! cheaper than regenerating the whole document, and the design system can never drift per turn.
+//!
 //! # References
 //!
-//! - Sub-agent plan §10 — the endpoint pipelines (the `/agent` conversion)
-//! - `config/prompt_guide/{fetcher,analyst,charter}_system.md` — the authored stage instructions
+//! - Sub-agent plan §10 — the endpoint pipelines (the `/agent` conversion; the `/report` renderer)
+//! - `config/prompt_guide/{fetcher,analyst,charter}_system.md` — the `/insight` stage instructions
+//! - `config/prompt_guide/report_{analyst,composer}_system.md` — the `/report` stage instructions
+//! - `config/report_template/report.html` — the boot-loaded HTML template the renderer fills
 
 #![allow(dead_code)] // groundwork: the pipeline is assembled + tested, not yet wired behind AgentPort.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -64,6 +86,12 @@ pub const FETCHER_INSTRUCTION: &str = include_str!("../../config/prompt_guide/fe
 pub const ANALYST_INSTRUCTION: &str = include_str!("../../config/prompt_guide/analyst_system.md");
 /// The `charter`'s system instruction — decide on 0–2 charts, emit via `emit_chart`.
 pub const CHARTER_INSTRUCTION: &str = include_str!("../../config/prompt_guide/charter_system.md");
+/// The report `analyst`'s instruction — write the executive insight narrative (prose only).
+pub const REPORT_ANALYST_INSTRUCTION: &str =
+    include_str!("../../config/prompt_guide/report_analyst_system.md");
+/// The report `composer`'s instruction — map the fetched data + narrative into `emit_report`.
+pub const REPORT_COMPOSER_INSTRUCTION: &str =
+    include_str!("../../config/prompt_guide/report_composer_system.md");
 
 // ===========================================================================
 // Stage configs — the authored `SubAgentConfig` for each LLM-driven stage
@@ -125,6 +153,51 @@ pub fn charter_config() -> SubAgentConfig {
 /// The pipeline id that selects this `/agent` pipeline in the [`Orchestrator`](crate::agent::engine::Orchestrator).
 pub fn agent_pipeline_id() -> PipelineId {
     PipelineId("agent".into())
+}
+
+// ===========================================================================
+// Report stage configs — the `/report` pipeline's LLM-driven stages
+// ===========================================================================
+
+/// The report `analyst` config: no tools, consumes the fetched data, writes the insight narrative.
+///
+/// Its narrative is its model message, captured as `analyst.message` (the open-key contract keeps
+/// every stage's message), so the `composer` can fold it into the report's `insight` field and it
+/// survives the `Intermediate` boundary as provenance.
+pub fn report_analyst_config() -> SubAgentConfig {
+    SubAgentConfig {
+        id: SubAgentId("analyst".into()),
+        instruction: REPORT_ANALYST_INSTRUCTION.to_string(),
+        llm: None,
+        tools: vec![],
+        accepts: vec![PayloadKind::Intermediate],
+        output: None,
+        capture_message: true, // the analyst's message *is* the insight narrative — keep it
+    }
+}
+
+/// The report `composer` config: the `emit_report` sink, consumes the data + narrative, emits
+/// `report.data`.
+///
+/// Its tool grant is the built-in `emit_report` sink (wired by
+/// [`build_report_pipeline`](crate::agent::wiring::build_report_pipeline)); the `tools` field here
+/// is left empty because that path never reads it. Its output is the validated `report.data`
+/// artifact, not its message, so it opts out of `capture_message`.
+pub fn report_composer_config() -> SubAgentConfig {
+    SubAgentConfig {
+        id: SubAgentId("composer".into()),
+        instruction: REPORT_COMPOSER_INSTRUCTION.to_string(),
+        llm: None,
+        tools: vec![], // grant is wired in code; see `build_report_pipeline`
+        accepts: vec![PayloadKind::Intermediate],
+        output: None,
+        capture_message: false, // its output is the `report.data` artifact, not its message
+    }
+}
+
+/// The pipeline id that selects the `/report` pipeline in the [`Orchestrator`](crate::agent::engine::Orchestrator).
+pub fn report_pipeline_id() -> PipelineId {
+    PipelineId("report".into())
 }
 
 // ===========================================================================
@@ -242,6 +315,115 @@ impl SubAgent for Finalizer {
             user: data.prompt,
             assistant: render_report(&report, &charts),
             now: data.now,          // carry the turn's timestamp onto the terminal result
+            artifacts: data.artifacts, // full provenance rides along on the result
+        }))
+    }
+}
+
+// ===========================================================================
+// render_report_html — the renderer's pure template injection
+// ===========================================================================
+
+/// The single placeholder the boot-loaded HTML template reserves for the report data.
+///
+/// [`render_report_html`] replaces exactly this token (inside the template's
+/// `<script type="application/json">`) with the escaped report JSON; everything else in the
+/// template — design-system CSS, layout, the client-side reader — is static, so this is the whole
+/// per-turn variable part.
+pub const REPORT_DATA_PLACEHOLDER: &str = "__REPORT_DATA_JSON__";
+
+/// Injects `data` into `template` and wraps the result as a ```` ```falcon-report ```` block.
+///
+/// Pure and total — this *is* the renderer's whole logic, factored out so it is directly testable
+/// without a payload. The data is serialized compactly, then `<` / `>` are escaped to `<` /
+/// `>` so a string value can never close the `<script>` element early (injection safety), and
+/// the one [`REPORT_DATA_PLACEHOLDER`] is replaced. The frontend renders the HTML inside the
+/// `falcon-report` fence, matching the prior monolith wire contract.
+///
+/// # Arguments
+///
+/// - `template`: the boot-loaded HTML (must contain [`REPORT_DATA_PLACEHOLDER`] — checked at boot).
+/// - `data`: the serialized [`ReportData`](crate::agent::report::ReportData) to inject.
+pub fn render_report_html(template: &str, data: &serde_json::Value) -> String {
+    let json = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+    let escaped = json.replace('<', "\\u003c").replace('>', "\\u003e");
+    let html = template.replacen(REPORT_DATA_PLACEHOLDER, &escaped, 1);
+    format!("```falcon-report\n{html}\n```")
+}
+
+// ===========================================================================
+// Renderer — the pure-logic terminal stage for /report (no LLM, no tools)
+// ===========================================================================
+
+/// The payload variants the [`Renderer`] consumes: it reads only the merged artifact map.
+const RENDERER_ACCEPTS: &[PayloadKind] = &[PayloadKind::Intermediate];
+
+/// The `/report` terminal stage: a code-defined [`SubAgent`] with **no LLM and no tools** whose
+/// entire behaviour is [`render_report_html`].
+///
+/// It reads the `composer`'s schema-validated `report.data` artifact (required; a missing payload
+/// is a wiring error surfaced as [`AgentError::MissingArtifact`], not a panic) and injects it into
+/// the boot-loaded template, emitting the `Final` HTML answer. The full upstream artifact map rides
+/// along as provenance. Being pure logic, it can neither fetch nor invent — its output is fully
+/// determined by `report.data` and the fixed template.
+///
+/// # References
+///
+/// - Sub-agent plan §10 — the `renderer` injects `report.data` into the HTML template
+/// - Sub-agent contract §1.1 — Logic-only agents
+pub struct Renderer {
+    id: SubAgentId,
+    /// The boot-loaded HTML template, shared read-only. Contains [`REPORT_DATA_PLACEHOLDER`].
+    template: Arc<String>,
+}
+
+impl Renderer {
+    /// Builds a renderer that injects `report.data` into `template`.
+    pub fn new(id: SubAgentId, template: Arc<String>) -> Self {
+        Self { id, template }
+    }
+
+    /// Builds the renderer with its canonical `renderer` id.
+    pub fn with_template(template: Arc<String>) -> Self {
+        Self::new(SubAgentId("renderer".into()), template)
+    }
+}
+
+#[async_trait]
+impl SubAgent for Renderer {
+    fn id(&self) -> &SubAgentId {
+        &self.id
+    }
+
+    fn accepts(&self) -> &'static [PayloadKind] {
+        RENDERER_ACCEPTS
+    }
+
+    async fn run(&self, input: AgentPayload) -> Result<AgentPayload, AgentError> {
+        // Consumes only Intermediate; anything else falls (payload §2.4). The match is both the
+        // accept-check and the destructure — total, never a panic.
+        let data = match input {
+            AgentPayload::Intermediate(d) => d,
+            other => {
+                return Err(AgentError::Mismatch {
+                    expected: self.accepts(),
+                    got: other.kind(),
+                })
+            }
+        };
+
+        // The structured report is required — the renderer's whole job is to inject it. A non-JSON
+        // value at `report.data` is a wiring fault, surfaced as missing (typed, never a panic).
+        let key = ArtifactKey::report_data();
+        let report_json = match data.artifacts.get(&key) {
+            Some(ArtifactValue::Json(v)) => v.clone(),
+            _ => return Err(AgentError::MissingArtifact(key)),
+        };
+
+        Ok(AgentPayload::Final(FinalResult {
+            user: data.prompt,
+            assistant: render_report_html(&self.template, &report_json),
+            now: data.now,             // carry the turn's timestamp onto the terminal result
             artifacts: data.artifacts, // full provenance rides along on the result
         }))
     }
@@ -557,6 +739,85 @@ mod tests {
     #[tokio::test]
     async fn finalizer_falls_on_a_variant_it_does_not_accept() {
         let out = Finalizer::default_stage()
+            .run(AgentPayload::Initial(InitialPrompt {
+                prompt: "x".into(),
+                history: vec![],
+                now: fixed_now(),
+            }))
+            .await;
+        assert!(matches!(
+            out,
+            Err(AgentError::Mismatch {
+                got: PayloadKind::Initial,
+                ..
+            })
+        ));
+    }
+
+    // ── renderer: pure logic — inject report.data into the template, wrap, fall on missing ──
+
+    /// A stand-in template with the one placeholder the renderer fills.
+    const TEST_TEMPLATE: &str =
+        "<html><script type=\"application/json\">__REPORT_DATA_JSON__</script></html>";
+
+    #[test]
+    fn render_report_html_injects_escapes_and_wraps() {
+        // A `<` in a data string is escaped so it cannot close the <script> early…
+        let data = serde_json::json!({ "name": "A<B", "n": 1 });
+        let out = render_report_html(TEST_TEMPLATE, &data);
+        assert!(out.starts_with("```falcon-report\n"));
+        assert!(out.ends_with("\n```"));
+        assert!(!out.contains(REPORT_DATA_PLACEHOLDER)); // the placeholder is gone
+        assert!(out.contains("A\\u003cB")); // '<' escaped
+        assert!(!out.contains("A<B"));
+    }
+
+    #[tokio::test]
+    async fn renderer_injects_report_data_into_the_template() {
+        let mut artifacts = HashMap::new();
+        artifacts.insert(
+            ArtifactKey::report_data(),
+            ArtifactValue::Json(serde_json::json!({ "report": { "title": "營運報表" } })),
+        );
+        // an unrelated upstream artifact the renderer must simply carry as provenance
+        artifacts.insert(
+            ArtifactKey::message("analyst"),
+            ArtifactValue::Text("洞察".into()),
+        );
+
+        let out = Renderer::with_template(Arc::new(TEST_TEMPLATE.to_string()))
+            .run(intermediate("近半年營運報表", artifacts))
+            .await
+            .unwrap();
+
+        match out {
+            AgentPayload::Final(f) => {
+                assert_eq!(f.user, "近半年營運報表");
+                assert!(f.assistant.starts_with("```falcon-report"));
+                assert!(f.assistant.contains("\"title\":\"營運報表\""));
+                // provenance rides along on the result
+                assert!(f.artifacts.contains_key(&ArtifactKey::report_data()));
+                assert!(f.artifacts.contains_key(&ArtifactKey::message("analyst")));
+            }
+            other => panic!("expected Final, got {:?}", other.kind()),
+        }
+    }
+
+    #[tokio::test]
+    async fn renderer_falls_on_missing_report_data() {
+        // No report.data ⇒ a wiring error, surfaced typed (never a panic).
+        let out = Renderer::with_template(Arc::new(TEST_TEMPLATE.to_string()))
+            .run(intermediate("x", HashMap::new()))
+            .await;
+        match out {
+            Err(AgentError::MissingArtifact(k)) => assert_eq!(k, ArtifactKey::report_data()),
+            other => panic!("expected MissingArtifact(report.data), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn renderer_falls_on_a_variant_it_does_not_accept() {
+        let out = Renderer::with_template(Arc::new(TEST_TEMPLATE.to_string()))
             .run(AgentPayload::Initial(InitialPrompt {
                 prompt: "x".into(),
                 history: vec![],

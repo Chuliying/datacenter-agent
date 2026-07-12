@@ -39,6 +39,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::agent::chart::ChartBatch;
+use crate::agent::report::ReportData;
 use crate::agent::events::{AgentEvent, EventSink};
 use crate::agent::payload::{
     AgentError, ArtifactKey, ArtifactValue, Tool, ToolOutcome, ToolSchema,
@@ -364,6 +365,30 @@ pub fn emit_chart_tool() -> SchemaTool<ChartBatch> {
          built strictly from the fetched numbers. Skip it entirely — call no tool — for \
          chit-chat, greetings, or single-value answers.",
         ArtifactKey::charts_spec(),
+    )
+}
+
+/// Builds the `emit_report` sink: a [`SchemaTool`] over [`ReportData`] whose validated value lands
+/// at [`ArtifactKey::report_data()`].
+///
+/// This is the report `composer`'s only tool and is **code-backed, not MCP** — the model calls it
+/// once with the whole structured report (metadata, the insight narrative, the monthly periods, and
+/// the station ranking) built strictly from the fetched numbers. A malformed shape is `Rejected`
+/// and fed back until valid ("loop until valid" for free, tool contract), and the serialized
+/// [`ReportData`] becomes the `report.data` artifact the pure-logic `renderer` injects into the
+/// boot-loaded HTML template. The model never writes HTML — only this data.
+///
+/// # References
+///
+/// - Sub-agent plan §10 — `emit_report` is a code-registered `SchemaTool` sink
+pub fn emit_report_tool() -> SchemaTool<ReportData> {
+    SchemaTool::<ReportData>::sink(
+        "emit_report",
+        "Emit the whole operations report as structured data. Call exactly once with the report \
+         metadata, the executive insight narrative, every monthly period, and the station ranking \
+         — all built strictly from the fetched numbers, never invented. Do NOT write HTML; the \
+         server renders it from this data.",
+        ArtifactKey::report_data(),
     )
 }
 
@@ -693,6 +718,59 @@ mod tests {
 
         // A malformed chart type is a retryable rejection, not a crash.
         let bad = serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
+        assert!(matches!(
+            tool.call(bad).await.unwrap(),
+            ToolOutcome::Rejected { .. }
+        ));
+    }
+
+    // ── emit_report: the composer's sink, advertised name + validate/reject ──
+
+    /// A minimal well-formed [`ReportData`](crate::agent::report::ReportData) JSON, as the composer
+    /// would pass it to `emit_report`.
+    fn valid_report() -> serde_json::Value {
+        serde_json::json!({
+            "report": {
+                "title": "營運報表", "organization": "EOMC", "brand": "Starcharger",
+                "periodLabel": "2026年5月-6月", "dateFrom": "2026-05-01", "dateTo": "2026-06-30",
+                "asOf": "2026-06-30", "locale": "zh-TW", "currency": "TWD",
+                "partialPeriodNote": "2026-06 為部分月份數據。"
+            },
+            "summary": { "latestCompletedPeriod": "2026-05", "topStationPeriodLabel": "Q2 累計" },
+            "insight": { "headline": "營收創高。", "paragraphs": ["5 月月增 13.7%。"] },
+            "periods": [
+                { "period": "2026-05", "revenue": 5805093, "revenueMom": 13.7, "kwh": 978061,
+                  "sessions": 35861, "newMembers": 2888, "totalMembers": 42758,
+                  "activeMembers": 7247, "stations": 248, "chargers": 796, "partial": false },
+                { "period": "2026-06", "revenue": 4136808, "revenueMom": -28.7, "kwh": 794876,
+                  "sessions": 29434, "newMembers": 2834, "totalMembers": 45592,
+                  "activeMembers": 6758, "stations": 248, "chargers": 812, "partial": true }
+            ],
+            "stationRanking": [
+                { "rank": 1, "name": "內湖堤頂專用站", "revenue": 1538139, "kwh": 291775,
+                  "utilization": 13.1, "revenuePerKw": 16.56 }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn emit_report_tool_targets_report_data_and_validates_the_payload() {
+        let tool = emit_report_tool();
+        assert_eq!(tool.schema().name, "emit_report");
+        assert_eq!(tool.target(), ArtifactKey::report_data());
+
+        // A well-formed payload produces the serialized report data.
+        match tool.call(valid_report()).await.unwrap() {
+            ToolOutcome::Produced(ArtifactValue::Json(v)) => {
+                assert_eq!(v["summary"]["latestCompletedPeriod"], "2026-05");
+                assert_eq!(v["stationRanking"][0]["name"], "內湖堤頂專用站");
+            }
+            other => panic!("expected Produced(Json), got {other:?}"),
+        }
+
+        // A missing required field (no `periods`) is a retryable rejection, not a crash.
+        let mut bad = valid_report();
+        bad.as_object_mut().unwrap().remove("periods");
         assert!(matches!(
             tool.call(bad).await.unwrap(),
             ToolOutcome::Rejected { .. }

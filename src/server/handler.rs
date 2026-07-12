@@ -23,8 +23,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures::{stream::BoxStream, Stream, StreamExt};
-use tracing::{error, instrument, warn, Instrument};
+use tracing::{instrument, warn, Instrument};
 
 use rand::seq::SliceRandom;
 
@@ -37,23 +36,11 @@ use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
-use crate::agent::pipeline::agent_pipeline_id;
-use crate::agent::wiring::build_insight_pipeline;
-use crate::llm_connector;
-use crate::model::GenerationConfig;
+use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id};
+use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline};
 
 /// Upper bound on the user prompt, in UTF-8 characters.
 pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
-
-/// Output-token ceiling for the report endpoints.
-///
-/// A full self-contained HTML report (design-system CSS + markup + chart
-/// script) far exceeds the chat-sized [`LlmDefaults::max_tokens`] default, so
-/// the `/report` paths raise it. Kept below the 120 s request timeout's
-/// practical generation budget.
-///
-/// [`LlmDefaults::max_tokens`]: crate::appstate::LlmDefaults::max_tokens
-const REPORT_MAX_TOKENS: u32 = 16_384;
 
 /// SSE keep-alive interval.
 ///
@@ -172,73 +159,75 @@ pub async fn insight(
     .await
 }
 
-/// Shared completion body for the non-streaming JSON endpoints.
-///
-/// `base_system` selects the system prompt (analytics vs report) and
-/// `max_tokens_override` bumps the output ceiling for the report path.
-async fn completion_inner(
-    state: AppState,
-    req: AgentRequest,
-    base_system: String,
-    max_tokens_override: Option<u32>,
-) -> Result<Json<AgentResponse>, AppError> {
-    let user_prompt = req.prompt.clone();
-    let cfg = prepare_config(&state, req, &base_system, max_tokens_override)?;
-
-    // MCP tool-calling loop
-    let md = match llm_connector::generate(cfg, state.tools.clone(), state.mcp.clone()).await {
-        Ok(m) => m,
-        Err(e) => {
-            error!(error = %e, "completion.llm_failed");
-            return Err(AppError::BadGateway(format!("{e:#}")));
-        }
-    };
-
-    Ok(Json(AgentResponse {
-        user_prompt,
-        model_response: md,
-        intent: "unknown".into(),
-    }))
-}
-
 // ──── /report ───
 
-/// HTML report handler (legacy monolith path).
+/// HTML report handler: runs the four-stage `/report` pipeline (fetcher → analyst → composer →
+/// renderer) and returns the renderer's self-contained HTML report, wrapped in a `falcon-report`
+/// fenced block.
 ///
-/// Drives the `report_system` prompt through the monolith tool-loop, producing a
-/// self-contained HTML report wrapped in a `falcon-report` fenced block. The
-/// output ceiling is raised to `REPORT_MAX_TOKENS` to fit a full document.
+/// The economy over the old monolith: the `composer` emits only the small structured
+/// [`ReportData`](crate::agent::report::ReportData) via its `emit_report` sink, and the pure-logic
+/// renderer injects it into the boot-loaded template — **no LLM ever writes HTML**, so the report
+/// is faster, cheaper, and design-stable per turn.
+///
+/// Drives the pipeline directly (no runtime turn), like [`insight`].
 pub async fn report(
     State(state): State<AppState>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<AgentResponse>, AppError> {
     let Json(req) = req?;
 
-    // Prepare logging
     let span = tracing::info_span!(
         "report",
         prompt_len = req.prompt.chars().count(),
         history_len = req.history.len(),
     );
-    let base_system = state.prompts.report_system.clone();
-    completion_inner(state, req, base_system, Some(REPORT_MAX_TOKENS))
-        .instrument(span)
-        .await
+    async move {
+        validate_prompt(&req.prompt)?;
+        let user_prompt = req.prompt.clone();
+
+        // Assemble the pipeline buffered (no sink) and thread the payload through it.
+        let resolved = state.llm.resolved();
+        let orchestrator = build_report_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.insight_grants.fetcher,
+            &resolved,
+            state.report_template.clone(),
+            None,
+        )
+        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+
+        let outcome = orchestrator
+            .run(&report_pipeline_id(), insight_initial(req))
+            .await
+            .map_err(insight_error_to_app_error)?;
+
+        Ok(Json(AgentResponse {
+            user_prompt,
+            model_response: final_answer(outcome)?,
+            intent: "unknown".into(),
+        }))
+    }
+    .instrument(span)
+    .await
 }
 
 // ──── /report/stream ───
 
 /// Server-Sent Events variant of [`report`].
 ///
-/// Same `data:`-JSON-envelope wire contract as [`insight_stream`]; the `falcon-report` HTML block
-/// streams token-by-token like any other answer.
+/// Same wire contract as [`insight_stream`] — `stage` frames (progress dots) plus a terminal
+/// `clear` + full-answer `token` + `done`. The `composer` emits a tool call rather than streamable
+/// prose, so the live signal is the per-stage progress; the finished HTML arrives on the terminal
+/// frame.
 pub async fn report_stream(
     State(state): State<AppState>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+) -> Result<Response, AppError> {
     let Json(req) = req?;
 
-    // Prepare logging
     let span = tracing::info_span!(
         "report-stream",
         prompt_len = req.prompt.chars().count(),
@@ -246,27 +235,52 @@ pub async fn report_stream(
     );
     let _enter = span.enter();
 
-    // Prepare configuration
-    let cfg = prepare_config(
-        &state,
-        req,
-        &state.prompts.report_system,
-        Some(REPORT_MAX_TOKENS),
-    )?;
+    validate_prompt(&req.prompt)?;
 
-    // Build SSE stream
-    let sse_stream: BoxStream<'static, Result<Event, Infallible>> =
-        llm_connector::agent_stream(cfg, state.tools.clone(), state.mcp.clone())
-            .filter_map(|ev| async move {
-                let frame = stream_frame_from_llm_event(ev)?;
-                let event = Event::default()
-                    .json_data(&frame)
-                    .expect("unexpected error: StreamFrame is always valid JSON");
-                Some(Ok::<_, Infallible>(event))
-            })
-            .boxed();
+    // One shared per-turn sink drives the stream (plan §8.5, mechanism A): the streaming LLM stages
+    // emit content deltas onto it, and the orchestrator emits stage transitions.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
 
-    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE)))
+    let resolved = state.llm.resolved();
+    let orchestrator = build_report_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.insight_grants.fetcher,
+        &resolved,
+        state.report_template.clone(),
+        Some(sink.clone()),
+    )
+    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+
+    let initial = insight_initial(req);
+    // The task owns the orchestrator + sink, so when the run finishes every sink clone drops and
+    // the channel closes — the drain loop below ends naturally on close.
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&report_pipeline_id(), initial, &*sink)
+            .await
+    });
+
+    let sse_stream = async_stream::stream! {
+        while let Some(event) = rx.recv().await {
+            for frame in insight_frames(event) {
+                yield Ok::<_, Infallible>(sse_event(frame));
+            }
+        }
+        // Channel closed → the run finished. A stage failure already surfaced as an `error` frame
+        // during draining; only a task panic needs a fallback terminal frame here.
+        if let Err(join) = run.await {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
+                data: format!("report task failed: {join}"),
+            }));
+        }
+    };
+
+    Ok(Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response())
 }
 
 // ──── /insight/stream ───
@@ -358,33 +372,6 @@ fn sse_event(frame: StreamFrame) -> Event {
 
 // ──── shared prelude ───
 
-/// Prepare a [`GenerationConfig`] from the request.
-///
-/// Validate the request and assemble a [`GenerationConfig`] for the MCP
-/// tool-calling loop. `base_system` selects which system prompt drives the
-/// loop; `max_tokens_override` (when `Some`) raises the output ceiling above
-/// [`LlmDefaults`] for the report path.
-///
-/// Shared by the legacy monolith `/report` and `/report/stream` paths. (The analytics endpoints
-/// are now `/insight` + `/insight/stream`, which drive the sub-agent pipeline instead.)
-///
-/// [`LlmDefaults`]: crate::appstate::LlmDefaults
-fn prepare_config(
-    state: &AppState,
-    req: AgentRequest,
-    base_system: &str,
-    max_tokens_override: Option<u32>,
-) -> Result<GenerationConfig, AppError> {
-    validate_prompt(&req.prompt)?;
-
-    // build config
-    let mut cfg = state.generation_config(base_system, req.prompt, req.history);
-    if let Some(max_tokens) = max_tokens_override {
-        cfg.max_tokens = max_tokens;
-    }
-    Ok(cfg)
-}
-
 /// Validate the current prompt contract.
 fn validate_prompt(prompt: &str) -> Result<(), AppError> {
     let trimmed = prompt.trim();
@@ -399,19 +386,6 @@ fn validate_prompt(prompt: &str) -> Result<(), AppError> {
     }
 
     Ok(())
-}
-
-/// Map internal LLM stream events to the stable external SSE frame contract.
-fn stream_frame_from_llm_event(ev: llm_connector::LlmEvent) -> Option<StreamFrame> {
-    match ev {
-        llm_connector::LlmEvent::Token(t) => Some(StreamFrame::Token { data: t }),
-        llm_connector::LlmEvent::Done => Some(StreamFrame::Done),
-        llm_connector::LlmEvent::Error(e) => Some(StreamFrame::Error { data: e }),
-        llm_connector::LlmEvent::Clear => Some(StreamFrame::Clear),
-        llm_connector::LlmEvent::ToolCalled { .. } | llm_connector::LlmEvent::ToolResult { .. } => {
-            None
-        }
-    }
 }
 
 // ──── /insight shared helpers ───
@@ -539,35 +513,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
-    }
-
-    #[test]
-    fn stream_mapping_preserves_external_sse_events() {
-        assert_eq!(
-            stream_frame_from_llm_event(llm_connector::LlmEvent::Token("hi".into())),
-            Some(StreamFrame::Token { data: "hi".into() })
-        );
-        assert_eq!(
-            stream_frame_from_llm_event(llm_connector::LlmEvent::Error("boom".into())),
-            Some(StreamFrame::Error {
-                data: "boom".into()
-            })
-        );
-        assert_eq!(
-            stream_frame_from_llm_event(llm_connector::LlmEvent::Clear),
-            Some(StreamFrame::Clear)
-        );
-        assert_eq!(
-            stream_frame_from_llm_event(llm_connector::LlmEvent::Done),
-            Some(StreamFrame::Done)
-        );
-        assert_eq!(
-            stream_frame_from_llm_event(llm_connector::LlmEvent::ToolCalled {
-                name: "tool".into(),
-                args_hash: "hash".into()
-            }),
-            None
-        );
     }
 
     #[test]

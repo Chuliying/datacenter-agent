@@ -70,6 +70,34 @@ fn load_prompt(root: &Path, id: &str, prompt_ref: &PromptRef) -> Result<String> 
     Ok(body)
 }
 
+/// Resolve and read the `/report` HTML template body referenced by the manifest.
+///
+/// Resolves `[report].template` (or [`default_report_template`] when the section is absent) against
+/// `root`, and reads it. Placeholder validation is deferred to boot ([`AppState::new`]) so the
+/// config layer stays free of pipeline internals.
+///
+/// # Errors
+///
+/// Returns `Err` if the file cannot be read, or if its body is empty.
+///
+/// [`AppState::new`]: crate::appstate::AppState::new
+fn load_report_template(root: &Path, report: Option<&ReportManifest>) -> Result<String> {
+    let rel = report
+        .map(|r| r.template.clone())
+        .unwrap_or_else(default_report_template);
+    let file = resolve_relative(root, &rel);
+    let body = std::fs::read_to_string(&file)
+        .with_context(|| format!("read report template from {}", file.display()))?;
+    if body.trim().is_empty() {
+        return Err(anyhow!(
+            "report template at {} is empty — refusing to ship an empty report template",
+            file.display()
+        ));
+    }
+    debug!(path = %file.display(), bytes = body.len(), "app config: report template loaded");
+    Ok(body)
+}
+
 /// Join `p` to `root` if relative, pass through if already absolute.
 fn resolve_relative(root: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -100,6 +128,24 @@ struct Manifest {
     /// Optional `/insight` pipeline tool grants (defaults applied when absent).
     #[serde(default)]
     insight: Option<InsightManifest>,
+    /// Optional `/report` pipeline assets (the HTML template; default path applied when absent).
+    #[serde(default)]
+    report: Option<ReportManifest>,
+}
+
+/// Optional `[report]` section: assets for the `/report` HTML pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportManifest {
+    /// Path to the HTML report template the `renderer` fills (relative to the manifest's parent
+    /// directory, or absolute). Must contain the `__REPORT_DATA_JSON__` placeholder.
+    #[serde(default = "default_report_template")]
+    template: PathBuf,
+}
+
+/// The default report template path, used when `[report]` (or its `template`) is omitted.
+fn default_report_template() -> PathBuf {
+    PathBuf::from("report_template/report.html")
 }
 
 /// Optional `[insight]` section: per-sub-agent tool grants for the `/insight` pipeline.
@@ -260,6 +306,9 @@ pub struct AppConfig {
     pub runtime: Option<RuntimeRefs>,
     /// Resolved `/insight` pipeline tool grants (defaults when `[insight]` is absent).
     pub insight_grants: InsightGrants,
+    /// The `/report` HTML template body, read at load from `[report].template` (or its default
+    /// path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
+    pub report_template: String,
 }
 
 /// Resolved `/insight` pipeline tool grants — which tools each sub-agent exposes to its LLM.
@@ -407,6 +456,8 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        let report_template = load_report_template(&root, manifest.report.as_ref())?;
+
         // Log the loaded config
         info!(
             root = %root.display(),
@@ -419,6 +470,7 @@ impl AppConfig {
             prompts,
             runtime,
             insight_grants,
+            report_template,
         })
     }
 
@@ -496,6 +548,15 @@ mod tests {
             ]
         );
         assert_eq!(cfg.insight_grants.charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn config_loads_the_report_template_with_the_data_placeholder() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        // The template body is read eagerly and carries the one placeholder the renderer fills.
+        assert!(cfg.report_template.contains("__REPORT_DATA_JSON__"));
+        // The design tokens are baked in (no leftover token placeholder).
+        assert!(!cfg.report_template.contains("__REPORT_TOKENS__"));
     }
 
     #[test]

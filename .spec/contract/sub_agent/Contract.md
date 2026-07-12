@@ -62,7 +62,10 @@ A sub-agent is obtained **two ways, both the same abstract `SubAgent`**:
   *any* component may be absent. This covers behaviours a prompt cannot express: a **Logic-only**
   agent (a session-memory keeper that queries a store and emits a memory artifact — no LLM, no
   tools), a trivial fixed responder (a hello-world agent), or any agent needing bespoke control
-  flow.
+  flow. Both endpoint pipelines end in such a stage: `/insight`'s `Finalizer` concatenates the
+  analyst's report with the charter's charts, and `/report`'s `Renderer` injects the composer's
+  `report.data` into a boot-loaded HTML template — each deterministic, each with an empty grant that
+  makes the isolation guarantee concrete (it can neither fetch nor invent).
 
 The **`SubAgent` trait is the unification**: config-defined and code-defined agents are both
 `Arc<dyn SubAgent>`, and the `Orchestrator`/pipeline holds and threads them identically — it

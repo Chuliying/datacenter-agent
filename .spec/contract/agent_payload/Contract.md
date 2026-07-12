@@ -84,8 +84,11 @@ Every variant additionally carries a **turn timestamp** `now: DateTime<FixedOffs
   `Display` / `FromStr` (split on the *first* dot) and a `serde(into/try_from = "String")`
   transparent representation. **This trades the earlier compile-time-enum guarantee** — a
   mistyped key is now a *runtime* key, not a compile error — for an open key space; the named
-  constructors (`fetcher_records()`, `charts_spec()`, `message(agent)`) keep the well-known
-  wires in one place so a typo has a single blast radius.
+  constructors (`fetcher_records()`, `charts_spec()`, `report_data()`, `message(agent)`) keep the
+  well-known wires in one place so a typo has a single blast radius. `report.data` is the newest
+  such wire: a serialized `ReportData` from `/report`'s `emit_report` sink, the single artifact the
+  pure-logic `renderer` injects into its HTML template — one more producer-namespaced key, no schema
+  change needed for the open space to absorb it.
 - **The turn timestamp `now`** — a `DateTime<FixedOffset>` stamped **once at the boundary** and
   threaded through every stage unchanged. It is *data*, not an ambient read: this is what makes
   a run reproducible (a fixture can pin it for byte-identical replay), observable (it shows up in
