@@ -155,6 +155,8 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
         max_tokens: 2048,
         api_key: Some(api_key),
         reasoning_effort: None,
+        app_url: None,
+        app_title: None,
     };
     // Buffered LLM for the tool-using stages; streaming LLM for the analyst so its report streams.
     let buffered: Arc<dyn LlmCapability> =

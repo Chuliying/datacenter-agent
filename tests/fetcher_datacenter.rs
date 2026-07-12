@@ -112,6 +112,8 @@ async fn fetcher_fetches_real_data_from_the_datacenter() {
         max_tokens: 2048,
         api_key: Some(api_key),
         reasoning_effort: None,
+        app_url: None,
+        app_title: None,
     };
     let llm: Arc<dyn LlmCapability> =
         Arc::new(OpenAiLlm::from_resolved(&resolved).expect("build OpenAiLlm"));

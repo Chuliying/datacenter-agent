@@ -240,12 +240,41 @@ fn extract_tool_calls(calls: Vec<ChatCompletionMessageToolCalls>) -> Vec<ToolCal
 /// Returns `Err` if the underlying HTTP client cannot be built.
 fn build_client(resolved: &ResolvedLlm) -> Result<Client<OpenAIConfig>> {
     let http = reqwest::Client::builder()
+        .default_headers(attribution_headers(resolved)?)
         .build()
         .context("build OpenAiLlm http client")?;
     let cfg = OpenAIConfig::new()
         .with_api_base(&resolved.base_url)
         .with_api_key(resolved.api_key.clone().unwrap_or_default());
     Ok(Client::with_config(cfg).with_http_client(http))
+}
+
+/// The OpenRouter app-attribution headers (`HTTP-Referer` / `X-Title`), baked in as reqwest default
+/// headers when present.
+///
+/// Without these, OpenRouter shows the sub-agent's requests as "Unknown" on its dashboard. Parity
+/// with the legacy [`llm_connector`](crate::llm_connector) client, which sets the same headers.
+///
+/// # Errors
+///
+/// Returns `Err` if a configured app URL or title is not a valid HTTP header value.
+fn attribution_headers(resolved: &ResolvedLlm) -> Result<reqwest::header::HeaderMap> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    if let Some(url) = &resolved.app_url {
+        headers.insert(
+            HeaderName::from_static("http-referer"),
+            HeaderValue::from_str(url).context("invalid OPENROUTER_APP_URL header value")?,
+        );
+    }
+    if let Some(title) = &resolved.app_title {
+        headers.insert(
+            HeaderName::from_static("x-title"),
+            HeaderValue::from_str(title).context("invalid OPENROUTER_APP_TITLE header value")?,
+        );
+    }
+    Ok(headers)
 }
 
 /// Assembles one chat-completion request from abstract messages and tool schemas.
@@ -640,6 +669,8 @@ mod tests {
             max_tokens: 256,
             api_key: Some("sk-test".into()),
             reasoning_effort: None,
+            app_url: None,
+            app_title: None,
         }
     }
 
@@ -674,6 +705,22 @@ mod tests {
             to_request_message(m).expect("every message variant translates");
         }
         assert_eq!(to_request_tools(&[]).len(), 0);
+    }
+
+    #[test]
+    fn attribution_headers_carry_openrouter_app_info_when_present() {
+        // With app info: the OpenRouter attribution headers are set, so requests aren't "Unknown".
+        let attributed = ResolvedLlm {
+            app_url: Some("https://eomc.example".into()),
+            app_title: Some("EOMC Agent".into()),
+            ..resolved()
+        };
+        let headers = attribution_headers(&attributed).unwrap();
+        assert_eq!(headers.get("http-referer").unwrap(), "https://eomc.example");
+        assert_eq!(headers.get("x-title").unwrap(), "EOMC Agent");
+
+        // Without app info: no headers (nothing to attribute) and no error.
+        assert!(attribution_headers(&resolved()).unwrap().is_empty());
     }
 
     #[test]

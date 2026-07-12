@@ -310,6 +310,11 @@ pub struct ResolvedLlm {
     /// [`ReasoningEffort::Minimal`] for mechanical stages so they don't burn the output budget on
     /// reasoning the task doesn't need (see [`with_reasoning_effort`](Self::with_reasoning_effort)).
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// OpenRouter app-attribution URL (`HTTP-Referer` header), or `None`. Without it, requests show
+    /// as "Unknown" on the OpenRouter dashboard.
+    pub app_url: Option<String>,
+    /// OpenRouter app-attribution title (`X-Title` header), or `None`.
+    pub app_title: Option<String>,
 }
 
 impl ResolvedLlm {
@@ -413,6 +418,10 @@ pub fn resolve_llm(
         max_tokens: over.params.max_tokens.unwrap_or(default.max_tokens),
         api_key,
         reasoning_effort: None, // provider default; lowered per mechanical stage in `wiring`
+        // The TOML sub-agent config path carries no app attribution; the live pipelines build
+        // their `ResolvedLlm` from `LlmDefaults::resolved`, which does.
+        app_url: None,
+        app_title: None,
     })
 }
 
@@ -494,6 +503,8 @@ mod tests {
             max_tokens: 1024,
             api_key: Some("default-key".into()),
             reasoning_effort: None,
+            app_url: None,
+            app_title: None,
         }
     }
 

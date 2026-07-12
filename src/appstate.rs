@@ -94,6 +94,9 @@ impl LlmDefaults {
             max_tokens: self.max_tokens,
             api_key: Some(self.api_key.clone()),
             reasoning_effort: None, // provider default; mechanical stages are lowered in `wiring`
+            // Carry the OpenRouter app attribution so sub-agent calls aren't shown as "Unknown".
+            app_url: self.app_url.clone(),
+            app_title: self.app_title.clone(),
         }
     }
 }

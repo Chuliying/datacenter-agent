@@ -156,6 +156,8 @@ async fn terminal_stage_streams_its_answer_from_the_datacenter() {
         max_tokens: 2048,
         api_key: Some(api_key),
         reasoning_effort: None,
+        app_url: None,
+        app_title: None,
     };
     let llm: Arc<dyn LlmCapability> = Arc::new(
         StreamingOpenAiLlm::from_resolved(&resolved, sink.clone()).expect("build StreamingOpenAiLlm"),
