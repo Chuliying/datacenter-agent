@@ -276,13 +276,9 @@ impl AuditSink for TracingAuditSink {
                 ok,
                 "audit.tool_result"
             ),
-            AuditEvent::AnswerCleared => info!(
-                request_id,
-                route,
-                seq,
-                session_id,
-                "audit.answer_cleared"
-            ),
+            AuditEvent::AnswerCleared => {
+                info!(request_id, route, seq, session_id, "audit.answer_cleared")
+            }
             AuditEvent::ResponseCompleted {
                 response_hash,
                 response_chars,

@@ -219,8 +219,7 @@ pub fn render_report(report: &str, charts: &[serde_json::Value]) -> String {
     charts
         .iter()
         .fold(report.trim_end().to_string(), |mut acc, chart| {
-            let block =
-                serde_json::to_string_pretty(chart).unwrap_or_else(|_| chart.to_string());
+            let block = serde_json::to_string_pretty(chart).unwrap_or_else(|_| chart.to_string());
             acc.push_str("\n\n```falcon-chart\n");
             acc.push_str(&block);
             acc.push_str("\n```");
@@ -314,7 +313,7 @@ impl SubAgent for Finalizer {
         Ok(AgentPayload::Final(FinalResult {
             user: data.prompt,
             assistant: render_report(&report, &charts),
-            now: data.now,          // carry the turn's timestamp onto the terminal result
+            now: data.now, // carry the turn's timestamp onto the terminal result
             artifacts: data.artifacts, // full provenance rides along on the result
         }))
     }
@@ -423,7 +422,7 @@ impl SubAgent for Renderer {
         Ok(AgentPayload::Final(FinalResult {
             user: data.prompt,
             assistant: render_report_html(&self.template, &report_json),
-            now: data.now,             // carry the turn's timestamp onto the terminal result
+            now: data.now, // carry the turn's timestamp onto the terminal result
             artifacts: data.artifacts, // full provenance rides along on the result
         }))
     }
@@ -485,9 +484,11 @@ mod tests {
             ArtifactKey::fetcher_records()
         }
         async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
-            Ok(ToolOutcome::Produced(ArtifactValue::Json(serde_json::json!({
-                "months": [{ "month": "2026-05", "revenue": 120 }, { "month": "2026-06", "revenue": 180 }]
-            }))))
+            Ok(ToolOutcome::Produced(ArtifactValue::Json(
+                serde_json::json!({
+                    "months": [{ "month": "2026-05", "revenue": 120 }, { "month": "2026-06", "revenue": 180 }]
+                }),
+            )))
         }
     }
 
@@ -550,7 +551,9 @@ mod tests {
             AgentPayload::Intermediate(d) => {
                 assert_eq!(
                     d.artifacts.get(&ArtifactKey::message("analyst")),
-                    Some(&ArtifactValue::Text("## 營收分析\n5月 120，6月 180，月增 50%。".into()))
+                    Some(&ArtifactValue::Text(
+                        "## 營收分析\n5月 120，6月 180，月增 50%。".into()
+                    ))
                 );
                 // the fetcher's data is still present for the charter downstream (append-only)
                 assert!(d.artifacts.contains_key(&ArtifactKey::fetcher_records()));
@@ -565,7 +568,10 @@ mod tests {
     async fn charter_emits_a_validated_charts_spec_and_carries_the_report_forward() {
         let charter = ConfiguredAgent::new(
             &charter_config(),
-            ScriptedLlm::arc(vec![call("emit_chart", chart_args()), message("已產生圖表")]),
+            ScriptedLlm::arc(vec![
+                call("emit_chart", chart_args()),
+                message("已產生圖表"),
+            ]),
             vec![Box::new(emit_chart_tool())],
             OutputShape::Intermediate,
         );
@@ -604,7 +610,8 @@ mod tests {
     async fn charter_rejects_a_malformed_chart_then_produces_on_retry() {
         // The first call is a bad chart type; the SchemaTool rejects it (fed back), the model
         // corrects, and the second call produces charts.spec — "loop until valid" for free.
-        let bad = serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
+        let bad =
+            serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
         let charter = ConfiguredAgent::new(
             &charter_config(),
             ScriptedLlm::arc(vec![
@@ -857,7 +864,10 @@ mod tests {
         );
         let charter = ConfiguredAgent::new(
             &charter_config(),
-            ScriptedLlm::arc(vec![call("emit_chart", chart_args()), message("已產生圖表")]),
+            ScriptedLlm::arc(vec![
+                call("emit_chart", chart_args()),
+                message("已產生圖表"),
+            ]),
             vec![Box::new(emit_chart_tool())],
             OutputShape::Intermediate,
         );

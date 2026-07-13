@@ -264,6 +264,9 @@ mod tests {
             rx.try_recv().unwrap(),
             AgentEvent::ContentDelta { text: "a".into() }
         );
-        assert!(rx.try_recv().is_err(), "second event must have been dropped");
+        assert!(
+            rx.try_recv().is_err(),
+            "second event must have been dropped"
+        );
     }
 }

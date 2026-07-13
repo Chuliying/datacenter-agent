@@ -76,8 +76,7 @@ impl SystemClock {
 impl Default for SystemClock {
     fn default() -> Self {
         Self::new(
-            FixedOffset::east_opt(TAIPEI_OFFSET_SECONDS)
-                .expect("+08:00 is a valid fixed offset"),
+            FixedOffset::east_opt(TAIPEI_OFFSET_SECONDS).expect("+08:00 is a valid fixed offset"),
         )
     }
 }
@@ -148,6 +147,9 @@ mod tests {
     fn system_clock_presents_utc_in_its_fixed_offset() {
         // Default is +08:00 regardless of the host TZ — the near-midnight correctness guarantee.
         let clock = SystemClock::default();
-        assert_eq!(clock.now().offset().local_minus_utc(), TAIPEI_OFFSET_SECONDS);
+        assert_eq!(
+            clock.now().offset().local_minus_utc(),
+            TAIPEI_OFFSET_SECONDS
+        );
     }
 }

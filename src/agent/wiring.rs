@@ -194,8 +194,8 @@ pub fn build_insight_pipeline(
             SubAgentId("finalizer".into()),
         ],
     };
-    let stages =
-        resolve_pipeline(&pipeline, &agents).map_err(|e| anyhow!("resolve insight pipeline: {e}"))?;
+    let stages = resolve_pipeline(&pipeline, &agents)
+        .map_err(|e| anyhow!("resolve insight pipeline: {e}"))?;
 
     let mut orchestrator = Orchestrator::new();
     orchestrator.insert(pipeline.id, stages);
@@ -266,7 +266,7 @@ pub fn build_report_pipeline(
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &report_analyst_config(),
-        llm, // the analyst genuinely reasons — keep the default budget
+        llm,    // the analyst genuinely reasons — keep the default budget
         vec![], // the analyst only reasons over provided material
         OutputShape::Intermediate,
     ));
@@ -296,8 +296,8 @@ pub fn build_report_pipeline(
             SubAgentId("renderer".into()),
         ],
     };
-    let stages =
-        resolve_pipeline(&pipeline, &agents).map_err(|e| anyhow!("resolve report pipeline: {e}"))?;
+    let stages = resolve_pipeline(&pipeline, &agents)
+        .map_err(|e| anyhow!("resolve report pipeline: {e}"))?;
 
     let mut orchestrator = Orchestrator::new();
     orchestrator.insert(pipeline.id, stages);
@@ -376,7 +376,7 @@ pub fn build_greeting_pipeline(
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
         &analyst_cfg,
-        llm, // the greeting writer reasons over the snapshot — keep the default budget
+        llm,    // the greeting writer reasons over the snapshot — keep the default budget
         vec![], // the analyst writes from provided material; no tools
         OutputShape::Final,
     ));
@@ -454,10 +454,7 @@ fn build_stage_tools(
     mcp: &McpHandle,
     discovered: &[ChatCompletionTool],
 ) -> Result<Vec<Box<dyn Tool>>> {
-    let advertised: Vec<String> = discovered
-        .iter()
-        .map(|t| t.function.name.clone())
-        .collect();
+    let advertised: Vec<String> = discovered.iter().map(|t| t.function.name.clone()).collect();
     expand_grant(grant, &advertised)
         .iter()
         .map(|name| build_tool(stage, name, mcp, discovered))
@@ -495,11 +492,11 @@ fn build_tool(
     let (description, parameters) = tool_schema(discovered, name)?;
     Ok(Box::new(McpTool::from_name(
         mcp.clone(),
-        name,                              // advertised, LLM-facing name
-        name,                              // raw MCP wire name (coincide for the datacenter)
+        name, // advertised, LLM-facing name
+        name, // raw MCP wire name (coincide for the datacenter)
         description,
         parameters,
-        ArtifactKey::new(stage, name),     // a distinct slot per tool: `{stage}.{name}`
+        ArtifactKey::new(stage, name), // a distinct slot per tool: `{stage}.{name}`
     )))
 }
 
@@ -574,10 +571,7 @@ mod tests {
         );
         // "*" plus an overlapping explicit name de-duplicates in first-seen order.
         assert_eq!(
-            expand_grant(
-                &["*".to_string(), "bill_revenue".to_string()],
-                &advertised
-            ),
+            expand_grant(&["*".to_string(), "bill_revenue".to_string()], &advertised),
             vec!["bill_revenue".to_string(), "member_analysis".to_string()]
         );
     }

@@ -43,7 +43,8 @@ use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline};
 use crate::runtime::audit::{hash_identifier, AuditCtx, AuditEvent, AuditWriter};
 use crate::runtime::schema::{AgentTurnFrame, AgentTurnInput, NormalizedInput};
 use crate::runtime::turn::{
-    append_memory_turn_if_enabled, plan_stream_turn, AgentPort, AgentTurnDeps, StreamPlan, TurnEvent,
+    append_memory_turn_if_enabled, plan_stream_turn, AgentPort, AgentTurnDeps, StreamPlan,
+    TurnEvent,
 };
 
 /// Upper bound on the user prompt, in UTF-8 characters.
@@ -411,9 +412,8 @@ impl AgentPort for UnusedAgentPort {
     async fn stream_turn(
         &self,
         _input: AgentTurnInput,
-    ) -> crate::runtime::error::RuntimeResult<
-        futures::stream::BoxStream<'static, AgentTurnFrame>,
-    > {
+    ) -> crate::runtime::error::RuntimeResult<futures::stream::BoxStream<'static, AgentTurnFrame>>
+    {
         Ok(futures::stream::empty().boxed())
     }
 }
@@ -987,7 +987,10 @@ mod tests {
     #[test]
     fn wants_report_pipeline_on_top_intent_or_candidate_only() {
         // Report as the resolved top intent.
-        assert!(wants_report_pipeline(&normalized_with("report", &["report"])));
+        assert!(wants_report_pipeline(&normalized_with(
+            "report",
+            &["report"]
+        )));
         // Report merely mentioned (a candidate) while a topic won the top slot —
         // e.g. `營收報告`: revenue is top, report co-occurs.
         assert!(wants_report_pipeline(&normalized_with(

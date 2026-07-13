@@ -45,10 +45,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datacenter_agent::agent::clock::{Clock, SystemClock};
 use datacenter_agent::agent::config::{
     OutputShape, PipelineConfig, PipelineId, Provider, ResolvedLlm, SubAgentConfig, SubAgentId,
 };
-use datacenter_agent::agent::clock::{Clock, SystemClock};
 use datacenter_agent::agent::engine::{resolve_pipeline, ConfiguredAgent, Orchestrator, SubAgent};
 use datacenter_agent::agent::events::{AgentEvent, ChannelSink, EventSink};
 use datacenter_agent::agent::llm::StreamingOpenAiLlm;
@@ -90,7 +90,9 @@ fn summarize(ev: &AgentEvent) -> String {
             completion,
             reasoning,
             total,
-        } => format!("[usage] prompt={prompt} completion={completion} reasoning={reasoning:?} total={total}"),
+        } => format!(
+            "[usage] prompt={prompt} completion={completion} reasoning={reasoning:?} total={total}"
+        ),
         AgentEvent::ReasoningDelta { text } => format!("[reasoning] {text}"),
         AgentEvent::ContentDelta { text } => format!("[content] {text}"),
         AgentEvent::Finished { assistant } => {
@@ -160,7 +162,8 @@ async fn terminal_stage_streams_its_answer_from_the_datacenter() {
         app_title: None,
     };
     let llm: Arc<dyn LlmCapability> = Arc::new(
-        StreamingOpenAiLlm::from_resolved(&resolved, sink.clone()).expect("build StreamingOpenAiLlm"),
+        StreamingOpenAiLlm::from_resolved(&resolved, sink.clone())
+            .expect("build StreamingOpenAiLlm"),
     );
 
     let mcp_tool: Box<dyn Tool> = Box::new(McpTool::new(

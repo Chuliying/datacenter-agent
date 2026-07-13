@@ -39,11 +39,11 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::agent::chart::ChartBatch;
-use crate::agent::report::ReportData;
 use crate::agent::events::{AgentEvent, EventSink};
 use crate::agent::payload::{
     AgentError, ArtifactKey, ArtifactValue, Tool, ToolOutcome, ToolSchema,
 };
+use crate::agent::report::ReportData;
 use crate::mcp_client::McpHandle;
 
 // ===========================================================================
@@ -482,7 +482,14 @@ impl McpTool {
         parameters: serde_json::Value,
         target: ArtifactKey,
     ) -> Self {
-        Self::from_name(handle, id.to_string(), mcp_name, description, parameters, target)
+        Self::from_name(
+            handle,
+            id.to_string(),
+            mcp_name,
+            description,
+            parameters,
+            target,
+        )
     }
 }
 
@@ -717,7 +724,8 @@ mod tests {
         }
 
         // A malformed chart type is a retryable rejection, not a crash.
-        let bad = serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
+        let bad =
+            serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
         assert!(matches!(
             tool.call(bad).await.unwrap(),
             ToolOutcome::Rejected { .. }

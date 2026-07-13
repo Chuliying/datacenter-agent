@@ -709,7 +709,9 @@ mod tests {
         };
         let analyst = ConfiguredAgent::new(
             &cfg,
-            ScriptedLlm::arc(vec![LlmResponse::Message("## Analysis\nRevenue is up.".into())]),
+            ScriptedLlm::arc(vec![LlmResponse::Message(
+                "## Analysis\nRevenue is up.".into(),
+            )]),
             vec![],
             OutputShape::Intermediate,
         );
@@ -891,9 +893,9 @@ mod tests {
         ) -> Result<LlmResponse, AgentError> {
             let response = self.turns.lock().unwrap().remove(0);
             match &response {
-                LlmResponse::Message(text) => self.sink.emit(AgentEvent::ContentDelta {
-                    text: text.clone(),
-                }),
+                LlmResponse::Message(text) => self
+                    .sink
+                    .emit(AgentEvent::ContentDelta { text: text.clone() }),
                 LlmResponse::ToolCalls(calls) => {
                     for c in calls {
                         self.sink.emit(AgentEvent::ToolCallProposed {

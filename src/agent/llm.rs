@@ -312,9 +312,11 @@ fn build_request(
     }
 
     if !tools.is_empty() {
-        builder.tools(to_request_tools(tools)).tool_choice(
-            ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto),
-        );
+        builder
+            .tools(to_request_tools(tools))
+            .tool_choice(ChatCompletionToolChoiceOption::Mode(
+                ToolChoiceOptions::Auto,
+            ));
     }
 
     builder
@@ -727,8 +729,16 @@ mod tests {
     fn build_request_serializes_reasoning_effort_only_when_set() {
         let msgs = [LlmMessage::User("hi".into())];
         // Set ⇒ the provider control reaches the wire, lowercased (`minimal`).
-        let req =
-            build_request("m", 0.2, 0.1, 256, Some(ReasoningEffort::Minimal), &msgs, &[]).unwrap();
+        let req = build_request(
+            "m",
+            0.2,
+            0.1,
+            256,
+            Some(ReasoningEffort::Minimal),
+            &msgs,
+            &[],
+        )
+        .unwrap();
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["reasoning_effort"], "minimal");
 
@@ -823,7 +833,12 @@ mod tests {
         }
     }
 
-    fn tool_frame(index: u32, id: Option<&str>, name: Option<&str>, args: Option<&str>) -> DeltaFrame {
+    fn tool_frame(
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        args: Option<&str>,
+    ) -> DeltaFrame {
         DeltaFrame {
             content: None,
             tool_calls: vec![ToolCallFragment {
@@ -858,7 +873,10 @@ mod tests {
         let sink = CollectingSink::new();
         let mut acc = StreamAccumulator::default();
         // fragment 1: id + name + start of args; fragment 2: rest of args (same index, no id/name).
-        acc.push(tool_frame(0, Some("call_1"), Some("bill_revenue"), Some("{\"year\":")), &sink);
+        acc.push(
+            tool_frame(0, Some("call_1"), Some("bill_revenue"), Some("{\"year\":")),
+            &sink,
+        );
         acc.push(tool_frame(0, None, None, Some("2026}")), &sink);
         let response = acc.finish(&sink);
 
@@ -874,9 +892,18 @@ mod tests {
         assert_eq!(
             sink.events(),
             vec![
-                AgentEvent::ToolArgsDelta { id: "call_1".into(), fragment: "{\"year\":".into() },
-                AgentEvent::ToolArgsDelta { id: "call_1".into(), fragment: "2026}".into() },
-                AgentEvent::ToolCallProposed { id: "call_1".into(), name: "bill_revenue".into() },
+                AgentEvent::ToolArgsDelta {
+                    id: "call_1".into(),
+                    fragment: "{\"year\":".into()
+                },
+                AgentEvent::ToolArgsDelta {
+                    id: "call_1".into(),
+                    fragment: "2026}".into()
+                },
+                AgentEvent::ToolCallProposed {
+                    id: "call_1".into(),
+                    name: "bill_revenue".into()
+                },
             ]
         );
     }

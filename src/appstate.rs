@@ -133,12 +133,8 @@ impl PromptBank {
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
-            greeting_fetcher_system: cfg
-                .get_prompt_by_id("greeting_fetcher_system")?
-                .to_string(),
-            greeting_analyst_system: cfg
-                .get_prompt_by_id("greeting_analyst_system")?
-                .to_string(),
+            greeting_fetcher_system: cfg.get_prompt_by_id("greeting_fetcher_system")?.to_string(),
+            greeting_analyst_system: cfg.get_prompt_by_id("greeting_analyst_system")?.to_string(),
             greeting_user: cfg.get_prompt_by_id("greeting_user")?.to_string(),
         })
     }

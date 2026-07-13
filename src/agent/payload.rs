@@ -154,7 +154,9 @@ impl std::str::FromStr for ArtifactKey {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Split on the *first* dot: the producer namespace cannot contain one, the slot name may.
         match s.split_once('.') {
-            Some((agent, name)) if !agent.is_empty() && !name.is_empty() => Ok(Self::new(agent, name)),
+            Some((agent, name)) if !agent.is_empty() && !name.is_empty() => {
+                Ok(Self::new(agent, name))
+            }
             _ => Err(format!("artifact key must be `agent.name`, got: {s:?}")),
         }
     }
@@ -531,7 +533,10 @@ mod tests {
 
     #[test]
     fn artifact_key_round_trips_through_its_dotted_string() {
-        assert_eq!(ArtifactKey::fetcher_records().to_string(), "fetcher.records");
+        assert_eq!(
+            ArtifactKey::fetcher_records().to_string(),
+            "fetcher.records"
+        );
         assert_eq!(
             "fetcher.records".parse::<ArtifactKey>().unwrap(),
             ArtifactKey::fetcher_records()

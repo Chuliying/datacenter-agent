@@ -52,8 +52,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datacenter_agent::agent::config::{OutputShape, PipelineConfig, Provider, ResolvedLlm, SubAgentId};
 use datacenter_agent::agent::clock::{Clock, SystemClock};
+use datacenter_agent::agent::config::{
+    OutputShape, PipelineConfig, Provider, ResolvedLlm, SubAgentId,
+};
 use datacenter_agent::agent::engine::{resolve_pipeline, ConfiguredAgent, Orchestrator, SubAgent};
 use datacenter_agent::agent::events::{AgentEvent, ChannelSink, EventSink};
 use datacenter_agent::agent::llm::{OpenAiLlm, StreamingOpenAiLlm};
@@ -98,7 +100,9 @@ fn summarize(ev: &AgentEvent) -> String {
             completion,
             reasoning,
             total,
-        } => format!("[usage] prompt={prompt} completion={completion} reasoning={reasoning:?} total={total}"),
+        } => format!(
+            "[usage] prompt={prompt} completion={completion} reasoning={reasoning:?} total={total}"
+        ),
         AgentEvent::ReasoningDelta { text } => format!("[reasoning] {text}"),
         AgentEvent::ContentDelta { text } => format!("[content] {text}"),
         AgentEvent::Finished { assistant } => {
@@ -118,9 +122,8 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
     let model = require_env("OPENROUTER_MODEL");
     let base_url = std::env::var("OPENROUTER_BASE_URL")
         .unwrap_or_else(|_| "https://openrouter.ai/api/v1".into());
-    let prompt = std::env::var("AGENT_PROMPT").unwrap_or_else(|_| {
-        "比較最近兩個月的營收，並用一段話總結趨勢。".into()
-    });
+    let prompt = std::env::var("AGENT_PROMPT")
+        .unwrap_or_else(|_| "比較最近兩個月的營收，並用一段話總結趨勢。".into());
 
     // ── connect to the datacenter MCP server and discover the data tool ──
     let client = McpClient::connect_http(&mcp_url)
@@ -162,7 +165,8 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
     let buffered: Arc<dyn LlmCapability> =
         Arc::new(OpenAiLlm::from_resolved(&resolved).expect("build OpenAiLlm"));
     let streaming: Arc<dyn LlmCapability> = Arc::new(
-        StreamingOpenAiLlm::from_resolved(&resolved, sink.clone()).expect("build StreamingOpenAiLlm"),
+        StreamingOpenAiLlm::from_resolved(&resolved, sink.clone())
+            .expect("build StreamingOpenAiLlm"),
     );
 
     // ── build the four stages ──
@@ -210,7 +214,10 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
         ],
     };
     let mut orch = Orchestrator::new();
-    orch.insert(agent_pipeline_id(), resolve_pipeline(&pipe, &agents).unwrap());
+    orch.insert(
+        agent_pipeline_id(),
+        resolve_pipeline(&pipe, &agents).unwrap(),
+    );
 
     // ── run the pipeline on a task; drain the sink live in this task ──
     let run = tokio::spawn(async move {

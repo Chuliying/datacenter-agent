@@ -160,7 +160,8 @@ mod tests {
 
     #[test]
     fn an_empty_batch_is_valid_and_means_no_chart() {
-        let batch: ChartBatch = serde_json::from_value(serde_json::json!({ "charts": [] })).unwrap();
+        let batch: ChartBatch =
+            serde_json::from_value(serde_json::json!({ "charts": [] })).unwrap();
         assert!(batch.charts.is_empty());
     }
 }
