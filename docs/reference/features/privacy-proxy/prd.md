@@ -1,11 +1,11 @@
 # Privacy Proxy（本地去識別化 / 逆向還原）功能 PRD
 
 **Story ID**：S-PRIVACY-01
-**版本**：v0.1.0
+**版本**：v0.1.1
 **狀態**：Target-state feature source of truth（待建置）
 **對應全域 PRD**：[reference PRD](../../prd.md) FR-015 / NFR-010
 **對應 Spec**：[privacy-proxy spec](./spec.md)
-**Source**：需求來自本頁；技術設計見 [spec](./spec.md)，接縫對照 `src/runtime/orchestrator.rs`、`src/server/handler.rs`、`src/llm_connector/agent.rs`。設計已經獨立 subagent 對照 codebase review（verdict: approve-with-changes，2 critical + 6 major 已併入）
+**Source**：需求來自本頁；技術設計見 [spec](./spec.md)，接縫對照 `src/agent/payload.rs`、`src/agent/wiring.rs`、`src/server/handler.rs`（baseline：PR #5 `feature/subagent-separation` @ `02cdd41`）。設計已經獨立 subagent 對照 codebase review（verdict: approve-with-changes，2 critical + 6 major 已併入）
 
 > 本 PRD 描述**完成後**的功能樣貌並逐項標建置狀態。現況：**尚未實作**，多數項目為 待建置／待決策。狀態標記定義沿用 [全域 PRD §1](../../prd.md)。
 
@@ -14,6 +14,7 @@
 | 版本 | 日期 | 內容 |
 |---|---|---|
 | v0.1.0 | 2026-07-11 | 初版；由模組設計計畫 + 對照 codebase review 收斂為功能 PRD |
+| v0.1.1 | 2026-07-13 | 對齊 PR #5 sub-agent 架構：In-scope 整合方式、FR-P07 出境覆蓋、Source 接縫更新（詳見 spec v0.2.0 §7/§10）；功能需求 FR-P01–P06/P08 不變 |
 
 ## 1. 背景與問題
 
@@ -40,7 +41,7 @@
 **In scope**
 
 - 去識別化模組：純文字 `mask` / `restore`（batch）＋ streaming 還原介面。
-- 以 `AgentPort` decorator 掛入現有 runtime，保護 chat prompt、history、tool I/O。
+- 以 sub-agent 出境邊界 decorator（`PrivacyLlm`/`PrivacyTool` + handler 還原）掛入 PR #5 的 pipeline，保護 chat prompt、tool I/O 與串流輸出（見 spec §7）。
 - 台灣 + 多語（zh-TW / en / ja）PII 偵測；hybrid（規則 + 選配本地 Ollama NER）。
 - 對照表 SQLite 加密持久化、TTL 清理、跨 session／重啟還原。
 - `[runtime.privacy]` config 開關與 fail-closed 語意。
@@ -84,12 +85,12 @@
 
 完成樣貌：`[runtime.privacy].enabled=false` 或缺 section 時完全不建構、不開 DB、不需 key、不連 Ollama，行為與今日逐位元組相同。`detector`（rules|hybrid）、`store`（in-memory|sqlite）、`on_detector_error`（block|rules-only）皆 config。
 
-### FR-P07：出境路徑全覆蓋 — 待建置（含現況漏洞修補）
+### FR-P07：出境路徑全覆蓋 — 待建置
 
-完成樣貌：啟用時，`/agent`、`/agent/stream`、**`/report`、`/report/stream`**、tool args/result、greeting 等所有把文字送雲端的路徑都經遮罩。特別修補現況兩個 fail-open 漏洞：
+完成樣貌：啟用時，所有把文字送雲端 LLM 的路徑都經遮罩。**PR #5 後所有上雲端點（`/insight`、`/report` 及其 `/stream`、`/agent/stream`、boot-time greeting）共用 `src/agent/wiring.rs` 的 pipeline builder**，故在 builder 的 LLM 邊界（`build_stage_llm`）單點注入即全覆蓋（見 spec §7.2）。
 
-- `/report` 兩端點目前**繞過 runtime**（直呼 `llm_connector`），必須另行接線或啟用時先回 503 拒絕。
-- `RUNTIME_ENABLED=false` legacy path 會靜默退回無遮罩路徑；需 boot 不變量：privacy 啟用 + runtime 停用 → 拒絕開機。
+- v0.1.0 標為 critical 的「`/report` 繞過 runtime 直呼 `llm_connector`」在 PR #5 後消失：`/report` 已改走 sub-agent report pipeline，與其他端點同一條 builder。
+- `RUNTIME_ENABLED=false` 時 `/agent/stream` 回 503、caller 落到 direct 端點；因 privacy 注入在 builder 層（與 runtime flag 無關），direct 端點仍受遮罩——原「privacy 啟用 + runtime 停用 → 拒絕開機」不變量放寬為「privacy 啟用時 builder 拿不到 engine 即 fail-closed」。
 
 ### FR-P08：去敏稽核 — 待建置
 
