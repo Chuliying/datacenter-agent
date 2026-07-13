@@ -182,7 +182,7 @@ impl ConfiguredAgent {
     /// Returns the rendered block, one `[key] value` line per artifact in key order.
     fn render_material(artifacts: &HashMap<ArtifactKey, ArtifactValue>) -> String {
         let mut entries: Vec<(&ArtifactKey, &ArtifactValue)> = artifacts.iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b)); // ArtifactKey: Ord (no longer Copy)
+        entries.sort_by_key(|(a, _)| *a); // ArtifactKey: Ord (no longer Copy)
         entries
             .iter()
             .map(|(k, v)| format!("[{k}] {v}\n"))
