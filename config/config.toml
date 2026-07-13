@@ -112,7 +112,9 @@ enabled = true
 backend = "in-memory"
 
 [runtime.audit]
-sink = "stdout"
+# Audit records are emitted as structured `tracing` events (audit.* / INFO,
+# key=value fields) — stderr via the tracing stack, not a stdout JSON stream.
+sink = "tracing"
 failure_policy = "fail-open"
 
 [runtime.guardrails]

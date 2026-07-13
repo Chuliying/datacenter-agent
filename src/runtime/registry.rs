@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::audit::{AuditSink, StdoutAuditSink};
+use super::audit::{AuditSink, TracingAuditSink};
 use super::config::RuntimeConfig;
 use super::error::{RuntimeError, RuntimeResult};
 use super::eval::evaluator::{Evaluator, NoopEvaluator};
@@ -37,7 +37,7 @@ impl Default for BuiltinRegistry {
             answer_policies: BTreeSet::from(["rule"]),
             llm_normalizers: BTreeSet::from(["disabled"]),
             memory_backends: BTreeSet::from(["in-memory"]),
-            audit_sinks: BTreeSet::from(["stdout"]),
+            audit_sinks: BTreeSet::from(["tracing"]),
             guardrails: BTreeSet::from(["injection", "input_guard", "answer_policy"]),
             slot_extractors: BTreeSet::from(["time_range", "metric", "asset", "rank_limit"]),
             evaluators: BTreeSet::from([
@@ -143,7 +143,7 @@ impl BuiltinRegistry {
     /// Build the configured audit sink.
     pub fn build_audit(&self, cfg: &RuntimeConfig) -> RuntimeResult<Arc<dyn AuditSink>> {
         self.require_audit_sink(&cfg.assembly.audit_sink, "runtime.audit")?;
-        Ok(Arc::new(StdoutAuditSink))
+        Ok(Arc::new(TracingAuditSink))
     }
 
     /// Build configured evaluator ids.

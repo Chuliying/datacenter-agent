@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(runtime.llm_normalizer_backend, "disabled");
         assert!(runtime.memory_enabled);
         assert_eq!(runtime.memory_backend, "in-memory");
-        assert_eq!(runtime.audit_sink, "stdout");
+        assert_eq!(runtime.audit_sink, "tracing");
         assert_eq!(runtime.audit_failure_policy, "fail-open");
         assert_eq!(
             runtime.guardrails,
