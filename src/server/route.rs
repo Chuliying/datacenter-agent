@@ -66,6 +66,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/insight/stream", post(handler::insight_stream))
         .route("/report", post(handler::report))
         .route("/report/stream", post(handler::report_stream))
+        .route("/agent/stream", post(handler::agent_stream))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

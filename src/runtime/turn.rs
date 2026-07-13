@@ -511,7 +511,14 @@ async fn apply_memory_context(
     Ok(input)
 }
 
-async fn append_memory_turn_if_enabled(
+/// Append one completed turn to server-side session memory, when a session id is
+/// present and a store is configured. A no-op otherwise.
+///
+/// Exposed to the crate so a host that streams a turn *outside* [`run_agent_turn`]
+/// (e.g. the `/agent/stream` router, which drives the sub-agent pipeline directly
+/// to preserve its stage frames) can persist memory with the exact same shape —
+/// no drift between the two paths.
+pub(crate) async fn append_memory_turn_if_enabled(
     input: &AgentTurnInput,
     sessions: Option<&dyn SessionMemoryStore>,
     normalized: &NormalizedInput,
