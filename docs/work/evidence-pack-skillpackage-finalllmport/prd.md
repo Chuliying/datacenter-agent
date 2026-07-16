@@ -276,7 +276,7 @@ UI: N/A (has_ui=false)，因為本 story 是 Rust 後端型別定義與 compile-
 |----------|------|
 | Target PRD | `docs/reference/prd.md` FR-013 / AC-013 / §3.1 / §3.2 |
 | Plan | `.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md` I09 |
-| Paired Sprint story | `docs/sprints/2026-07-02-sprint-1/eval-evaluator-registry-fix/prd.md` |
+| Paired work item | `docs/work/eval-evaluator-registry-fix/prd.md` |
 
 ---
 
@@ -294,6 +294,6 @@ UI: N/A (has_ui=false)，因為本 story 是 Rust 後端型別定義與 compile-
 ```text
 Gate 1: PASS
 Failed checks: 無
-Evidence: docs/sprints/2026-07-02-sprint-1/evidence-pack-skillpackage-finalllmport/prd.md v1.3.1
+Evidence: docs/work/evidence-pack-skillpackage-finalllmport/prd.md v1.3.1
 Reviewed at: 2026-07-06 11:08 +0800
 ```

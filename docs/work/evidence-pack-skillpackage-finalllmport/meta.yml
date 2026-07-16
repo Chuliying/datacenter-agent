@@ -1,0 +1,17 @@
+slug: evidence-pack-skillpackage-finalllmport
+title: Evidence Pack SkillPackage and FinalLlmPort boundary
+created_at: 2026-07-02T14:30:00+08:00
+updated_at: 2026-07-06T11:47:33+08:00
+status: active
+type: feature
+surface: runtime
+area: evidence
+relocated_from: .agent/artifacts/docs/2026-07-02-evidence-pack-skillpackage-finalllmport/; docs/sprints/2026-07-02-sprint-1/evidence-pack-skillpackage-finalllmport/
+sprint: Sprint 1
+story_id: S-EVIDENCE-01
+version: v1.3.1
+stages:
+  prd: { skill: prd-interview, file: prd.md, status: ready }
+inputs:
+  - .agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md
+  - docs/reference/prd.md
