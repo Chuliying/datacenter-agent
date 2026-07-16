@@ -3,7 +3,7 @@
 **Spec 版本**：v1.3.0
 **對應 Target PRD**：[`../prd.md`](../prd.md) v1.3.0
 **狀態**：Current-state contract  
-**Source**：[`src/server/dto.rs`](../../../src/server/dto.rs)、[`src/server/route.rs`](../../../src/server/route.rs)、[`src/server/handler.rs`](../../../src/server/handler.rs)、[`src/runtime/orchestrator.rs`](../../../src/runtime/orchestrator.rs)、[`src/runtime/config.rs`](../../../src/runtime/config.rs)
+**Source**：[`src/server/dto.rs`](../../../src/server/dto.rs)、[`src/server/route.rs`](../../../src/server/route.rs)、[`src/server/handler.rs`](../../../src/server/handler.rs)、[`src/runtime/turn.rs`](../../../src/runtime/turn.rs)、[`src/runtime/config.rs`](../../../src/runtime/config.rs)
 
 > 本規格只記錄目前程式。未落地的修正與目標設計在 [程式修改計劃](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)。
 

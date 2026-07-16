@@ -13,6 +13,9 @@ rmcp = { version = "0.17", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+# JSON-Schema derivation for `SchemaTool<T>` (tool contract §3): the advertised
+# tool schema and the on-receipt validation both come from one Rust type.
+schemars = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 
 tracing = "0.1"
@@ -20,7 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 anyhow = "1"
 async-trait = "0.1"
-chrono = "0.4"
+# `serde` feature: the payload's per-turn `now` (DateTime<FixedOffset>) is serialized end to end
+# for reproducibility/auditability (agent payload contract, PART A).
+chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 sha2 = "0.10"
 thiserror = "2"
@@ -32,6 +37,7 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "signal",
     "fs",
+    "sync",
 ] }
 async-stream = "0.3"
 

@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>Starcharger 營運報表</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    /* Design tokens — baked in (edit here to retune the brand palette). */
+    :root {
+      --report-color-surface-page: #f4f4f5;
+      --report-color-surface-panel: #ffffff;
+      --report-color-surface-subtle: #fafafa;
+      --report-color-surface-strong: #e4e4e7;
+      --report-color-content-primary: #18181b;
+      --report-color-content-secondary: #52525b;
+      --report-color-content-muted: #71717a;
+      --report-color-content-inverse: #fafafa;
+      --report-color-border-default: #e4e4e7;
+      --report-color-border-strong: #a1a1aa;
+      --report-color-accent-primary: #167bd9;
+      --report-color-accent-soft: #e8f2fc;
+      --report-color-accent-muted: #78afe3;
+      --report-color-status-positive: #15803d;
+      --report-color-status-positive-soft: #dcfce7;
+      --report-color-status-negative: #b91c1c;
+      --report-color-status-negative-soft: #fee2e2;
+      --report-color-status-caution: #0f5fa8;
+      --report-color-status-caution-soft: #e8f2fc;
+      --report-color-chart-neutral: #8ebce8;
+      --report-color-chart-neutral-dark: #167bd9;
+      --report-color-chart-grid: #d7e8f7;
+      --report-font-body: "Noto Sans TC", "PingFang TC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --report-font-data: Saira, "Arial Narrow", "Noto Sans TC", sans-serif;
+      --report-radius-panel: 12px;
+      --report-radius-control: 8px;
+      --report-shadow-panel: 0 1px 2px rgba(24, 24, 27, 0.05);
+      --report-space-page: clamp(16px, 3vw, 36px);
+      --report-space-panel: clamp(16px, 2vw, 24px);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      background: var(--report-color-surface-page);
+      color: var(--report-color-content-primary);
+      font-family: var(--report-font-body);
+      font-synthesis: none;
+    }
+
+    body {
+      min-width: 320px;
+      margin: 0;
+      background: var(--report-color-surface-page);
+      color: var(--report-color-content-primary);
+      padding: var(--report-space-page);
+    }
+
+    button, input, table {
+      font: inherit;
+    }
+
+    .report-shell {
+      width: min(100%, 1280px);
+      margin-inline: auto;
+    }
+
+    .report-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 24px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--report-color-border-default);
+    }
+
+    .report-organization {
+      margin: 0 0 6px;
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .03em;
+    }
+
+    .report-title {
+      margin: 0;
+      font-size: clamp(26px, 3vw, 38px);
+      font-weight: 650;
+      letter-spacing: -.035em;
+      line-height: 1.15;
+    }
+
+    .report-brand {
+      display: inline-block;
+      margin-left: 8px;
+      color: var(--report-color-content-muted);
+      font-size: .48em;
+      font-weight: 500;
+      letter-spacing: 0;
+      vertical-align: middle;
+    }
+
+    .report-meta {
+      min-width: 240px;
+      margin: 0;
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      line-height: 1.65;
+      text-align: right;
+    }
+
+    .report-meta strong {
+      color: var(--report-color-content-primary);
+      font-weight: 600;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .kpi-card,
+    .panel {
+      border: 1px solid var(--report-color-border-default);
+      border-radius: var(--report-radius-panel);
+      background: var(--report-color-surface-panel);
+      box-shadow: var(--report-shadow-panel);
+    }
+
+    .kpi-card {
+      min-width: 0;
+      padding: 16px;
+    }
+
+    .kpi-label {
+      margin: 0 0 10px;
+      color: var(--report-color-content-muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .kpi-value {
+      min-height: 2.2em;
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--report-color-content-primary);
+      font-family: var(--report-font-data);
+      font-size: clamp(20px, 2.1vw, 28px);
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      letter-spacing: -.025em;
+      line-height: 1.1;
+    }
+
+    .kpi-card[data-kind="name"] .kpi-value {
+      font-family: var(--report-font-body);
+      font-size: clamp(17px, 1.5vw, 21px);
+      letter-spacing: -.015em;
+    }
+
+    .kpi-detail {
+      margin: 8px 0 0;
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .kpi-detail[data-tone="positive"] {
+      color: var(--report-color-status-positive);
+    }
+
+    .kpi-detail[data-tone="negative"] {
+      color: var(--report-color-status-negative);
+    }
+
+    .insight-panel {
+      margin-bottom: 20px;
+    }
+
+    .insight-headline {
+      margin: 0 0 12px;
+      color: var(--report-color-content-primary);
+      font-size: clamp(16px, 1.7vw, 20px);
+      font-weight: 650;
+      line-height: 1.45;
+    }
+
+    .insight-body {
+      display: grid;
+      gap: 10px;
+    }
+
+    .insight-body p {
+      margin: 0;
+      color: var(--report-color-content-secondary);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .panel {
+      min-width: 0;
+      padding: var(--report-space-panel);
+    }
+
+    .panel + .panel-full,
+    .panel-full + .panel-full {
+      margin-top: 16px;
+    }
+
+    .panel-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .panel-title {
+      margin: 0;
+      color: var(--report-color-content-primary);
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.4;
+    }
+
+    .panel-context {
+      flex: none;
+      color: var(--report-color-content-muted);
+      font-size: 12px;
+    }
+
+    .chart-frame {
+      position: relative;
+      min-height: 300px;
+    }
+
+    .chart-frame canvas {
+      width: 100%;
+      height: 300px;
+    }
+
+    .chart-fallback {
+      display: grid;
+      min-height: 300px;
+      place-items: center;
+      border-radius: var(--report-radius-control);
+      background: var(--report-color-surface-subtle);
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      text-align: center;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      color: var(--report-color-content-primary);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    caption {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--report-color-border-default);
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      background: var(--report-color-surface-subtle);
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    td[data-align="right"],
+    th[data-align="right"] {
+      text-align: right;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr[data-partial="true"] td {
+      background: var(--report-color-status-caution-soft);
+    }
+
+    .rank-marker {
+      display: inline-grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border: 1px solid var(--report-color-border-default);
+      border-radius: 50%;
+      color: var(--report-color-content-secondary);
+      font-family: var(--report-font-data);
+      font-weight: 600;
+    }
+
+    tr[data-rank="1"] .rank-marker {
+      border-color: var(--report-color-accent-muted);
+      background: var(--report-color-accent-soft);
+      color: var(--report-color-accent-primary);
+    }
+
+    .value-positive {
+      color: var(--report-color-status-positive);
+    }
+
+    .value-negative {
+      color: var(--report-color-status-negative);
+    }
+
+    .data-note {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--report-color-border-default);
+      border-radius: var(--report-radius-control);
+      background: var(--report-color-status-caution-soft);
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .data-note-label {
+      color: var(--report-color-status-caution);
+      font-weight: 650;
+    }
+
+    .report-footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 20px;
+      color: var(--report-color-content-muted);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1080px) {
+      .kpi-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 900px) {
+      .chart-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .chart-frame,
+      .chart-frame canvas {
+        min-height: 280px;
+        height: 280px;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .report-header {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+        gap: 12px;
+      }
+
+      .report-brand {
+        display: block;
+        margin: 6px 0 0;
+        font-size: 14px;
+      }
+
+      .report-meta {
+        min-width: 0;
+        text-align: left;
+      }
+
+      .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .panel-heading {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .table-wrap {
+        overflow: visible;
+      }
+
+      table,
+      tbody,
+      tr,
+      td {
+        display: block;
+        width: 100%;
+      }
+
+      thead {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+
+      tbody {
+        display: grid;
+        gap: 10px;
+      }
+
+      tbody tr {
+        padding: 8px 12px;
+        border: 1px solid var(--report-color-border-default);
+        border-radius: var(--report-radius-control);
+        background: var(--report-color-surface-panel);
+      }
+
+      tbody tr[data-partial="true"] {
+        background: var(--report-color-status-caution-soft);
+      }
+
+      tbody tr[data-partial="true"] td {
+        background: transparent;
+      }
+
+      td,
+      td[data-align="right"] {
+        display: grid;
+        grid-template-columns: minmax(92px, .8fr) minmax(0, 1.2fr);
+        gap: 12px;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--report-color-border-default);
+        text-align: right;
+      }
+
+      td::before {
+        content: attr(data-label);
+        color: var(--report-color-content-muted);
+        font-size: 12px;
+        font-weight: 500;
+        text-align: left;
+      }
+
+      tbody tr td:last-child {
+        border-bottom: 0;
+      }
+
+      .rank-marker {
+        margin-left: auto;
+      }
+
+      .report-footer {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .kpi-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .kpi-value {
+        min-height: auto;
+      }
+
+      .chart-frame,
+      .chart-frame canvas {
+        min-height: 250px;
+        height: 250px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto;
+        transition-duration: .01ms;
+        animation-duration: .01ms;
+        animation-iteration-count: 1;
+      }
+    }
+
+    @media print {
+      @page {
+        size: A4 landscape;
+        margin: 12mm;
+      }
+
+      html,
+      body {
+        background: var(--report-color-surface-panel);
+      }
+
+      body {
+        padding: 0;
+      }
+
+      .report-shell {
+        width: 100%;
+        max-width: none;
+      }
+
+      .kpi-card,
+      .panel {
+        box-shadow: none;
+        break-inside: avoid;
+      }
+
+      .chart-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 40px;
+      }
+
+      .report-footer {
+        break-before: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="report-shell">
+    <header class="report-header">
+      <div>
+        <p class="report-organization" id="report-organization"></p>
+        <h1 class="report-title">
+          <span id="report-title"></span>
+          <span class="report-brand" id="report-brand"></span>
+        </h1>
+      </div>
+      <p class="report-meta">
+        <strong id="report-period"></strong><br>
+        資料截至 <time id="report-as-of"></time>
+      </p>
+    </header>
+
+    <section class="kpi-grid" id="kpi-grid" aria-label="營運摘要"></section>
+
+    <section class="panel panel-full insight-panel" id="insight-panel" aria-labelledby="insight-title" hidden>
+      <div class="panel-heading">
+        <h2 class="panel-title" id="insight-title">營運洞察</h2>
+      </div>
+      <p class="insight-headline" id="insight-headline"></p>
+      <div class="insight-body" id="insight-body"></div>
+    </section>
+
+    <section class="chart-grid" aria-label="營運趨勢">
+      <article class="panel">
+        <div class="panel-heading">
+          <h2 class="panel-title">月營收趨勢</h2>
+          <span class="panel-context">TWD</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="revenue">
+          <canvas id="revenue-chart" role="img" aria-label="每月營收長條圖">每月營收趨勢</canvas>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <h2 class="panel-title">月充電度數與次數</h2>
+          <span class="panel-context">kWh / 次</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="charge">
+          <canvas id="charge-chart" role="img" aria-label="每月充電度數與次數組合圖">每月充電度數與次數</canvas>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <h2 class="panel-title">會員成長</h2>
+          <span class="panel-context">人</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="members">
+          <canvas id="member-chart" role="img" aria-label="每月會員成長組合圖">每月會員成長</canvas>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <h2 class="panel-title">站點與充電樁擴張</h2>
+          <span class="panel-context">站 / 樁</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="infrastructure">
+          <canvas id="infrastructure-chart" role="img" aria-label="每月站點與充電樁數量組合圖">每月站點與充電樁擴張</canvas>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel panel-full" aria-labelledby="station-ranking-title">
+      <div class="panel-heading">
+        <h2 class="panel-title" id="station-ranking-title">站點營收排名</h2>
+        <span class="panel-context" id="station-ranking-period"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>站點營收排名</caption>
+          <thead>
+            <tr>
+              <th scope="col">排名</th>
+              <th scope="col">站點名稱</th>
+              <th scope="col" data-align="right">總營收</th>
+              <th scope="col" data-align="right">充電度數</th>
+              <th scope="col" data-align="right">使用率</th>
+              <th scope="col" data-align="right">每 kW 營收</th>
+            </tr>
+          </thead>
+          <tbody id="station-ranking-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel-full" aria-labelledby="monthly-detail-title">
+      <div class="panel-heading">
+        <h2 class="panel-title" id="monthly-detail-title">逐月營運明細</h2>
+        <span class="panel-context">按月份排序</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <caption>逐月營運明細</caption>
+          <thead>
+            <tr>
+              <th scope="col">月份</th>
+              <th scope="col" data-align="right">營收</th>
+              <th scope="col" data-align="right">MoM</th>
+              <th scope="col" data-align="right">充電度數</th>
+              <th scope="col" data-align="right">充電次數</th>
+              <th scope="col" data-align="right">新增會員</th>
+              <th scope="col" data-align="right">累積會員</th>
+              <th scope="col" data-align="right">活躍會員</th>
+              <th scope="col" data-align="right">站點數</th>
+              <th scope="col" data-align="right">充電樁數</th>
+            </tr>
+          </thead>
+          <tbody id="monthly-detail-body"></tbody>
+        </table>
+      </div>
+      <aside class="data-note" aria-label="資料說明">
+        <span class="data-note-label">資料說明</span>
+        <span id="partial-period-note"></span>
+      </aside>
+    </section>
+
+    <footer class="report-footer">
+      <span id="report-footer-range"></span>
+      <span>由 Starcharger Report Builder 產生</span>
+    </footer>
+  </main>
+
+  <noscript>此報表需要 JavaScript 才能顯示圖表與資料表。</noscript>
+  <script type="application/json" id="report-data">__REPORT_DATA_JSON__</script>
+  <script>
+    (() => {
+      'use strict'
+
+      const dataNode = document.getElementById('report-data')
+      const data = JSON.parse(dataNode.textContent)
+      const locale = data.report.locale || 'zh-TW'
+      const integerFormat = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 })
+      const compactFormat = new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 })
+      const decimalCurrencyFormat = new Intl.NumberFormat(locale, {
+        style: 'decimal',
+        maximumFractionDigits: 0,
+      })
+      const decimalCurrencyDetailFormat = new Intl.NumberFormat(locale, {
+        style: 'decimal',
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      })
+      const currencyLabel = data.report.currency === 'TWD' ? 'NT$' : data.report.currency
+      const formatCurrency = (value) => `${currencyLabel} ${decimalCurrencyFormat.format(value)}`
+      const formatCurrencyDetail = (value) => `${currencyLabel} ${decimalCurrencyDetailFormat.format(value)}`
+
+      const setText = (id, value) => {
+        const element = document.getElementById(id)
+        if (element) element.textContent = String(value)
+      }
+      const token = (path) => getComputedStyle(document.documentElement)
+        .getPropertyValue(`--report-${path}`)
+        .trim()
+      const formatPercent = (value) => `${value > 0 ? '+' : ''}${value.toFixed(1)}%`
+      const comparePercent = (current, previous) => previous === 0 ? 0 : ((current - previous) / previous) * 100
+      const monthLabel = (item) => `${item.period}${item.partial ? ' (部分)' : ''}`
+      const chartMonthLabel = (item) => `${item.period}${item.partial ? ' *' : ''}`
+
+      document.documentElement.lang = locale
+      document.title = `${data.report.organization} ${data.report.title}`
+      setText('report-organization', data.report.organization)
+      setText('report-title', data.report.title)
+      setText('report-brand', data.report.brand)
+      setText('report-period', data.report.periodLabel)
+      setText('report-as-of', data.report.asOf)
+      setText('station-ranking-period', data.summary.topStationPeriodLabel)
+      setText('partial-period-note', data.report.partialPeriodNote)
+      setText('report-footer-range', `${data.report.dateFrom} - ${data.report.dateTo}`)
+      document.getElementById('report-as-of').dateTime = data.report.asOf
+
+      const insight = data.insight || {}
+      const insightParagraphs = Array.isArray(insight.paragraphs) ? insight.paragraphs : []
+      if (insight.headline || insightParagraphs.length) {
+        document.getElementById('insight-panel').hidden = false
+        setText('insight-headline', insight.headline || '')
+        const insightBody = document.getElementById('insight-body')
+        insightParagraphs.forEach((paragraph) => {
+          const p = document.createElement('p')
+          p.textContent = String(paragraph)
+          insightBody.append(p)
+        })
+      }
+
+      const completedIndex = data.periods.findIndex((item) => item.period === data.summary.latestCompletedPeriod)
+      const completed = data.periods[completedIndex]
+      const previousCompleted = data.periods[Math.max(0, completedIndex - 1)]
+      const first = data.periods[0]
+      const latest = data.periods[data.periods.length - 1]
+      const topStation = data.stationRanking[0]
+
+      const kpis = [
+        {
+          label: `${completed.period} 總營收`,
+          value: formatCurrency(completed.revenue),
+          detail: `較上月 ${formatPercent(completed.revenueMom)}`,
+          tone: completed.revenueMom >= 0 ? 'positive' : 'negative',
+        },
+        {
+          label: `${completed.period} 充電度數`,
+          value: `${integerFormat.format(completed.kwh)} kWh`,
+          detail: `較上月 ${formatPercent(comparePercent(completed.kwh, previousCompleted.kwh))}`,
+          tone: completed.kwh >= previousCompleted.kwh ? 'positive' : 'negative',
+        },
+        {
+          label: '累積會員數',
+          value: `${integerFormat.format(latest.totalMembers)} 人`,
+          detail: `${latest.period} 新增 ${integerFormat.format(latest.newMembers)} 人`,
+          tone: 'neutral',
+        },
+        {
+          label: '全網站點 / 充電樁',
+          value: `${integerFormat.format(latest.stations)} 站 / ${integerFormat.format(latest.chargers)} 樁`,
+          detail: `期間增加 ${integerFormat.format(latest.stations - first.stations)} 站 / ${integerFormat.format(latest.chargers - first.chargers)} 樁`,
+          tone: 'neutral',
+        },
+        {
+          label: '營收最高站點',
+          value: topStation.name,
+          detail: `${data.summary.topStationPeriodLabel} ${formatCurrency(topStation.revenue)}`,
+          tone: 'neutral',
+          kind: 'name',
+        },
+      ]
+
+      const kpiGrid = document.getElementById('kpi-grid')
+      kpis.forEach((item) => {
+        const card = document.createElement('article')
+        card.className = 'kpi-card'
+        if (item.kind) card.dataset.kind = item.kind
+        const label = document.createElement('p')
+        label.className = 'kpi-label'
+        label.textContent = item.label
+        const value = document.createElement('p')
+        value.className = 'kpi-value'
+        value.textContent = item.value
+        const detail = document.createElement('p')
+        detail.className = 'kpi-detail'
+        detail.dataset.tone = item.tone
+        detail.textContent = item.detail
+        card.append(label, value, detail)
+        kpiGrid.append(card)
+      })
+
+      const createCell = (label, value, align = 'left') => {
+        const cell = document.createElement('td')
+        cell.dataset.label = label
+        cell.dataset.align = align
+        if (value instanceof Node) cell.append(value)
+        else cell.textContent = String(value)
+        return cell
+      }
+
+      const stationBody = document.getElementById('station-ranking-body')
+      data.stationRanking.forEach((station) => {
+        const row = document.createElement('tr')
+        row.dataset.rank = String(station.rank)
+        const rank = document.createElement('span')
+        rank.className = 'rank-marker'
+        rank.textContent = String(station.rank)
+        row.append(
+          createCell('排名', rank, 'right'),
+          createCell('站點名稱', station.name, 'right'),
+          createCell('總營收', formatCurrency(station.revenue), 'right'),
+          createCell('充電度數', `${integerFormat.format(station.kwh)} kWh`, 'right'),
+          createCell('使用率', `${station.utilization.toFixed(1)}%`, 'right'),
+          createCell('每 kW 營收', formatCurrencyDetail(station.revenuePerKw), 'right'),
+        )
+        stationBody.append(row)
+      })
+
+      const monthlyBody = document.getElementById('monthly-detail-body')
+      data.periods.forEach((item) => {
+        const row = document.createElement('tr')
+        row.dataset.partial = String(item.partial)
+        const momCell = createCell('MoM', formatPercent(item.revenueMom), 'right')
+        momCell.classList.add(item.revenueMom >= 0 ? 'value-positive' : 'value-negative')
+        row.append(
+          createCell('月份', monthLabel(item), 'right'),
+          createCell('營收', formatCurrency(item.revenue), 'right'),
+          momCell,
+          createCell('充電度數', `${integerFormat.format(item.kwh)} kWh`, 'right'),
+          createCell('充電次數', integerFormat.format(item.sessions), 'right'),
+          createCell('新增會員', integerFormat.format(item.newMembers), 'right'),
+          createCell('累積會員', integerFormat.format(item.totalMembers), 'right'),
+          createCell('活躍會員', integerFormat.format(item.activeMembers), 'right'),
+          createCell('站點數', integerFormat.format(item.stations), 'right'),
+          createCell('充電樁數', integerFormat.format(item.chargers), 'right'),
+        )
+        monthlyBody.append(row)
+      })
+
+      if (!window.Chart) {
+        document.querySelectorAll('[data-chart-frame]').forEach((frame) => {
+          frame.replaceChildren()
+          const fallback = document.createElement('p')
+          fallback.className = 'chart-fallback'
+          fallback.textContent = '圖表元件載入失敗，請檢查網路後重新開啟報表。'
+          frame.append(fallback)
+        })
+        return
+      }
+
+      Chart.defaults.animation = false
+      Chart.defaults.color = token('color-content-secondary')
+      Chart.defaults.font.family = token('font-body')
+      Chart.defaults.font.size = 11
+
+      const labels = data.periods.map(chartMonthLabel)
+      const accent = token('color-accent-primary')
+      const accentMuted = token('color-accent-muted')
+      const caution = token('color-status-caution')
+      const neutral = token('color-chart-neutral')
+      const neutralDark = token('color-chart-neutral-dark')
+      const grid = token('color-chart-grid')
+      const primaryBars = data.periods.map((item) => {
+        if (item.partial) return caution
+        if (item.period === data.summary.latestCompletedPeriod) return accent
+        return accentMuted
+      })
+      const commonScales = {
+        x: {
+          grid: { display: false },
+          border: { color: grid },
+          ticks: { maxRotation: 0, autoSkip: true },
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: grid },
+          border: { display: false },
+        },
+      }
+      const commonPlugins = {
+        legend: {
+          position: 'top',
+          align: 'center',
+          labels: { boxWidth: 9, boxHeight: 9, padding: 10, usePointStyle: true },
+        },
+        tooltip: {
+          backgroundColor: token('color-content-primary'),
+          titleColor: token('color-content-inverse'),
+          bodyColor: token('color-content-inverse'),
+          padding: 10,
+          displayColors: true,
+        },
+      }
+
+      new Chart(document.getElementById('revenue-chart'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: '總營收',
+            data: data.periods.map((item) => item.revenue),
+            backgroundColor: primaryBars,
+            borderWidth: 0,
+            borderRadius: 4,
+            maxBarThickness: 44,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { ...commonPlugins, legend: { display: false } },
+          scales: {
+            ...commonScales,
+            y: { ...commonScales.y, ticks: { callback: (value) => compactFormat.format(value) } },
+          },
+        },
+      })
+
+      new Chart(document.getElementById('charge-chart'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: '充電度數',
+              data: data.periods.map((item) => item.kwh),
+              backgroundColor: accentMuted,
+              borderWidth: 0,
+              borderRadius: 4,
+              maxBarThickness: 42,
+              yAxisID: 'y',
+            },
+            {
+              label: '充電次數',
+              type: 'line',
+              data: data.periods.map((item) => item.sessions),
+              borderColor: neutralDark,
+              backgroundColor: neutralDark,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              tension: .25,
+              yAxisID: 'y1',
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: commonPlugins,
+          scales: {
+            ...commonScales,
+            y: { ...commonScales.y, ticks: { callback: (value) => compactFormat.format(value) } },
+            y1: {
+              beginAtZero: true,
+              position: 'right',
+              grid: { drawOnChartArea: false },
+              border: { display: false },
+              ticks: { callback: (value) => compactFormat.format(value) },
+            },
+          },
+        },
+      })
+
+      new Chart(document.getElementById('member-chart'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: '新增會員',
+              data: data.periods.map((item) => item.newMembers),
+              backgroundColor: neutral,
+              borderWidth: 0,
+              borderRadius: 4,
+              maxBarThickness: 42,
+              yAxisID: 'y',
+            },
+            {
+              label: '累積會員',
+              type: 'line',
+              data: data.periods.map((item) => item.totalMembers),
+              borderColor: accent,
+              backgroundColor: accent,
+              pointRadius: 3,
+              tension: .25,
+              yAxisID: 'y1',
+            },
+            {
+              label: '活躍會員',
+              type: 'line',
+              data: data.periods.map((item) => item.activeMembers),
+              borderColor: neutralDark,
+              backgroundColor: neutralDark,
+              borderDash: [5, 4],
+              pointRadius: 2,
+              tension: .25,
+              yAxisID: 'y1',
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: commonPlugins,
+          scales: {
+            ...commonScales,
+            y: { ...commonScales.y, ticks: { callback: (value) => compactFormat.format(value) } },
+            y1: {
+              beginAtZero: true,
+              position: 'right',
+              grid: { drawOnChartArea: false },
+              border: { display: false },
+              ticks: { callback: (value) => compactFormat.format(value) },
+            },
+          },
+        },
+      })
+
+      new Chart(document.getElementById('infrastructure-chart'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: '站點數',
+              data: data.periods.map((item) => item.stations),
+              backgroundColor: accentMuted,
+              borderWidth: 0,
+              borderRadius: 4,
+              maxBarThickness: 42,
+              yAxisID: 'y',
+            },
+            {
+              label: '充電樁數',
+              type: 'line',
+              data: data.periods.map((item) => item.chargers),
+              borderColor: neutralDark,
+              backgroundColor: neutralDark,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              tension: .25,
+              yAxisID: 'y1',
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: commonPlugins,
+          scales: {
+            ...commonScales,
+            y: { ...commonScales.y, ticks: { precision: 0 } },
+            y1: {
+              beginAtZero: true,
+              position: 'right',
+              grid: { drawOnChartArea: false },
+              border: { display: false },
+              ticks: { precision: 0 },
+            },
+          },
+        },
+      })
+    })()
+  </script>
+</body>
+</html>

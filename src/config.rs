@@ -70,6 +70,34 @@ fn load_prompt(root: &Path, id: &str, prompt_ref: &PromptRef) -> Result<String> 
     Ok(body)
 }
 
+/// Resolve and read the `/report` HTML template body referenced by the manifest.
+///
+/// Resolves `[report].template` (or [`default_report_template`] when the section is absent) against
+/// `root`, and reads it. Placeholder validation is deferred to boot ([`AppState::new`]) so the
+/// config layer stays free of pipeline internals.
+///
+/// # Errors
+///
+/// Returns `Err` if the file cannot be read, or if its body is empty.
+///
+/// [`AppState::new`]: crate::appstate::AppState::new
+fn load_report_template(root: &Path, report: Option<&ReportManifest>) -> Result<String> {
+    let rel = report
+        .map(|r| r.template.clone())
+        .unwrap_or_else(default_report_template);
+    let file = resolve_relative(root, &rel);
+    let body = std::fs::read_to_string(&file)
+        .with_context(|| format!("read report template from {}", file.display()))?;
+    if body.trim().is_empty() {
+        return Err(anyhow!(
+            "report template at {} is empty — refusing to ship an empty report template",
+            file.display()
+        ));
+    }
+    debug!(path = %file.display(), bytes = body.len(), "app config: report template loaded");
+    Ok(body)
+}
+
 /// Join `p` to `root` if relative, pass through if already absolute.
 fn resolve_relative(root: &Path, p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -97,6 +125,63 @@ struct Manifest {
     /// Optional runtime capability-pack references and assembly.
     #[serde(default)]
     runtime: Option<RuntimeManifest>,
+    /// Optional `/insight` pipeline tool grants (defaults applied when absent).
+    #[serde(default)]
+    insight: Option<InsightManifest>,
+    /// Optional `/report` pipeline assets (the HTML template; default path applied when absent).
+    #[serde(default)]
+    report: Option<ReportManifest>,
+}
+
+/// Optional `[report]` section: assets for the `/report` HTML pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportManifest {
+    /// Path to the HTML report template the `renderer` fills (relative to the manifest's parent
+    /// directory, or absolute). Must contain the `__REPORT_DATA_JSON__` placeholder.
+    #[serde(default = "default_report_template")]
+    template: PathBuf,
+}
+
+/// The default report template path, used when `[report]` (or its `template`) is omitted.
+fn default_report_template() -> PathBuf {
+    PathBuf::from("report_template/report.html")
+}
+
+/// Optional `[insight]` section: per-sub-agent tool grants for the `/insight` pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsightManifest {
+    #[serde(default = "default_insight_grants")]
+    grants: InsightGrantsManifest,
+}
+
+/// `[insight.grants]`: the tools each `/insight` sub-agent exposes to its LLM, by wire name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsightGrantsManifest {
+    #[serde(default = "default_fetcher_grant")]
+    fetcher: Vec<String>,
+    #[serde(default = "default_charter_grant")]
+    charter: Vec<String>,
+}
+
+/// The fetcher's default grant: `["*"]` — every tool the MCP server advertises, so new datacenter
+/// tools are wired without a code change.
+fn default_fetcher_grant() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+/// The charter's default grant: the built-in `emit_chart` sink only.
+fn default_charter_grant() -> Vec<String> {
+    vec!["emit_chart".to_string()]
+}
+
+fn default_insight_grants() -> InsightGrantsManifest {
+    InsightGrantsManifest {
+        fetcher: default_fetcher_grant(),
+        charter: default_charter_grant(),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,7 +204,7 @@ struct RuntimeManifest {
     /// Runtime injection config path.
     injection: PathBuf,
     /// Runtime input pipeline assembly.
-    pipeline: RuntimePipelineManifest,
+    input: RuntimeInputManifest,
     /// Runtime answer policy assembly.
     answer_policy: RuntimeAnswerPolicyManifest,
     /// Optional LLM normalizer assembly.
@@ -138,7 +223,7 @@ struct RuntimeManifest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimePipelineManifest {
+struct RuntimeInputManifest {
     /// Ordered input pipeline stage ids.
     input_stages: Vec<String>,
 }
@@ -219,6 +304,33 @@ pub struct AppConfig {
     pub prompts: BTreeMap<String, String>,
     /// Optional runtime config references and assembly.
     pub runtime: Option<RuntimeRefs>,
+    /// Resolved `/insight` pipeline tool grants (defaults when `[insight]` is absent).
+    pub insight_grants: InsightGrants,
+    /// The `/report` HTML template body, read at load from `[report].template` (or its default
+    /// path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
+    pub report_template: String,
+}
+
+/// Resolved `/insight` pipeline tool grants — which tools each sub-agent exposes to its LLM.
+///
+/// Names are matched at boot against the MCP server's advertised set (fail-fast on a typo) or the
+/// built-in code-backed tools (e.g. `emit_chart`). A grant of `["*"]` means "every tool the MCP
+/// server advertises", so new datacenter tools are wired without a code change.
+#[derive(Debug, Clone)]
+pub struct InsightGrants {
+    /// The fetcher's granted data tools (MCP wire names, or `["*"]` for all discovered).
+    pub fetcher: Vec<String>,
+    /// The charter's granted tools (normally the built-in `emit_chart` sink).
+    pub charter: Vec<String>,
+}
+
+impl Default for InsightGrants {
+    fn default() -> Self {
+        Self {
+            fetcher: default_fetcher_grant(),
+            charter: default_charter_grant(),
+        }
+    }
 }
 
 /// Resolved runtime references and assembly from the host config.
@@ -269,7 +381,7 @@ impl RuntimeRefs {
             lexicon: resolve_relative(root, &manifest.lexicon),
             thresholds: resolve_relative(root, &manifest.thresholds),
             injection: resolve_relative(root, &manifest.injection),
-            input_stages: manifest.pipeline.input_stages,
+            input_stages: manifest.input.input_stages,
             answer_policy_backend: manifest.answer_policy.backend,
             llm_normalizer_enabled: manifest.llm_normalizer.enabled,
             llm_normalizer_backend: manifest.llm_normalizer.backend,
@@ -336,6 +448,16 @@ impl AppConfig {
             .runtime
             .map(|runtime| RuntimeRefs::resolve(&root, runtime));
 
+        let insight_grants = manifest
+            .insight
+            .map(|insight| InsightGrants {
+                fetcher: insight.grants.fetcher,
+                charter: insight.grants.charter,
+            })
+            .unwrap_or_default();
+
+        let report_template = load_report_template(&root, manifest.report.as_ref())?;
+
         // Log the loaded config
         info!(
             root = %root.display(),
@@ -347,6 +469,8 @@ impl AppConfig {
             root,
             prompts,
             runtime,
+            insight_grants,
+            report_template,
         })
     }
 
@@ -387,7 +511,7 @@ mod tests {
         assert_eq!(runtime.llm_normalizer_backend, "disabled");
         assert!(runtime.memory_enabled);
         assert_eq!(runtime.memory_backend, "in-memory");
-        assert_eq!(runtime.audit_sink, "stdout");
+        assert_eq!(runtime.audit_sink, "tracing");
         assert_eq!(runtime.audit_failure_policy, "fail-open");
         assert_eq!(
             runtime.guardrails,
@@ -406,5 +530,40 @@ mod tests {
         assert!(runtime
             .response_baseline
             .ends_with("runtime/evals/response-baseline.json"));
+    }
+
+    #[test]
+    fn config_loads_insight_grants() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        // The fetcher enumerates the datacenter analytics tools explicitly; the charter gets the
+        // code-backed `emit_chart` sink.
+        assert_eq!(
+            cfg.insight_grants.fetcher,
+            [
+                "bill_revenue",
+                "bill_charge",
+                "member_analysis",
+                "business_metrics",
+                "station_revenue_ranking",
+            ]
+        );
+        assert_eq!(cfg.insight_grants.charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn config_loads_the_report_template_with_the_data_placeholder() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        // The template body is read eagerly and carries the one placeholder the renderer fills.
+        assert!(cfg.report_template.contains("__REPORT_DATA_JSON__"));
+        // The design tokens are baked in (no leftover token placeholder).
+        assert!(!cfg.report_template.contains("__REPORT_TOKENS__"));
+    }
+
+    #[test]
+    fn insight_grants_default_to_wildcard_when_section_absent() {
+        // The in-code default (no `[insight]` section) still grants the fetcher every discovered
+        // MCP tool, so a minimal config keeps working.
+        assert_eq!(InsightGrants::default().fetcher, ["*"]);
+        assert_eq!(InsightGrants::default().charter, ["emit_chart"]);
     }
 }

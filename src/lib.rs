@@ -14,6 +14,7 @@
 
 //! Core agent library
 
+pub mod agent;
 pub mod appstate;
 pub mod config;
 pub mod llm_connector;

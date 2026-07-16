@@ -6,6 +6,7 @@ intent_allowlist = [
   "charging",
   "site-build",
   "member",
+  "report",
 ]
 
 [option_prefixes]
@@ -13,6 +14,7 @@ revenue = "revenue"
 charging = "charging"
 site = "site-build"
 member = "member"
+report = "report"
 
 [[intents]]
 id = "unknown"
@@ -36,3 +38,12 @@ keywords = ["建置", "站點", "場站", "site"]
 [[intents]]
 id = "member"
 keywords = ["會員", "會員數", "會員成長", "註冊", "留存", "活躍會員", "membership", "member"]
+
+# Full HTML report — a routing intent, orthogonal to the topic above. When the
+# user asks for a "報告" the `/agent/stream` front door runs the `/report`
+# pipeline (fetcher → analyst → composer → renderer) instead of `/insight`; the
+# topic (營收 / 充電 / …) still rides along in the prompt. Routing keys off this
+# intent being *mentioned* (top or candidate), so `營收報告` reports on revenue.
+[[intents]]
+id = "report"
+keywords = ["報告", "完整的報告", "完整報告", "report"]

@@ -6,9 +6,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tracing::error;
+use tracing::{error, info};
 
-use super::error::{RuntimeError, RuntimeResult};
+use super::error::RuntimeResult;
 
 /// Audit sink failure behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,17 +182,132 @@ impl AuditSink for NoopAuditSink {
     }
 }
 
-/// Stdout JSON-lines audit sink.
+/// Audit sink that emits each record as a structured [`mod@tracing`] event
+/// (`audit.*`, INFO level, decomposed into `key=value` fields) rather than a JSON
+/// blob on stdout — so the audit trail flows through the same tracing stack
+/// (stderr) as every other operational log, honouring the stream-split logging
+/// convention. The per-request context (`request_id`, `route`, `seq`,
+/// `session_id`) rides on every event for correlation; hashes stay hashed.
 #[derive(Debug, Default)]
-pub struct StdoutAuditSink;
+pub struct TracingAuditSink;
 
 #[async_trait]
-impl AuditSink for StdoutAuditSink {
+impl AuditSink for TracingAuditSink {
     async fn write(&self, ctx: &AuditCtx, seq: u64, event: AuditEvent) -> RuntimeResult<()> {
-        let record = AuditRecord::from_event(ctx, seq, event);
-        let json = serde_json::to_string(&record)
-            .map_err(|err| RuntimeError::AuditSink(format!("serialize audit record: {err}")))?;
-        println!("{json}");
+        let request_id = ctx.request_id.as_str();
+        let route = ctx.route.as_str();
+        let session_id = ctx.session_id.as_deref().unwrap_or("-");
+        match event {
+            AuditEvent::RequestReceived {
+                input_hash,
+                input_chars,
+                option_id,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                input_hash = %input_hash,
+                input_chars,
+                option_id = option_id.as_deref().unwrap_or("-"),
+                "audit.request_received"
+            ),
+            AuditEvent::InputNormalized {
+                intent,
+                confidence,
+                intent_source,
+                warnings,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                intent = %intent,
+                confidence = confidence as f64,
+                intent_source = intent_source.as_deref().unwrap_or("-"),
+                warnings = warnings.len(),
+                "audit.input_normalized"
+            ),
+            AuditEvent::InputRejected { code, reason } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                code = %code,
+                reason = %reason,
+                "audit.input_rejected"
+            ),
+            AuditEvent::Refused { reason } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                reason = %reason,
+                "audit.refused"
+            ),
+            AuditEvent::MemoryContext {
+                used_turn_count,
+                dropped_reason,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                used_turn_count,
+                dropped_reason = dropped_reason.as_deref().unwrap_or("-"),
+                "audit.memory_context"
+            ),
+            AuditEvent::ToolCalled { tool, args_hash } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                tool = %tool,
+                args_hash = %args_hash,
+                "audit.tool_called"
+            ),
+            AuditEvent::ToolResult { tool, bytes, ok } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                tool = %tool,
+                bytes,
+                ok,
+                "audit.tool_result"
+            ),
+            AuditEvent::AnswerCleared => {
+                info!(request_id, route, seq, session_id, "audit.answer_cleared")
+            }
+            AuditEvent::ResponseCompleted {
+                response_hash,
+                response_chars,
+                duration_ms,
+                status,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                response_hash = %response_hash,
+                response_chars,
+                duration_ms,
+                status = %status,
+                "audit.response_completed"
+            ),
+            AuditEvent::ResponseFailed {
+                error_code,
+                duration_ms,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                error_code = %error_code,
+                duration_ms,
+                "audit.response_failed"
+            ),
+        }
         Ok(())
     }
 }

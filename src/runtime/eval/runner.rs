@@ -287,10 +287,11 @@ fn live_eval_system_prompt(base_system: &str, instructions: Option<&str>) -> Str
         }
         _ => base_system.to_string(),
     };
-    let now_str = chrono::Local::now()
-        .format("%Y-%m-%d %H:%M:%S %:z")
-        .to_string();
-    format!("# Current Time\n{now_str}\n\n{system_base}")
+    // Shared with the serving path + sub-agent engine via `current_time_header` (no drift).
+    format!(
+        "{}{system_base}",
+        crate::agent::clock::current_time_header(&chrono::Local::now())
+    )
 }
 
 fn estimate_tokens(response: &str) -> u64 {

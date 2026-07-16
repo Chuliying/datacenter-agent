@@ -31,5 +31,5 @@
 
 ## 相關
 - 每個端點細節 → [端點總覽](../endpoints/index.md)
-- runtime 編排 → [orchestrator](./runtime-orchestrator.md)
+- runtime 編排 → [turn](./runtime-turn.md)
 - 共享狀態 `AppState` / `AppRuntime` → [專案主體 · 啟動與組裝](../index.md#4-啟動與組裝top-level-接線)

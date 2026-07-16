@@ -14,11 +14,11 @@
 
 //! OpenRouter LLM connector with MCP tool-calling.
 //!
-//! The single entry point is the agentic loop in [`agent`]:
+//! The single entry point is the agentic loop, exposed as two functions:
 //! - [`agent_stream`]: drive the tool-calling loop, streaming the final answer
-//!   token-by-token (used by `/agent/stream`).
+//!   token-by-token (used by the legacy `/report/stream` path and the runtime turn).
 //! - [`generate`]: run the same loop and await the whole Markdown reply (used
-//!   by `/agent` and the greeting generator).
+//!   by the legacy `/report` path and the greeting generator).
 
 mod agent;
 mod client;

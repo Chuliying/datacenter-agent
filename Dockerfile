@@ -10,15 +10,16 @@ RUN cargo build --release --bin datacenter-agent
 
 RUN strip -s ./target/release/datacenter-agent
 
-FROM scratch
+FROM scratch AS runtime
 
 WORKDIR /app
 
+COPY config ./config
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/target/release/datacenter-agent /app/datacenter-agent
 COPY --from=builder /app/config /app/config
 
 EXPOSE 8080
 
-ENTRYPOINT ["/app/datacenter-agent"]
-CMD ["--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["datacenter-agent"]
+CMD ["--host", "0.0.0.0", "--port", "8080", "--config", "config/config.toml"]

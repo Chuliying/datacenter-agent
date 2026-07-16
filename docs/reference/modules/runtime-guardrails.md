@@ -26,7 +26,7 @@
 `AnswerPolicy` 是 trait、由 config 選已註冊後端（目前 `rule`），並由 AppState 接線；refusal/disclaimer thresholds 讀取 capability config。數值範圍與 ordering validation 仍待補。
 
 ## 相關
-- 何時被呼叫 → [orchestrator](./runtime-orchestrator.md) 流程第 1、4 步
+- 何時被呼叫 → [turn](./runtime-turn.md) 流程第 1、4 步
 - regex 移植注意（`\b` 對 CJK 語意）→ [移植 PRD](../../agent-runtime-rust-port/prd.md)
 - 後端組裝 → [registry](./runtime-registry.md)
 - 決策後的稽核 → [audit](./runtime-audit.md)

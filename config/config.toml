@@ -24,22 +24,67 @@ version = 1
 # the call site that depends on it.
 #
 # Currently implemented, good for reference:
-#   * agent_system    — analytics agent system prompt for /agent and /agent/stream.
-#   * report_system   — HTML report generator system prompt for /report and /report/stream.
-#   * greeting_system — greeting system prompt for /greeting.
-#   * greeting_user   — greeting user prompt for /greeting.
+#   * agent_system              — legacy monolith analytics prompt (eval baseline).
+#   * greeting_fetcher_system   — greeting pipeline: the data-fetch stage.
+#   * greeting_analyst_system   — greeting pipeline: the C-suite greeting writer (terminal).
+#   * greeting_user             — greeting pipeline: the boot-time request prompt.
+#
+# The /insight and /report pipeline stage prompts (fetcher/analyst/charter,
+# report_analyst/report_composer) are compiled in via include_str!, so they live under
+# prompt_guide/ but are NOT listed here.
 
 [prompts.agent_system]
 file = "prompt_guide/agent_system.md"
 
-[prompts.report_system]
-file = "prompt_guide/report_system.md"
+[prompts.greeting_fetcher_system]
+file = "prompt_guide/greeting_fetcher_system.md"
 
-[prompts.greeting_system]
-file = "prompt_guide/greeting_system.md"
+[prompts.greeting_analyst_system]
+file = "prompt_guide/greeting_analyst_system.md"
 
 [prompts.greeting_user]
 file = "prompt_guide/greeting_user.md"
+
+
+# ──── Insight pipeline tool grants ───
+# Which tools each /insight sub-agent exposes to its LLM, by wire name.
+# Edit these to change grants WITHOUT recompiling.
+#
+#   * MCP tool names are resolved against the datacenter server's advertised set
+#     at boot — a typo (or a tool the server does not offer) fails boot loudly.
+#   * "emit_chart" is a built-in, code-backed sink (not an MCP tool).
+#   * "*" is a shorthand for "every tool the MCP server advertises", handy while
+#     iterating; the explicit list below is the auditable production form.
+#
+# Omitting this whole section defaults `fetcher` to ["*"] and `charter` to
+# ["emit_chart"].
+
+[insight.grants]
+# The datacenter analytics tools the fetcher may call. These are the tools the
+# agent prompts are written around; see config/mcp-config.toml for the server's
+# full endpoint map (it also exposes "bill_member_analysis", omitted here as no
+# prompt references it — add it if you want the fetcher to reach it).
+fetcher = [
+    "bill_revenue",
+    "bill_charge",
+    "member_analysis",
+    "business_metrics",
+    "station_revenue_ranking",
+]
+charter = ["emit_chart"]
+
+
+# ──── Report pipeline assets ───
+# The /report pipeline (fetcher → analyst → composer → renderer) renders a self-contained HTML
+# report by injecting the composer's structured data into this template — the LLM never writes
+# HTML. The template must contain the `__REPORT_DATA_JSON__` placeholder (checked at boot); its
+# design tokens (brand palette) are baked into the template's `:root` CSS block, so retuning the
+# brand is a template edit. Omitting this section defaults to `report_template/report.html`.
+#
+# The /report fetcher reuses the `[insight.grants].fetcher` tools above (the same broad snapshot).
+
+[report]
+template = "report_template/report.html"
 
 
 # ──── Runtime capability pack section ───
@@ -52,7 +97,7 @@ lexicon = "runtime/lexicon.toml"
 thresholds = "runtime/thresholds.toml"
 injection = "runtime/injection.toml"
 
-[runtime.pipeline]
+[runtime.input]
 input_stages = ["normalize", "input_guard", "injection", "intent", "slots"]
 
 [runtime.answer_policy]
@@ -67,7 +112,9 @@ enabled = true
 backend = "in-memory"
 
 [runtime.audit]
-sink = "stdout"
+# Audit records are emitted as structured `tracing` events (audit.* / INFO,
+# key=value fields) — stderr via the tracing stack, not a stdout JSON stream.
+sink = "tracing"
 failure_policy = "fail-open"
 
 [runtime.guardrails]
