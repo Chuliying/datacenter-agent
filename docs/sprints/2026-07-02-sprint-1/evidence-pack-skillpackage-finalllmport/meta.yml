@@ -1,0 +1,15 @@
+skill: prd-interview
+stage: docs
+created_at: 2026-07-02T14:30:00+08:00
+updated_at: 2026-07-06T11:08:15+08:00
+status: ready
+relocated_from: .agent/artifacts/docs/2026-07-02-evidence-pack-skillpackage-finalllmport/
+primary_output: prd.md
+sprint: Sprint 1
+story_id: S-EVIDENCE-01
+version: v1.3.1
+stages:
+  prd: { skill: prd-interview, file: prd.md, status: ready }
+inputs:
+  - .agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md
+  - docs/reference/prd.md
