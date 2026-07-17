@@ -1,6 +1,6 @@
 # Privacy Proxy 技術規格
 
-**Spec 版本**：v0.2.0
+**Spec 版本**：v0.3.0
 **對應 Feature PRD**：[`./prd.md`](./prd.md) v0.1.0（S-PRIVACY-01）
 **對應全域**：[reference PRD](../../prd.md) FR-015、[reference spec](../../spec/spec.md) §2.5/§6
 **狀態**：Target-state design（待建置）
@@ -16,6 +16,8 @@
 |---|---|---|
 | v0.1.0 | 2026-07-11 | 初版；模組設計 + 對照 codebase review（2 critical + 6 major 已併入）落為技術 spec |
 | v0.2.0 | 2026-07-13 | 對齊 PR #5 sub-agent 架構：整合策略由「`AgentPort` decorator」改為「sub-agent 出境邊界 decorator」（`LlmCapability`/`Tool` + handler 還原）；§2 模組佈局、§7 Pipeline 整合、§8 Phase 4、§9 整合測試、§10 接縫全面重寫。引擎（§4–6）不變。經一輪對抗 review 修正：privacy 掛 `AppState`（非 `AppRuntime`，否則 rollback fail-open）、greeting 需改走 `build_stage_llm`、還原掛 async drain loop（非 sync `insight_frames`）、補 lossy-sink 終局處置、`PrivacyTool` 只包 `McpTool`。 |
+| v0.2.1 | 2026-07-13 | 新增 §11 偵測 eval 與持續改進（leak-rate 北極星、原文雙掃 + completeness critic、synthetic/holdout/regression 語料、改進閉環、插入 `src/runtime/eval/` + CI gate）。 |
+| v0.3.0 | 2026-07-13 | 新增 §12 威脅模型與紅隊 must-fix（6 面向對抗紅隊結論）；修正 C1 rollback fail-open（`state.runtime.privacy`→`state.privacy`）；相關文件順延為 §13。核心結論：目前為 pseudonymization-with-leakage，紅線需誠實降級（見 §12）。 |
 
 ## 1. 架構總覽
 
@@ -106,7 +108,7 @@ db_path = "data/privacy.db"
 - `src/runtime/registry.rs`：`BuiltinRegistry` 加 `privacy_detectors`/`privacy_stores` id 集合、`require_privacy_*` 驗證、`build_privacy(&cfg) -> RuntimeResult<Option<Arc<PrivacyEngine>>>`（disabled → `None`）。
 - `src/appstate.rs`：**⚠️（對抗 review 更正）privacy engine 掛在 `AppState`（由 `AppState::new` 無條件建構），不是 `AppRuntime`。** 因為 `/insight`、`/report` 不 gate 於 runtime，而 `AppRuntime` 在 `RUNTIME_ENABLED=false` 時為 `None`（`build_runtime_for_flag`，`appstate.rs:306`）——若放 `AppRuntime`，rollback 會讓 direct 端點無遮罩出境（fail-open，與 FR-P07 矛盾）。PR #5 的 `insight_grants`/`report_template` 也都在 `AppState`（`appstate.rs:179/182`），新增 `privacy` 欄位一併更新 struct-literal 與測試。`build_privacy` 仍放 `registry.rs`，但由 `AppState::new` 呼叫。
 - `src/main.rs`：`if let Some(p) = &runtime.privacy { p.clone().spawn_ttl_cleanup(); }`。
-- **Pipeline 注入**：`src/agent/wiring.rs` 的 `build_insight_pipeline` / `build_report_pipeline` / `build_greeting_pipeline` 各加 `privacy: Option<&Arc<PrivacyEngine>>` + `scope`；`handler.rs` 的各 pipeline 端點與 greeting 在 `state.runtime.privacy` 為 `Some` 時傳入（見 §7.1.4）。
+- **Pipeline 注入**：`src/agent/wiring.rs` 的 `build_insight_pipeline` / `build_report_pipeline` / `build_greeting_pipeline` 各加 `privacy: Option<&Arc<PrivacyEngine>>` + `scope`；`handler.rs` 的各 pipeline 端點與 greeting 在 `state.privacy` 為 `Some` 時傳入（見 §7.1.4）。
 
 ## 4. 規則引擎（台灣 PII）
 
@@ -204,7 +206,7 @@ CREATE TABLE privacy_mappings (
    buffered 端點（`/insight`、`/report`）在 `Orchestrator::run` 回傳的 `Final` 上做 batch restore；boot-time greeting 在 `server/greeting.rs::build_one_greeting` 的 `Final.assistant` 上做 batch restore。
 
 4. **privacy engine 注入路徑**
-   `build_insight_pipeline` / `build_report_pipeline` / `build_greeting_pipeline` 各加 `privacy: Option<&Arc<PrivacyEngine>>` + `scope: PrivacyScope`，往下傳給 `build_stage_llm` 與 `build_stage_tools`；`None` 分支 = 今日逐位元組原樣。呼叫端 `handler.rs`（`/insight`、`/insight/stream`、`/report`、`/report/stream`、`/agent/stream` 與 boot-time greeting）在 `state.runtime.privacy` 為 `Some` 時傳入。
+   `build_insight_pipeline` / `build_report_pipeline` / `build_greeting_pipeline` 各加 `privacy: Option<&Arc<PrivacyEngine>>` + `scope: PrivacyScope`，往下傳給 `build_stage_llm` 與 `build_stage_tools`；`None` 分支 = 今日逐位元組原樣。呼叫端 `handler.rs`（`/insight`、`/insight/stream`、`/report`、`/report/stream`、`/agent/stream` 與 boot-time greeting）在 `state.privacy` 為 `Some` 時傳入。
 
 ### 7.2 出境路徑覆蓋（PR #5 後重新盤點）
 
@@ -271,7 +273,105 @@ CREATE TABLE privacy_mappings (
 
 > 已淘汰的 v0.1.0 接縫：`src/runtime/orchestrator.rs`（已改名 `runtime::turn` 且非生產答案路徑）、`src/llm_connector/agent.rs`（PR #5 後非生產出境路徑）。`src/runtime/memory/store.rs` 仍是 store/trait 模式的參考範例。
 
-## 11. 相關文件
+## 11. 偵測 eval 與持續改進（detection eval loop）
+
+偵測 recall 是本模組安全的主變數（漏遮 = 洩漏）。本節定義如何量測與持續提升，並插入 repo 既有 `src/runtime/eval/` 框架（evaluator/runner/registry，對齊 PR #3 的 config-driven evaluator + CI negative-gate）。
+
+### 11.1 指標（不對稱損失：recall 為主、precision 有下限）
+
+| 指標 | 定義 | 目標 |
+|---|---|---|
+| **Leak rate**（doc-level，北極星）| 含 ≥1 個未遮真 PII 的文件占比 | 結構化 kind = **0**（硬 gate）；自由文本壓到最低 |
+| Recall / Precision（**span & entity level, per kind**）| PII 是 span，非 token | recall 為主 |
+| Over-mask rate | 遮到非 PII（尤其金額/日期/案號/發票號 hard-negative）| hard-negative = **0** |
+| 各 pass 邊際貢獻 | pass1 / pass2 / residual 各自 uniquely caught | 判斷「加工夫」值不值 |
+| 代稱一致性（co-reference）| 同實體是否得同 tag | 影響可用性與還原 |
+
+報表切維度：kind × language（zh-TW/en/ja/混語）× pass。
+
+### 11.2 偵測架構（原文雙掃 + 完整性補掃）
+
+- **pass1**：regex + checksum（結構化，高 precision）。
+- **pass2**：本機 Ollama NER，**看原文全文**（Ollama 是可信本機端；先遮再丟會餓死上下文），recall booster。
+- **pass3（建議新增）completeness critic**：對已遮文字再問一次本機 LLM「還有沒有漏的人名/機構/地址」——recall 的最後一道。
+- 各 pass 都在原文上跑 → union span + 重疊解析。各 pass 單獨 eval + union + union+residual，追 **marginal recall / cost**。
+
+### 11.3 Ground-truth 語料（不洩漏前提）
+
+| 層 | 用途 | 洩漏風險控制 |
+|---|---|---|
+| **A. Synthetic golden**（CI 主力）| 模板注入假 PII、記錄 char span，涵蓋三語 + edge case + hard-negative | 零 |
+| **B. 真實 holdout**（最終驗證）| 小量人工雙標註 + 裁決的真合約 | **加密 on-prem、access-controlled、不進 CI log／不上雲** |
+| **C. Regression + hard-negative**（只增不減）| 每個 prod 漏抓 → 永久測試；每個 must-not-mask → hard negative | 含真 PII → on-prem 處理 |
+
+前置：先定**標註規範**（何謂 PII、span 邊界、kind 分類），否則金標本身不一致。
+
+### 11.4 持續改進閉環
+
+```text
+run eval → error analysis（per kind / language）
+  → miss（漏遮）：結構化加/修 regex；自由文本加 NER few-shot（從真實 miss 萃取）、調 prompt/降門檻（偏遮）
+  → over-mask（過遮）：收緊規則/context、補 hard-negative
+  → 回歸（regression corpus 不得退）→ shadow / A-B 影子跑 prod 再 promote
+  → prod 訊號（residual 命中 / fail-closed / 人工回報）回流成新標註（on-prem）→ 循環
+```
+
+Active learning：優先標「模型最不確定」或「兩 pass 不一致」的案例。**安全紅隊的 evasion 樣本直接種入 corpus A/C**——red-team 與 eval 是同一飛輪。
+
+### 11.5 落地與 CI gate
+
+- 實作 `PrivacyDetectorEvaluator` 插入 `src/runtime/eval/`（fixtures = 標註語料，scoring = per-kind recall/precision + leak-rate），對齊 PR #3 的三維 threshold gate（此處三維 = recall / precision / leak）。
+- **CI gate**（mirror PR #3 negative self-test）：
+  - 結構化 kinds **leak rate = 0**（退則 build fail）
+  - 整體 recall ≥ 門檻（如 0.95）且**不得低於上一版**（no-regression）
+  - hard-negative（金額/日期）over-mask = 0
+  - regression corpus 全過
+
+## 12. 威脅模型與紅隊結論（must-fix）
+
+一輪 6 面向對抗紅隊（對照 spec + PR #5 實碼）的結論。**信任邊界**：唯一 untrusted = 雲端 LLM（OpenRouter + 上游 model host）；trusted = 本機 Ollama NER 與 datacenter MCP（資料擁有者）。另含攻擊者：偷 `privacy.db` 者、能讀 env/記憶體/log 者、能在合約內文與 prompt 注入者。
+
+**總結判斷**：引擎（AEAD/HMAC/AAD）對「無金鑰的 DB 竊取者」保護 literal 原文是穩的；但 (a) 偵測 recall 對非結構化 PII 是單層、(b) restore 是 global 無狀態 oracle、(c) 準識別子（金額/日期/站名）照原文出境——故目前為 **pseudonymization-with-leakage，不是 de-identification**。「原文永不出境」需誠實降級。
+
+### 12.1 Critical（build 前必修）
+
+| # | 發現 | 修法 |
+|---|---|---|
+| C1 | **rollback fail-open**：§3.4/§7.1.4 原寫「經 `state.runtime.privacy` 注入」，但 `state.runtime` 在 `RUNTIME_ENABLED=false` 時為 `None` → `/insight`、`/report` 直接端點無遮罩出境——正是本設計宣稱修掉的洞 | privacy 為 `AppState` 無條件欄位，一律讀 `state.privacy`；**本版已改正 §3.4/§7.1.4 內文** |
+| C2 | **站名/資產名不是遮罩 kind**：datacenter「專用站」站名 = 客戶身分，每份報表原文上雲；`(站點,期間,精確金額)` 幾乎必然 k=1 | 新增 `Station`/`Asset`/`Seller` EntityKind，tokenize + 本機還原（近零可用性成本） |
+| C3 | **restore 是 global 無狀態 oracle**：合約內文或模型輸出中偽造/枚舉 `⟦KIND_N⟧` 會對全域 store 解碼，dump 其他 session/租戶原文 | restore **只還原本回合 mask 實際發出的 tag**（per-turn issued-set，或 tag 內嵌 per-turn HMAC nonce `⟦PERSON_1.<nonce>⟧`）；mask 前先中和內文 tag 形狀字串；restore 採嚴格 canonical 文法 |
+
+### 12.2 High
+
+| # | 發現 | 修法 |
+|---|---|---|
+| H1 | 偵測對 6/8 kind 無 pass2（NER 只出 person/org）；residual 只重跑 RuleDetector（checksum 級）→ 名字/機構/地址/帳號漏抓即終局；`detector="rules"` 模式名字必洩 | residual 必須重跑 NER；`enabled=true` 強制 hybrid；擴充 lexicon/gazetteer |
+| H2 | **NFC≠NFKC**：全形/零寬/homoglyph/分隔符可破 checksum ID，並讓 NER verbatim 還原失效 | 加 NFKC + confusable skeleton + 零寬 strip 的偵測視圖（帶 offset map）；ID 用容分隔符 matcher |
+| H3 | **HMAC dedup = 繞過 AES 的暴力 oracle**：mac_key 若外洩（與 enc 同源 env key），phone/UBN/TWID 數秒破解；NFR-P06「HMAC 防字典」對結構化 PII 不成立（記憶體/log 攻擊者） | mac pepper 放不同信任域（KMS/keyring）；低熵 kind 用 Argon2id；或改 decrypt-and-compare dedup |
+| H4 | **restore-after-render → XSS**：renderer 先 escape masked JSON，restore 再把原文塞進已 escape 的 HTML（`report.rs:25` + §7.1.3）→ stored XSS | restore 在 render/escape **之前**；或替換時 context-escape |
+| H5 | **greeting 繞過 `build_stage_llm`**（`wiring.rs:345`），boot 時把 datacenter 資料原文上雲，且無 fail-closed | greeting 改走 `build_stage_llm` + 對 `Final` batch restore（§7 已標，列必修） |
+| H6 | **injection guard 覆蓋 ⊊ masking 覆蓋**：`/insight`、`/report` 有遮罩但無注入偵測；guard 只掃 top-level prompt，不掃合約內文/tool result/artifact | 注入偵測移到與 masking 同一 builder chokepoint，並掃內文/artifact |
+| H7 | `allow_remote_ner=true`（PRD 有、spec 無）= 未遮原文送外部 NER host，UI 仍顯示 privacy on | 移除逃生口或加響亮獨立確認；PRD↔spec 對齊 |
+| H8 | **紅線誇大**：「原文永不出境」只對 8 類 tagged 子字串成立；金額/日期/站名等準識別子照原文出境 | 誠實改寫為「結構化直接識別子 fail-closed + 自由文本 best-effort；準識別子仍出境」，PRD §1 同步 |
+
+### 12.3 Medium
+
+| # | 發現 | 修法 |
+|---|---|---|
+| M1 | privacy 是 `Option`，預設 silent no-op；6 個 call site 任一傳 `None` 即靜默洩漏（C1/H5 皆其實例） | 改為 `AppState` 必填依賴，非 per-call `Option`；boot 斷言 privacy 開啟時無 pipeline 能無 engine 建成 |
+| M2 | TTL 無真正抹除：WAL/freelist/APFS snapshot 保留「過期」ct+hash | `secure_delete=ON` + WAL truncate + crypto-shredding（per-epoch key） |
+| M3 | 金鑰輪替會摧毀 store：無 key_version，輪替 → 全 unresolved + dedup 破 | envelope encryption + key_version keyring，current-then-previous |
+| M4 | degraded 模式「看似 on 實則弱」：`rules-only`/`detector=rules`/`residual=warn` | degrade 時 alarm（非只 count）；`/ready` 揭露 effective-mode |
+| M5 | decrypt-failure 硬 block → 一個壞 byte 造成該實體 DoS | restore 路徑把 decrypt-fail 當 unresolved（tag 無害），硬 block 只留 mask 路徑 |
+| M6 | 可觀測性對 false negative 全盲（漏抓不產事件） | boot/定期 canary PII 自測；離線抽樣 eval（接 §11） |
+| M7 | AAD 未綁 `expires_at`/`original_hash` → 可竄改 TTL/desync；streaming holdback 超長 fuzzy variant 拆真 tag、`[` 觸發誤還原 | AAD 納入 expires/hash；grammar 限空白、cap 高於最長 accepted variant |
+| M8 | eval bin（`runner.rs:235` `llm_connector::generate`）無 privacy | 僅限合成資料 or 走本機 model，加註/守衛 |
+
+### 12.4 對 §11 eval 的回饋
+
+紅隊 surface-1 已產出 12 類 evasion 合成樣本（全形/零寬 ID、無錨人名、無關鍵字帳號、非後綴機構、passport/ARC-old、地段地號…），**直接種入 §11.3 corpus A/C 作為 recall 回歸基準**；C2 站名與 H2 unicode obfuscation 應設為 hard 測試類。
+
+## 13. 相關文件
 
 - [Privacy Proxy 功能 PRD](./prd.md)
 - [全域 reference PRD FR-015](../../prd.md)｜[reference spec §2.5/§6](../../spec/spec.md)
