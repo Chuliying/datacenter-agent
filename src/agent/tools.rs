@@ -233,6 +233,40 @@ impl ToolRegistry {
 // SchemaTool<T> — the generic validating / sink adapter (code backend)
 // ===========================================================================
 
+/// Recursively decodes JSON that a model wrapped one level too deep as a **string**.
+///
+/// A value that is a string whose trimmed form begins with `{` or `[` and parses as JSON is
+/// replaced by the parsed value; objects and arrays are walked so the repair reaches nested
+/// fields. Plain scalar strings (a title, a note) are left untouched — only string-encoded
+/// *objects/arrays* are decoded — so a legitimate text field is never corrupted.
+///
+/// This exists to accommodate models (e.g. Gemini) that serialize nested tool-call arguments as
+/// JSON strings; it is applied only as a fallback when strict deserialization has already failed.
+fn coerce_embedded_json(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => {
+            let looks_like_json = matches!(s.trim_start().chars().next(), Some('{') | Some('['));
+            match looks_like_json.then(|| serde_json::from_str::<Value>(&s)) {
+                // Decoded an embedded object/array — recurse into it to repair any deeper strings.
+                Some(Ok(decoded @ (Value::Object(_) | Value::Array(_)))) => {
+                    coerce_embedded_json(decoded)
+                }
+                // Not actually JSON (or decoded to a scalar) — keep the original string.
+                _ => Value::String(s),
+            }
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(coerce_embedded_json).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k, coerce_embedded_json(v)))
+                .collect(),
+        ),
+        scalar => scalar,
+    }
+}
+
 /// Turns any `serde` + `schemars` type `T` into a [`Tool`].
 ///
 /// The advertised schema is derived from `T`, and `call` **validates** the model's arguments by
@@ -329,12 +363,24 @@ where
     async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError> {
         // Schema enforcement: a shape the protocol type can't accept is REJECTED, not fatal —
         // the loop feeds the reason back and the model corrects (loop-until-valid).
-        let parsed: T = match serde_json::from_value(arguments) {
+        let parsed: T = match serde_json::from_value(arguments.clone()) {
             Ok(value) => value,
-            Err(e) => {
-                return Ok(ToolOutcome::Rejected {
-                    reason: format!("schema: {e}"),
-                })
+            Err(first_err) => {
+                // Some models (notably Gemini) emit *nested* object/array arguments as JSON
+                // **strings** rather than real JSON values — e.g. `report` arrives as
+                // `"{\"title\":...}"`, which fails as `invalid type: string, expected struct`.
+                // The content is correct; only the encoding is wrong. Recover by decoding any
+                // embedded JSON strings and retrying once. This fires ONLY on the error path, so a
+                // well-formed call is never touched.
+                match serde_json::from_value(coerce_embedded_json(arguments)) {
+                    Ok(value) => value,
+                    // Report the ORIGINAL error: it describes the shape the model actually sent.
+                    Err(_) => {
+                        return Ok(ToolOutcome::Rejected {
+                            reason: format!("schema: {first_err}"),
+                        })
+                    }
+                }
             }
         };
         Ok(match (self.on_valid)(parsed) {
@@ -670,6 +716,52 @@ mod tests {
             ArtifactKey::fetcher_records(),
         );
         let bad = serde_json::json!({ "chart_type": "donut" });
+        match tool.call(bad).await {
+            Ok(ToolOutcome::Rejected { reason }) => assert!(reason.starts_with("schema:")),
+            other => panic!("expected Ok(Rejected), got {other:?}"),
+        }
+    }
+
+    // ── Gemini quirk: a nested array/object arrives JSON-encoded as a *string*. The strict pass
+    //    fails ("invalid type: string, expected a sequence"); the coercion fallback decodes it and
+    //    the call still Produces. ──
+    #[tokio::test]
+    async fn schema_sink_coerces_a_stringified_nested_argument() {
+        let tool = SchemaTool::<ChartSpec>::sink(
+            "emit_chart",
+            "emit a chart",
+            ArtifactKey::fetcher_records(),
+        );
+        // `data_points` is a JSON *string*, not an array — exactly what Gemini sometimes emits.
+        let stringified = serde_json::json!({
+            "chart_type": "bar",
+            "title": "Q3 revenue",
+            "data_points": "[{ \"label\": \"AC\", \"value\": 1.0 }, { \"label\": \"DC\", \"value\": 2.0 }]"
+        });
+        match tool.call(stringified).await.unwrap() {
+            ToolOutcome::Produced(ArtifactValue::Json(v)) => {
+                assert_eq!(v["title"], "Q3 revenue");
+                assert_eq!(v["data_points"][0]["label"], "AC");
+            }
+            other => panic!("expected Produced(Json) after coercion, got {other:?}"),
+        }
+    }
+
+    // A plain-text field that merely *contains* no JSON is never mangled by the coercion pass, and
+    // a genuinely malformed shape still Rejects (with the original, honest error).
+    #[tokio::test]
+    async fn coercion_leaves_plain_strings_and_still_rejects_bad_shapes() {
+        let tool = SchemaTool::<ChartSpec>::sink(
+            "emit_chart",
+            "emit a chart",
+            ArtifactKey::fetcher_records(),
+        );
+        // `data_points` is neither an array nor a JSON string — still an honest reject.
+        let bad = serde_json::json!({
+            "chart_type": "bar",
+            "title": "{not json}",
+            "data_points": 42
+        });
         match tool.call(bad).await {
             Ok(ToolOutcome::Rejected { reason }) => assert!(reason.starts_with("schema:")),
             other => panic!("expected Ok(Rejected), got {other:?}"),

@@ -452,9 +452,21 @@ pub async fn run_llm_loop<L: LlmCapability>(
     let mut produced: HashMap<ArtifactKey, ArtifactValue> = HashMap::new();
 
     const MAX_STEPS: usize = 8; // guard against a non-terminating tool loop
-    for _ in 0..MAX_STEPS {
+    for step in 0..MAX_STEPS {
         match llm.chat(&messages, &schemas).await? {
-            LlmResponse::Message(text) => return Ok((text, produced)),
+            LlmResponse::Message(text) => {
+                // DEBUG PROBE (report.data SET path): the loop is terminating on a *text* message.
+                // If a required sink tool (e.g. `emit_report`) was never Produced, `produced` is
+                // empty/partial here and the downstream stage will fail with `missing artifact`.
+                tracing::debug!(
+                    target: "agent::probe",
+                    step,
+                    produced_keys = ?produced.keys().map(|k| k.to_string()).collect::<Vec<_>>(),
+                    text_preview = %text.chars().take(120).collect::<String>(),
+                    "run_llm_loop: model returned final MESSAGE (no further tool calls)"
+                );
+                return Ok((text, produced));
+            }
             LlmResponse::ToolCalls(calls) => {
                 messages.push(LlmMessage::Assistant {
                     content: None,
@@ -473,11 +485,31 @@ pub async fn run_llm_loop<L: LlmCapability>(
                     // A fatal `Err` aborts (`?`); a `Rejected` is fed back for a retry.
                     let content = match tool.call(arguments).await? {
                         ToolOutcome::Produced(value) => {
+                            // DEBUG PROBE (report.data SET path): a tool successfully produced its
+                            // target artifact. For the composer, `target` is `report.data`.
+                            tracing::debug!(
+                                target: "agent::probe",
+                                step,
+                                tool = %name,
+                                artifact = %tool.target(),
+                                "run_llm_loop: tool PRODUCED artifact"
+                            );
                             produced.insert(tool.target(), value.clone());
                             value.to_string()
                         }
                         // Do NOT record an artifact: the model must correct and call again.
-                        ToolOutcome::Rejected { reason } => format!("REJECTED: {reason}"),
+                        ToolOutcome::Rejected { reason } => {
+                            // DEBUG PROBE: a tool call was rejected (schema/validation). Repeated
+                            // rejections are a prime reason `report.data` never gets set.
+                            tracing::debug!(
+                                target: "agent::probe",
+                                step,
+                                tool = %name,
+                                %reason,
+                                "run_llm_loop: tool call REJECTED (fed back for retry)"
+                            );
+                            format!("REJECTED: {reason}")
+                        }
                     };
                     messages.push(LlmMessage::Tool {
                         tool_call_id: id,

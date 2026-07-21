@@ -414,9 +414,30 @@ impl SubAgent for Renderer {
         // The structured report is required — the renderer's whole job is to inject it. A non-JSON
         // value at `report.data` is a wiring fault, surfaced as missing (typed, never a panic).
         let key = ArtifactKey::report_data();
+        // DEBUG PROBE (report.data GET path): dump the full artifact map the renderer sees. When the
+        // error reproduces, `report.data` is absent here (composer never Produced it) or present but
+        // not `Json` — this line disambiguates the two.
+        tracing::debug!(
+            target: "agent::probe",
+            available_keys = ?data.artifacts.keys().map(|k| k.to_string()).collect::<Vec<_>>(),
+            report_data_present = data.artifacts.contains_key(&key),
+            report_data_variant = ?data.artifacts.get(&key).map(|v| match v {
+                ArtifactValue::Json(_) => "Json",
+                ArtifactValue::Text(_) => "Text",
+                ArtifactValue::Number(_) => "Number",
+            }),
+            "renderer: looking up report.data before injection"
+        );
         let report_json = match data.artifacts.get(&key) {
             Some(ArtifactValue::Json(v)) => v.clone(),
-            _ => return Err(AgentError::MissingArtifact(key)),
+            _ => {
+                tracing::warn!(
+                    target: "agent::probe",
+                    artifact = %key,
+                    "renderer: report.data MISSING or non-Json — failing with MissingArtifact"
+                );
+                return Err(AgentError::MissingArtifact(key));
+            }
         };
 
         Ok(AgentPayload::Final(FinalResult {
