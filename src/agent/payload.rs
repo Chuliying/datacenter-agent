@@ -423,6 +423,12 @@ pub trait Tool: Send + Sync {
 /// - `system`: the agent's system instruction.
 /// - `user`: the assembled user turn (prompt plus any carried material).
 /// - `tools`: the agent's granted tools — the only ones the model may call.
+/// - `required`: an artifact this stage **must** produce before it may finish (typically a sink
+///   tool's target, e.g. the composer's `report.data`). When the model tries to end without it,
+///   the loop nudges it to call the tool for real (up to `MAX_OUTPUT_RETRIES`); if it still hasn't
+///   produced it, the loop fails with [`AgentError::MissingArtifact`] rather than returning a
+///   spurious success. `None` imposes no requirement (the model may legitimately answer with prose
+///   or call no tool).
 ///
 /// # Returns
 ///
@@ -432,8 +438,10 @@ pub trait Tool: Send + Sync {
 /// # Errors
 ///
 /// - [`AgentError::UnknownTool`] — the model called a tool outside this agent's set.
+/// - [`AgentError::MissingArtifact`] — a `required` output was never produced, even after the
+///   retry nudges (or after the step cap).
 /// - [`AgentError::Capability`] — the LLM transport failed, a tool failed fatally, or the loop
-///   exceeded its step cap (`MAX_STEPS`).
+///   exceeded its step cap (`MAX_STEPS`) with no required output declared.
 ///
 /// # References
 ///
@@ -443,6 +451,7 @@ pub async fn run_llm_loop<L: LlmCapability>(
     system: &str,
     user: &str,
     tools: &[Box<dyn Tool>],
+    required: Option<&ArtifactKey>,
 ) -> Result<(String, HashMap<ArtifactKey, ArtifactValue>), AgentError> {
     let schemas: Vec<ToolSchema> = tools.iter().map(|t| t.schema()).collect();
     let mut messages = vec![
@@ -452,9 +461,52 @@ pub async fn run_llm_loop<L: LlmCapability>(
     let mut produced: HashMap<ArtifactKey, ArtifactValue> = HashMap::new();
 
     const MAX_STEPS: usize = 8; // guard against a non-terminating tool loop
+    // How many times to nudge a model that ends without its `required` output before giving up.
+    const MAX_OUTPUT_RETRIES: usize = 3;
+    let mut output_retries = 0usize;
     for step in 0..MAX_STEPS {
         match llm.chat(&messages, &schemas).await? {
             LlmResponse::Message(text) => {
+                // Required-output guard. A stage with a mandatory output (the composer's
+                // `report.data`) must not finish without it. When the model tries to terminate on a
+                // bare message — e.g. it replied "報告已成功提交。" after a rejected tool call — nudge
+                // it to call the tool for real, up to `MAX_OUTPUT_RETRIES`. This is what turns a
+                // flaky model's premature "done" into an actual retry instead of a downstream
+                // `missing artifact` failure.
+                if let Some(key) = required {
+                    if !produced.contains_key(key) {
+                        if output_retries >= MAX_OUTPUT_RETRIES {
+                            tracing::warn!(
+                                artifact = %key,
+                                retries = output_retries,
+                                "run_llm_loop: required output still missing after retries — failing stage"
+                            );
+                            return Err(AgentError::MissingArtifact(key.clone()));
+                        }
+                        output_retries += 1;
+                        tracing::warn!(
+                            artifact = %key,
+                            attempt = output_retries,
+                            max = MAX_OUTPUT_RETRIES,
+                            text_preview = %text.chars().take(120).collect::<String>(),
+                            "run_llm_loop: model ended without its required output — nudging to retry"
+                        );
+                        // Keep the transcript coherent: record what the model said, then instruct it
+                        // (as the user) to actually call the tool.
+                        messages.push(LlmMessage::Assistant {
+                            content: Some(text),
+                            tool_calls: vec![],
+                        });
+                        messages.push(LlmMessage::User(format!(
+                            "You have NOT produced the required result yet: the `{key}` artifact is \
+                             missing because no tool call has succeeded. Do not reply with prose or a \
+                             confirmation. You MUST call the required tool now with valid, \
+                             fully-populated arguments — every field present, and nested values as \
+                             real JSON objects/arrays, never as strings."
+                        )));
+                        continue;
+                    }
+                }
                 // DEBUG PROBE (report.data SET path): the loop is terminating on a *text* message.
                 // If a required sink tool (e.g. `emit_report`) was never Produced, `produced` is
                 // empty/partial here and the downstream stage will fail with `missing artifact`.
@@ -517,6 +569,17 @@ pub async fn run_llm_loop<L: LlmCapability>(
                     });
                 }
             }
+        }
+    }
+    // Step cap hit. If a required output was declared and never produced, report *that* — it is the
+    // actionable failure — rather than a generic step-cap message.
+    if let Some(key) = required {
+        if !produced.contains_key(key) {
+            tracing::warn!(
+                artifact = %key,
+                "run_llm_loop: exhausted max steps without producing required output"
+            );
+            return Err(AgentError::MissingArtifact(key.clone()));
         }
     }
     Err(AgentError::Capability(
@@ -595,12 +658,60 @@ mod tests {
                 LlmResponse::Message("done".into()),
             ]),
         };
-        let (text, produced) = run_llm_loop(&llm, "sys", "go", &tools).await.unwrap();
+        let (text, produced) = run_llm_loop(&llm, "sys", "go", &tools, None)
+            .await
+            .unwrap();
         assert_eq!(text, "done");
         assert_eq!(
             produced.get(&ArtifactKey::fetcher_records()),
             Some(&ArtifactValue::Text("echoed".into()))
         );
+    }
+
+    // The required-output guard: a model that ends with prose before producing its mandatory
+    // artifact is nudged to retry, then succeeds on the retry — no downstream `missing artifact`.
+    #[tokio::test]
+    async fn required_output_nudges_a_premature_message_then_succeeds() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let llm = ScriptedLlm {
+            turns: Mutex::new(vec![
+                // 1st turn: the model gives up early with a bare "done" — no tool call.
+                LlmResponse::Message("done, report submitted".into()),
+                // 2nd turn (after the nudge): it actually calls the tool.
+                LlmResponse::ToolCalls(vec![ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                // 3rd turn: now it may finish.
+                LlmResponse::Message("done for real".into()),
+            ]),
+        };
+        let required = ArtifactKey::fetcher_records(); // EchoTool's target
+        let (text, produced) = run_llm_loop(&llm, "sys", "go", &tools, Some(&required))
+            .await
+            .unwrap();
+        assert_eq!(text, "done for real");
+        assert!(produced.contains_key(&required));
+    }
+
+    // When the model NEVER produces the required output, the stage fails with `MissingArtifact`
+    // after exhausting the retry budget — instead of returning a spurious success.
+    #[tokio::test]
+    async fn required_output_fails_after_exhausting_retries() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        // The model stubbornly replies with prose every turn, never calling the tool.
+        let turns = std::iter::repeat_with(|| LlmResponse::Message("all done!".into()))
+            .take(8)
+            .collect();
+        let llm = ScriptedLlm {
+            turns: Mutex::new(turns),
+        };
+        let required = ArtifactKey::report_data();
+        let err = run_llm_loop(&llm, "sys", "go", &tools, Some(&required))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::MissingArtifact(k) if k == required));
     }
 
     #[tokio::test]
@@ -613,7 +724,9 @@ mod tests {
                 arguments: serde_json::json!({}),
             }])]),
         };
-        let err = run_llm_loop(&llm, "sys", "go", &tools).await.unwrap_err();
+        let err = run_llm_loop(&llm, "sys", "go", &tools, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::UnknownTool(name) if name == "not_granted"));
     }
 }
