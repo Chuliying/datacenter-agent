@@ -1,0 +1,211 @@
+---
+output: docs/work/agentgateway-openai-endpoint/spec.md
+stage: spec
+slug: agentgateway-openai-endpoint
+prd: docs/work/agentgateway-openai-endpoint/prd.md
+---
+
+# Spec — OpenAI 相容 `POST /v1/chat/completions` 端點
+
+## Capability Snapshot（manifest）
+
+| flag | 值 | 影響 |
+|---|---|---|
+| has_api | true | 新增對外 HTTP API;提供 request/response 範例 |
+| typed_contracts | true | Rust serde 型別;實作後以 `cargo check` 驗證 |
+| has_ui | false | 無 UI/mockup/token（Transformer N/A） |
+| has_e2e | false | 無 E2E |
+| Story 類型 | **新功能** | 使用 spec-template |
+
+## 目標
+
+方案 A:新增 `POST /v1/chat/completions`(OpenAI 相容,含 SSE)掛 agentgateway Path C,共用現有 runtime prelude + sub-agent pipeline;`/agent/stream` 與豐富事件原樣保留。
+
+## 關鍵技術決策（Decisions）
+
+> D1/D2 修正 PRD 的技術假設(基於 code 研究,佐證見各項)。
+
+### D1 — 串流採「偽串流」（真串流不可行）
+- **事實**:sub-agent pipeline 的最終答案由終端純邏輯 stage 事後組裝——insight 的 `Finalizer` 把 analyst 報告 `trim_end` 後**附加 charts fenced block**([pipeline.rs:304](src/agent/pipeline.rs:304));report 的 `Renderer` 產出注入 `report.data` 的 **HTML**([pipeline.rs:434](src/agent/pipeline.rs:434))。`AgentEvent::ContentDelta` 只由 streaming LLM adapter 發([llm.rs:485](src/agent/llm.rs:485)),是各 stage 的**中間 preview**,終端純邏輯 stage 不發。故**無任何 token 流等於最終答案**;現有契約在 `Finished` 時發 `[Clear, Token(完整答案), Done]`([handler.rs:821](src/server/handler.rs:821))撤回 preview。OpenAI `delta` 無撤回語意。
+- **決策**:跑 pipeline 到 `AgentEvent::Finished`(或 buffered `run()` 拿 `FinalResult.assistant`),取完整答案字串,**切塊逐塊送** `chat.completion.chunk`(`choices[0].delta.content`);首塊帶 `role:"assistant"`,末塊 `delta:{}` + `finish_reason:"stop"`,再 `data: [DONE]`。**不轉發中間 preview**。
+- **影響**:首 token 延遲 ≈ 完整計算時間(等同現有 clear+重送語意,只是改為分塊)。這是 pipeline 架構的本質限制,不是實作選擇。
+
+### D2 — 非串流走 buffered pipeline（Option A），不字面接 `run_agent_turn`
+- **事實**:`run_agent_turn` / `LlmAgentPort` 驅動的是**舊 monolith** loop([turn.rs:156](src/runtime/turn.rs:156)),production 未使用;`AgentTurnOutcome` 也無 usage 欄位([turn.rs:35](src/runtime/turn.rs:35))。
+- **決策**:非串流仿 `/agent/stream` 但 buffered——`plan_stream_turn` prelude → `wants_report_pipeline(&normalized)` 選 pipeline → `build_*_pipeline(..., sink=None)` → `Orchestrator::run()` → `final_answer(outcome)`([handler.rs:748](src/server/handler.rs:748))。達成 **REST/stream 同後端(pipeline)**,契合使用者「REST/stream 同組件」判準。
+
+### D3 — usage 自行累加
+- pipeline 每個 stage 各發一次 `AgentEvent::Usage`([llm.rs:634](src/agent/llm.rs:634)),**目前無任何累計**。新端點累加所有 `Usage`(sum prompt/completion/total,reasoning 有則 sum)填 OpenAI `usage`。⚠️ buffered `OpenAiLlm` **不發 Usage**([llm.rs:401](src/agent/llm.rs:401)):非串流若要 usage,需改用 streaming client + 收集 sink(見 Steps 5;否則非串流 usage 從缺並標註)。
+
+### D4 — prompt 長度上限 4000（runtime）
+走 `plan_stream_turn` prelude → `input_guard::validate_prompt(prompt, 4000)`([input_guard.rs:6](src/runtime/guardrails/input_guard.rs:6)、[config.rs:38](src/runtime/config.rs:38))。非 legacy 2000。
+
+### D5 — system message 忽略
+pipeline 無 system 槽(各 stage 自帶 designed instruction,[payload.rs:179](src/agent/payload.rs:179))。傳入 `role:"system"` 忽略(spec 明確;不 prepend,避免污染既有 stage prompt 設計)。
+
+### D6 — auth 沿用 bearer（418）
+新路由掛在 auth layer 之前,自動繼承 `require_bearer`(比對 `GLOBAL_TOKEN`,失敗 **418**,[auth.rs:54](src/server/auth.rs:54))。不改共用 middleware(避免影響其他 7 條端點)。與 OpenAI/gateway 慣例 401 的差異記錄,由平台端知悉(gateway 自管對外認證,418 僅在 gateway 傳錯 token 時出現)。
+
+### D7 — runtime-off 行為
+端點需 runtime(走 prelude);`RUNTIME_ENABLED=false` 時回 **503** + OpenAI 風格 error body(與 `/agent/stream` 一致,[handler.rs:455](src/server/handler.rs:455))。
+
+## Files
+
+| 檔案 | 動作 | 內容 |
+|---|---|---|
+| `src/server/openai.rs` | **NEW** | OpenAI DTO(`ChatCompletionRequest/Response/Chunk`、`ChatMessage`、`Usage`)+ `messages↔AgentRequest` 映射 + usage 累加 helper |
+| `src/server/handler.rs` | **MODIFY** | 新增 `chat_completions` handler;複用 `sse_event`/`INSIGHT_STREAM_BUFFER`/`final_answer`/`wants_report_pipeline`/`insight_error_to_app_error` |
+| `src/server/route.rs` | **MODIFY** | `Router::new()`([route.rs:61](src/server/route.rs:61))auth layer **之前**加 `.route("/v1/chat/completions", post(handler::chat_completions))` |
+| `src/server/mod.rs` | **MODIFY** | `mod openai;` |
+| `src/agent/llm.rs` / `payload.rs` | **MODIFY(僅非串流要 usage)** | buffered `OpenAiLlm::chat` 補發 `Usage`,或 `FinalResult` 加 usage 欄位([payload.rs:229](src/agent/payload.rs:229) 已預留 EXTEND) |
+
+> 不動 `run_agent_turn`(D2);Option C(`PipelineAgentPort`)不在本次範圍。
+
+## Contracts（資料契約）
+
+### 新增 OpenAI DTO（`src/server/openai.rs`）
+```rust
+#[derive(Deserialize)]
+pub struct ChatCompletionRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)] pub stream: bool,
+}
+#[derive(Deserialize)]
+pub struct ChatMessage { pub role: String, pub content: String }
+
+#[derive(Serialize)]
+pub struct ChatCompletionResponse {   // stream=false
+    pub id: String, pub object: &'static str /* "chat.completion" */,
+    pub created: i64, pub model: String,
+    pub choices: Vec<Choice>, pub usage: Usage,
+}
+#[derive(Serialize)]
+pub struct Choice { pub index: u32, pub message: ChatMessage, pub finish_reason: String }
+
+#[derive(Serialize)]
+pub struct ChatCompletionChunk {      // stream=true (每塊)
+    pub id: String, pub object: &'static str /* "chat.completion.chunk" */,
+    pub created: i64, pub model: String, pub choices: Vec<ChunkChoice>,
+}
+#[derive(Serialize)]
+pub struct ChunkChoice { pub index: u32, pub delta: Delta, pub finish_reason: Option<String> }
+#[derive(Serialize, Default)]
+pub struct Delta { #[serde(skip_serializing_if="Option::is_none")] pub role: Option<String>,
+                   #[serde(skip_serializing_if="Option::is_none")] pub content: Option<String> }
+
+#[derive(Serialize, Default)]
+pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub total_tokens: u32,
+                   #[serde(skip_serializing_if="Option::is_none")] pub completion_tokens_details: Option<ReasoningDetails> }
+```
+> `created` 由呼叫端傳入(避免在純函式取時間);`id` 用固定前綴 + 計數/隨機來源由 handler 提供。
+
+### 既有內部型別（引用,不改）
+`AgentRequest`([dto.rs:27](src/server/dto.rs:27))[EXISTING]、`StreamPlan`/`AgentTurnDeps`([turn.rs:70](src/runtime/turn.rs:70))[EXISTING]、`AgentEvent`([agent](src/agent))[EXISTING]、`UsageData`([dto.rs:155](src/server/dto.rs:155))[EXISTING,可複用累加]。
+
+### 映射規則 `messages → AgentRequest`
+- 最後一則 `role:"user"` → `prompt`;其前的 user/assistant **依序配對** → `history: Vec<History>{user_prompt, model_response}`。
+- `role:"system"` → 忽略(D5)。
+- 空 `messages` 或無任何 user → 400（`ERR2`）。
+- 相鄰同 role / 孤立 assistant → 400(格式錯),spec 定義為硬性規則。
+- `session_id`/`option_id` → OpenAI body 無 → `None`(memory 停用,等同 `sessions=None`)。
+
+## API
+
+### `POST /v1/chat/completions`（bearer required,D6）
+
+Request(OpenAI 標準):
+```json
+{"model":"<rd-model>","messages":[{"role":"user","content":"上個月營收多少?"}],"stream":false}
+```
+Response(stream=false):
+```json
+{"id":"chatcmpl-…","object":"chat.completion","created":1750000000,"model":"<rd-model>",
+ "choices":[{"index":0,"message":{"role":"assistant","content":"<report+charts 或 HTML>"},"finish_reason":"stop"}],
+ "usage":{"prompt_tokens":…,"completion_tokens":…,"total_tokens":…}}
+```
+Response(stream=true,SSE 逐塊,偽串流 D1):
+```
+data: {"id":"chatcmpl-…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+data: {"…","choices":[{"index":0,"delta":{"content":"<答案分塊 1>"},"finish_reason":null}]}
+data: {"…","choices":[{"index":0,"delta":{"content":"<答案分塊 2>"},"finish_reason":null}]}
+data: {"…","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: [DONE]
+```
+
+## Data Flow
+
+```
+messages ──(映射)──▶ AgentRequest ──▶ plan_stream_turn(dummy AgentPort + no-op emit)  [prelude 共用]
+                                          │
+                                StreamPlan┤
+   Error   ─▶ OpenAI error(依 status)
+   Refused ─▶ 200 + copy 當單一 assistant 內容(stream 則分塊)
+   Proceed ─▶ wants_report_pipeline(&normalized) 選 report / insight pipeline
+                 ├─ stream=false: build_*_pipeline(sink=None) → Orchestrator::run() → final_answer → ChatCompletionResponse   [D2]
+                 └─ stream=true : build_*_pipeline(sink) → spawn run_emitting → 收 AgentEvent
+                        累加 Usage(D3);忽略中間 ContentDelta;
+                        於 Finished 取完整 assistant → 切塊送 chunk → finish_reason:"stop" → [DONE]   [D1]
+```
+prelude 呼叫樣板見 [handler.rs:496](src/server/handler.rs:496)(dummy `UnusedAgentPort` + no-op emit,`plan_stream_turn` 不碰 agent/emit)。
+
+## Errors
+
+| 代號 | 觸發 | HTTP | body |
+|---|---|---|---|
+| ERR1 | RUNTIME_ENABLED=false | 503 | OpenAI error(D7) |
+| ERR2 | messages 空/無 user/格式錯/非法 JSON | 400 | OpenAI error(`invalid_request_error`) |
+| ERR3 | prompt > 4000(D4) | 400 | OpenAI error |
+| ERR4 | bearer 失敗 | 418(D6) | 現有 auth 回應 |
+| ERR5 | LLM/MCP capability 失敗 | 502 | OpenAI error(對映 `insight_error_to_app_error` Capability→502) |
+
+## Steps（分步實作）
+
+1. [ ] **OpenAI DTO + 映射 + usage helper**（45min）
+   - 檔案:`src/server/openai.rs` [NEW]、`src/server/mod.rs` [MODIFY]
+   - `messages→AgentRequest`、`accumulate_usage(&[UsageData])`、chunk/response 建構 helper
+2. [ ] **映射單元測試**（30min）— 依賴 1;多輪/空/system/相鄰同 role/長度
+3. [ ] **`chat_completions` handler 非串流路徑**（60min）[MODIFY handler.rs]— 依賴 1;prelude→分流→Option A buffered→`ChatCompletionResponse`
+4. [ ] **串流路徑(偽串流)**（45min）— 依賴 3;收到 Finished 取完整答案切塊送 chunk + `[DONE]`
+5. [ ] **usage 累加**（30min）— 依賴 3/4;串流端累加 `AgentEvent::Usage`;非串流若要 usage 需 buffered adapter 補發(否則標註從缺)
+6. [ ] **route 註冊**（10min）[MODIFY route.rs]— auth layer 之前
+7. [ ] **整合測試 + 規格書 C-3 curl**（45min）— 對照 AC1–5;`cargo test` + 手動 curl(串流/非串流)
+
+**總估時 ≈ 4h15m**（不含 D3 buffered-usage 的擴充,若需另 +30–45min）
+
+## Test Strategy
+
+- **Unit**(`tests/` 或模組內):
+  - `messages→AgentRequest`:單輪 / 多輪配對 / 只有 system(→400)/ 空(→400)/ 相鄰同 role(→400)。
+  - `accumulate_usage`:多筆 Usage 加總,reasoning 有無。
+  - chunk 序列化格式(delta.content、finish_reason、`[DONE]` sentinel)。
+- **Integration**(對照 AC):
+  - AC1 非串流:200 + `choices[0].message.content` 非空 + `usage`。
+  - AC2 串流:逐塊 `delta.content`,末塊 `finish_reason:"stop"`,收到 `data: [DONE]`。
+  - AC3:`/agent/stream` 既有測試不受影響(回歸)。
+  - AC5:injection 輸入 → 走 prelude 被 refuse(對照 `/agent/stream` refuse 行為)。
+  - ERR1 runtime-off → 503;ERR3 超長 → 400;ERR4 無 token → 418。
+
+## Gate 2 自檢
+
+| 類別 | 結果 | 證據 |
+|---|---|---|
+| Environment | PASS | auth 沿用 require_bearer(D6);無 rate-limit 現況一致;manifest 無 `environment_rules` → 依既有慣例 |
+| Tech Research | PASS | code 研究報告(pipeline 串流語意、run_agent_turn、plan_stream_turn),repo evidence 充分 |
+| 檔案清單 | PASS | 每個 FR 有對應檔案(見 Files) |
+| Typed contract | PENDING→實作驗 | 契約已定義;實作步驟 1 後以 `cargo check` 驗證(typed_contracts=true) |
+| API 範例 | PASS | request/response/chunk 範例符合上述契約 |
+| Transformer | N/A | has_ui=false |
+| 無未定義引用 | PASS | 複用符號均標 [EXISTING] 並附 file:line |
+| 資料流 | PASS | Data Flow 圖含 stream/非-stream 兩路 |
+| 測試案例 | PASS | Unit + Integration 規劃對照 AC |
+| UI Token/Mockup | N/A | has_ui=false |
+| 版控 | PASS | 見版本歷史 |
+
+> 一個 Gate 2 殘留待實作確認:**Typed contract** 需步驟 1 完成後 `cargo check` 實跑驗證(spec 階段無 code 無法編譯)。
+
+## 版本歷史
+
+| 時間 | 內容 | 對應 PRD 版本 | 作者 |
+|---|---|---|---|
+| 2026-07-22 | 初版;含 D1 偽串流、D2 buffered pipeline 兩項對 PRD 技術假設的修正 | prd v1(approved) | Chuliying + Claude |

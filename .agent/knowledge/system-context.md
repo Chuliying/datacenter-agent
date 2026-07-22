@@ -20,12 +20,16 @@ main / AppState
   └─ optional AppRuntime (built only when runtime routing is active)
 
 axum Router
-  ├─ all five routes require bearer; failure is 418
+  ├─ all eight routes require bearer; failure is 418
   ├─ trace + very-permissive CORS + compression
   ├─ 120s handler-future timeout + security headers + 64KiB body limit
-  └─ /agent and /agent/stream
-       ├─ runtime run_agent_turn (default)
-       └─ legacy llm_connector (explicit RUNTIME_ENABLED=false/0 rollback)
+  ├─ /health, /ready, /greeting
+  ├─ /insight + /report (buffered) and /insight/stream + /report/stream (SSE)
+  │    └─ drive build_{insight,report}_pipeline directly, bypassing the runtime
+  └─ /agent/stream (SSE) — the only runtime-routed production path
+       ├─ plan_stream_turn prelude (audit/guardrails/intent/answer-policy/memory),
+       │    then the handler drives the sub-agent pipeline itself (no-op AgentPort)
+       └─ requires runtime; 503 when RUNTIME_ENABLED=false (use /insight|/report stream)
 ```
 
 The runtime is partial, not a completed config-only platform. Current wiring and maturity are maintained in the [reference root](../../docs/reference/index.md#8-runtime-成熟度總覽).
@@ -45,7 +49,8 @@ The runtime is partial, not a completed config-only platform. Current wiring and
 
 ## Important current facts
 
-- `/health`, `/ready`, `/greeting`, `/agent`, `/agent/stream` all require bearer; `auth::check` has no path exemption.
+- All eight routes (`/health`, `/ready`, `/greeting`, `/insight`[`/stream`], `/report`[`/stream`], `/agent/stream`) require bearer via `require_bearer`; no path exemption.
+- `/agent/stream` runs the `plan_stream_turn` prelude then drives the sub-agent pipeline itself; the aggregated `run_agent_turn` exists but is not wired to any route (tests only). `/insight` and `/report` bypass the runtime entirely.
 - Legacy prompt cap is 2000 chars; runtime EV-pack cap is 4000.
 - Runtime SSE validates inside a spawned task, so structural errors are HTTP 200 + SSE error frame.
 - `InputPipeline` hard-codes normalize→injection→intent→slots and does not dispatch `input_stages`.
