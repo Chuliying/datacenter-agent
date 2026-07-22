@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-22
+
+### Changed
+
+- Prompt guides are now loaded at boot instead of being hard-coded at compile time.
+
+## [0.2.1] - 2026-07-22
+
+### Fixed
+
+- Nested tool arguments no longer crash the argument parser, which previously
+  broke the report pipeline.
+
+## [0.2.0] - 2026-07-16
+
+### Changed
+
+- Separated the agent into dedicated subagents.
+
 ## [0.1.2] - 2026-06-06
 
 ### Added

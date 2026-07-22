@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "datacenter-agent"
-version = "0.1.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-openai",
