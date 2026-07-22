@@ -121,6 +121,16 @@ pub struct PromptBank {
     pub greeting_analyst_system: String,
     /// Greeting pipeline — the boot-time request prompt (the `Initial` payload's prompt).
     pub greeting_user: String,
+    /// `/insight` + `/report` pipelines — the shared data-fetch stage's system prompt.
+    pub fetcher_system: String,
+    /// `/insight` pipeline — the analyst stage's system prompt (writes the markdown report).
+    pub analyst_system: String,
+    /// `/insight` pipeline — the charter stage's system prompt (decides 0–2 charts).
+    pub charter_system: String,
+    /// `/report` pipeline — the analyst stage's system prompt (writes the insight narrative).
+    pub report_analyst_system: String,
+    /// `/report` pipeline — the composer stage's system prompt (maps data into `emit_report`).
+    pub report_composer_system: String,
 }
 
 impl PromptBank {
@@ -128,14 +138,20 @@ impl PromptBank {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if any of `agent_system`, `greeting_fetcher_system`,
-    /// `greeting_analyst_system`, or `greeting_user` is missing from the loaded config.
+    /// Returns `Err` if any required prompt id — `agent_system`, the `greeting_*` ids, or the
+    /// `/insight` + `/report` stage prompts (`fetcher_system`, `analyst_system`, `charter_system`,
+    /// `report_analyst_system`, `report_composer_system`) — is missing from the loaded config.
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
             greeting_fetcher_system: cfg.get_prompt_by_id("greeting_fetcher_system")?.to_string(),
             greeting_analyst_system: cfg.get_prompt_by_id("greeting_analyst_system")?.to_string(),
             greeting_user: cfg.get_prompt_by_id("greeting_user")?.to_string(),
+            fetcher_system: cfg.get_prompt_by_id("fetcher_system")?.to_string(),
+            analyst_system: cfg.get_prompt_by_id("analyst_system")?.to_string(),
+            charter_system: cfg.get_prompt_by_id("charter_system")?.to_string(),
+            report_analyst_system: cfg.get_prompt_by_id("report_analyst_system")?.to_string(),
+            report_composer_system: cfg.get_prompt_by_id("report_composer_system")?.to_string(),
         })
     }
 }
