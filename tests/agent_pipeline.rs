@@ -66,6 +66,8 @@ use datacenter_agent::agent::pipeline::{
     agent_pipeline_id, analyst_config, charter_config, fetcher_config, Finalizer,
 };
 use datacenter_agent::agent::tools::{emit_chart_tool, McpTool, StreamingTool, ToolId};
+use datacenter_agent::appstate::PromptBank;
+use datacenter_agent::config::AppConfig;
 use datacenter_agent::mcp_client::McpClient;
 use tokio::sync::mpsc;
 
@@ -125,6 +127,11 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
     let prompt = std::env::var("AGENT_PROMPT")
         .unwrap_or_else(|_| "比較最近兩個月的營收，並用一段話總結趨勢。".into());
 
+    // ── load the stage prompts from config.toml, exactly as the server does at boot: the
+    //    per-stage system instructions are now dynamically loaded, not compiled in ──
+    let app_config = AppConfig::load("config/config.toml").expect("load config/config.toml");
+    let prompts = PromptBank::from_app_config(&app_config).expect("resolve prompt bank");
+
     // ── connect to the datacenter MCP server and discover the data tool ──
     let client = McpClient::connect_http(&mcp_url)
         .await
@@ -179,19 +186,19 @@ async fn agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter() {
         ArtifactKey::fetcher_records(),
     ));
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &fetcher_config(),
+        &fetcher_config(&prompts.fetcher_system),
         buffered.clone(),
         StreamingTool::wrap_all(vec![fetch_mcp], sink.clone()),
         OutputShape::Intermediate,
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &analyst_config(),
+        &analyst_config(&prompts.analyst_system),
         streaming.clone(),
         vec![],
         OutputShape::Intermediate,
     ));
     let charter: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &charter_config(),
+        &charter_config(&prompts.charter_system),
         buffered.clone(),
         StreamingTool::wrap_all(vec![Box::new(emit_chart_tool())], sink.clone()),
         OutputShape::Intermediate,

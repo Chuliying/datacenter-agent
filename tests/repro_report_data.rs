@@ -37,6 +37,8 @@ use datacenter_agent::agent::payload::{
 };
 use datacenter_agent::agent::pipeline::{report_composer_config, Renderer};
 use datacenter_agent::agent::tools::emit_report_tool;
+use datacenter_agent::appstate::PromptBank;
+use datacenter_agent::config::AppConfig;
 
 fn require_env(key: &str) -> String {
     std::env::var(key)
@@ -120,8 +122,11 @@ async fn reproduce_missing_report_data() {
     };
     let llm: Arc<_> = Arc::new(OpenAiLlm::from_resolved(&resolved).expect("build composer LLM"));
 
-    // The composer: real config + real `emit_report` sink, exactly as wired in production.
-    let composer_cfg: SubAgentConfig = report_composer_config();
+    // The composer: real config + real `emit_report` sink, exactly as wired in production. Its
+    // system instruction is loaded from config.toml at boot, just like the server does.
+    let app_config = AppConfig::load("config/config.toml").expect("load config/config.toml");
+    let prompts = PromptBank::from_app_config(&app_config).expect("resolve prompt bank");
+    let composer_cfg: SubAgentConfig = report_composer_config(&prompts.report_composer_system);
     let composer = ConfiguredAgent::new(
         &composer_cfg,
         llm,
