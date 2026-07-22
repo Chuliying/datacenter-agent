@@ -117,6 +117,8 @@ fn build_stage_llm(
 ///   from here so the model sees the server's real argument shape.
 /// - `mcp_instructions`: the MCP server's handshake conventions, appended to the `fetcher`'s
 ///   instruction (the data-tool-bearing stage) when present — parity with the legacy assembly.
+/// - `fetcher_instruction` / `analyst_instruction` / `charter_instruction`: the three LLM stages'
+///   system prompts, resolved at boot from `config.toml`'s `[prompts.*]` section.
 /// - `fetcher_grant` / `charter_grant`: the config-driven tool grants for those stages.
 /// - `resolved`: the fully-resolved LLM every stage runs on.
 /// - `sink`: `Some` selects the streaming shape; `None` is fully buffered.
@@ -131,10 +133,14 @@ fn build_stage_llm(
 ///   [`validate_insight_grants`]);
 /// - the vendor HTTP client could not be built from `resolved`;
 /// - a pipeline stage reference failed to resolve (an internal wiring bug).
+#[allow(clippy::too_many_arguments)]
 pub fn build_insight_pipeline(
     mcp: McpHandle,
     discovered: &[ChatCompletionTool],
     mcp_instructions: Option<&str>,
+    fetcher_instruction: &str,
+    analyst_instruction: &str,
+    charter_instruction: &str,
     fetcher_grant: &[String],
     charter_grant: &[String],
     resolved: &ResolvedLlm,
@@ -152,7 +158,7 @@ pub fn build_insight_pipeline(
         .context("build minimal-reasoning insight LLM")?;
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
-    let mut fetcher_cfg = fetcher_config();
+    let mut fetcher_cfg = fetcher_config(fetcher_instruction);
     fetcher_cfg.instruction = compose_with_mcp(&fetcher_cfg.instruction, mcp_instructions);
 
     // ── the four stages; upstream shapes are Intermediate, the finalizer is the terminal Final ──
@@ -163,13 +169,13 @@ pub fn build_insight_pipeline(
         OutputShape::Intermediate,
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &analyst_config(),
+        &analyst_config(analyst_instruction),
         llm.clone(),
         vec![], // the analyst only reasons over provided material
         OutputShape::Intermediate,
     ));
     let charter: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &charter_config(),
+        &charter_config(charter_instruction),
         llm, // chart selection is a judgment — keep the default reasoning budget
         charter_tools,
         OutputShape::Intermediate,
@@ -219,6 +225,8 @@ pub fn build_insight_pipeline(
 /// # Arguments
 ///
 /// - `mcp` / `discovered` / `mcp_instructions`: as for [`build_insight_pipeline`].
+/// - `fetcher_instruction` / `analyst_instruction` / `composer_instruction`: the three LLM stages'
+///   system prompts, resolved at boot from `config.toml`'s `[prompts.*]` section.
 /// - `fetcher_grant`: the datacenter tools the report fetcher may call (shares the `/insight`
 ///   fetcher's grant — the same broad snapshot).
 /// - `resolved`: the fully-resolved LLM every LLM stage runs on.
@@ -230,10 +238,14 @@ pub fn build_insight_pipeline(
 ///
 /// As for [`build_insight_pipeline`]: a granted MCP tool absent from the server, an LLM client that
 /// fails to build, or an unresolvable stage reference.
+#[allow(clippy::too_many_arguments)]
 pub fn build_report_pipeline(
     mcp: McpHandle,
     discovered: &[ChatCompletionTool],
     mcp_instructions: Option<&str>,
+    fetcher_instruction: &str,
+    analyst_instruction: &str,
+    composer_instruction: &str,
     fetcher_grant: &[String],
     resolved: &ResolvedLlm,
     template: Arc<String>,
@@ -254,7 +266,7 @@ pub fn build_report_pipeline(
         .context("build minimal-reasoning report LLM")?;
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
-    let mut fetcher_cfg = fetcher_config();
+    let mut fetcher_cfg = fetcher_config(fetcher_instruction);
     fetcher_cfg.instruction = compose_with_mcp(&fetcher_cfg.instruction, mcp_instructions);
 
     // ── the four stages; upstream shapes are Intermediate, the renderer is the terminal Final ──
@@ -265,14 +277,14 @@ pub fn build_report_pipeline(
         OutputShape::Intermediate,
     ));
     let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &report_analyst_config(),
+        &report_analyst_config(analyst_instruction),
         llm,    // the analyst genuinely reasons — keep the default budget
         vec![], // the analyst only reasons over provided material
         OutputShape::Intermediate,
     ));
     let composer: Arc<dyn SubAgent> = Arc::new(
         ConfiguredAgent::new(
-            &report_composer_config(),
+            &report_composer_config(composer_instruction),
             llm_low, // mechanical transcription — minimal reasoning
             composer_tools,
             OutputShape::Intermediate,

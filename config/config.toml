@@ -28,10 +28,14 @@ version = 1
 #   * greeting_fetcher_system   — greeting pipeline: the data-fetch stage.
 #   * greeting_analyst_system   — greeting pipeline: the C-suite greeting writer (terminal).
 #   * greeting_user             — greeting pipeline: the boot-time request prompt.
+#   * fetcher_system            — /insight + /report pipelines: the shared data-fetch stage.
+#   * analyst_system            — /insight pipeline: the markdown-report analyst.
+#   * charter_system            — /insight pipeline: the chart selector (0–2 charts).
+#   * report_analyst_system     — /report pipeline: the insight-narrative analyst.
+#   * report_composer_system    — /report pipeline: the emit_report composer.
 #
-# The /insight and /report pipeline stage prompts (fetcher/analyst/charter,
-# report_analyst/report_composer) are compiled in via include_str!, so they live under
-# prompt_guide/ but are NOT listed here.
+# All prompts are loaded dynamically at boot, so retuning a stage prompt is a config edit
+# (no recompile) — edit the Markdown file, or point an id at a different file below.
 
 [prompts.agent_system]
 file = "prompt_guide/agent_system.md"
@@ -44,6 +48,22 @@ file = "prompt_guide/greeting_analyst_system.md"
 
 [prompts.greeting_user]
 file = "prompt_guide/greeting_user.md"
+
+# ── /insight + /report pipeline stage prompts ──
+[prompts.fetcher_system]
+file = "prompt_guide/fetcher_system.md"
+
+[prompts.analyst_system]
+file = "prompt_guide/analyst_system.md"
+
+[prompts.charter_system]
+file = "prompt_guide/charter_system.md"
+
+[prompts.report_analyst_system]
+file = "prompt_guide/report_analyst_system.md"
+
+[prompts.report_composer_system]
+file = "prompt_guide/report_composer_system.md"
 
 
 # ──── Insight pipeline tool grants ───

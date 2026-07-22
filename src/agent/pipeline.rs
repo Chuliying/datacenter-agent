@@ -77,25 +77,16 @@ use crate::agent::payload::{
 };
 
 // ===========================================================================
-// Authored stage instructions (compiled in; superseded by the §6 TOML loader later)
-// ===========================================================================
-
-/// The `fetcher`'s system instruction — fetch the exact data, don't analyse.
-pub const FETCHER_INSTRUCTION: &str = include_str!("../../config/prompt_guide/fetcher_system.md");
-/// The `analyst`'s system instruction — analyse the fetched material into a markdown report.
-pub const ANALYST_INSTRUCTION: &str = include_str!("../../config/prompt_guide/analyst_system.md");
-/// The `charter`'s system instruction — decide on 0–2 charts, emit via `emit_chart`.
-pub const CHARTER_INSTRUCTION: &str = include_str!("../../config/prompt_guide/charter_system.md");
-/// The report `analyst`'s instruction — write the executive insight narrative (prose only).
-pub const REPORT_ANALYST_INSTRUCTION: &str =
-    include_str!("../../config/prompt_guide/report_analyst_system.md");
-/// The report `composer`'s instruction — map the fetched data + narrative into `emit_report`.
-pub const REPORT_COMPOSER_INSTRUCTION: &str =
-    include_str!("../../config/prompt_guide/report_composer_system.md");
-
-// ===========================================================================
 // Stage configs — the authored `SubAgentConfig` for each LLM-driven stage
 // ===========================================================================
+//
+// Each stage's system `instruction` is passed in by the caller, resolved at boot from
+// `config.toml`'s `[prompts.*]` section (see [`crate::config::AppConfig`] / [`PromptBank`]) and
+// threaded through the wiring ([`crate::agent::wiring`]). The prompt Markdown under
+// `config/prompt_guide/` is therefore loaded dynamically at startup, not compiled in — retuning a
+// stage prompt is a config edit, no recompile.
+//
+// [`PromptBank`]: crate::appstate::PromptBank
 
 /// The `fetcher` config: instruction, accepts, and message policy for the MCP data-fetch stage.
 ///
@@ -104,10 +95,10 @@ pub const REPORT_COMPOSER_INSTRUCTION: &str =
 /// here is left empty because the `/insight` path never reads it.
 /// Non-terminal ⇒ its output shape derives to `Intermediate`
 /// ([`effective_output`](crate::agent::config::effective_output)).
-pub fn fetcher_config() -> SubAgentConfig {
+pub fn fetcher_config(instruction: &str) -> SubAgentConfig {
     SubAgentConfig {
         id: SubAgentId("fetcher".into()),
-        instruction: FETCHER_INSTRUCTION.to_string(),
+        instruction: instruction.to_string(),
         llm: None,
         tools: vec![], // grant is config-driven; see `[insight.grants]` / `build_insight_pipeline`
         accepts: vec![PayloadKind::Initial],
@@ -121,10 +112,10 @@ pub fn fetcher_config() -> SubAgentConfig {
 /// Its report is its model message, captured automatically as the `analyst.message` artifact (the
 /// open-key contract captures every stage's message), so it survives the `Intermediate` boundary
 /// with no per-agent wiring.
-pub fn analyst_config() -> SubAgentConfig {
+pub fn analyst_config(instruction: &str) -> SubAgentConfig {
     SubAgentConfig {
         id: SubAgentId("analyst".into()),
-        instruction: ANALYST_INSTRUCTION.to_string(),
+        instruction: instruction.to_string(),
         llm: None,
         tools: vec![],
         accepts: vec![PayloadKind::Intermediate],
@@ -138,10 +129,10 @@ pub fn analyst_config() -> SubAgentConfig {
 /// Its tool grant is config-driven (`[insight.grants].charter`, normally the `emit_chart` sink);
 /// the `tools` field here is left empty because the `/insight` path never reads it. Consumes the
 /// report + data, produces `charts.spec` (or nothing, for chit-chat).
-pub fn charter_config() -> SubAgentConfig {
+pub fn charter_config(instruction: &str) -> SubAgentConfig {
     SubAgentConfig {
         id: SubAgentId("charter".into()),
-        instruction: CHARTER_INSTRUCTION.to_string(),
+        instruction: instruction.to_string(),
         llm: None,
         tools: vec![], // grant is config-driven; see `[insight.grants]` / `build_insight_pipeline`
         accepts: vec![PayloadKind::Intermediate],
@@ -164,10 +155,10 @@ pub fn agent_pipeline_id() -> PipelineId {
 /// Its narrative is its model message, captured as `analyst.message` (the open-key contract keeps
 /// every stage's message), so the `composer` can fold it into the report's `insight` field and it
 /// survives the `Intermediate` boundary as provenance.
-pub fn report_analyst_config() -> SubAgentConfig {
+pub fn report_analyst_config(instruction: &str) -> SubAgentConfig {
     SubAgentConfig {
         id: SubAgentId("analyst".into()),
-        instruction: REPORT_ANALYST_INSTRUCTION.to_string(),
+        instruction: instruction.to_string(),
         llm: None,
         tools: vec![],
         accepts: vec![PayloadKind::Intermediate],
@@ -183,10 +174,10 @@ pub fn report_analyst_config() -> SubAgentConfig {
 /// [`build_report_pipeline`](crate::agent::wiring::build_report_pipeline)); the `tools` field here
 /// is left empty because that path never reads it. Its output is the validated `report.data`
 /// artifact, not its message, so it opts out of `capture_message`.
-pub fn report_composer_config() -> SubAgentConfig {
+pub fn report_composer_config(instruction: &str) -> SubAgentConfig {
     SubAgentConfig {
         id: SubAgentId("composer".into()),
-        instruction: REPORT_COMPOSER_INSTRUCTION.to_string(),
+        instruction: instruction.to_string(),
         llm: None,
         tools: vec![], // grant is wired in code; see `build_report_pipeline`
         accepts: vec![PayloadKind::Intermediate],
@@ -552,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn analyst_writes_a_report_from_the_material_and_carries_data_forward() {
         let analyst = ConfiguredAgent::new(
-            &analyst_config(),
+            &analyst_config("test analyst instruction"),
             ScriptedLlm::arc(vec![message("## 營收分析\n5月 120，6月 180，月增 50%。")]),
             vec![], // no tools — the analyst only reasons over provided material
             OutputShape::Intermediate,
@@ -588,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn charter_emits_a_validated_charts_spec_and_carries_the_report_forward() {
         let charter = ConfiguredAgent::new(
-            &charter_config(),
+            &charter_config("test charter instruction"),
             ScriptedLlm::arc(vec![
                 call("emit_chart", chart_args()),
                 message("已產生圖表"),
@@ -634,7 +625,7 @@ mod tests {
         let bad =
             serde_json::json!({ "charts": [{ "chartType": "donut", "title": "x", "data": [] }] });
         let charter = ConfiguredAgent::new(
-            &charter_config(),
+            &charter_config("test charter instruction"),
             ScriptedLlm::arc(vec![
                 call("emit_chart", bad),
                 call("emit_chart", chart_args()),
@@ -667,7 +658,7 @@ mod tests {
     async fn charter_skips_charts_for_chit_chat() {
         // No emit_chart call — the model judged the turn needs no chart. charts.spec stays absent.
         let charter = ConfiguredAgent::new(
-            &charter_config(),
+            &charter_config("test charter instruction"),
             ScriptedLlm::arc(vec![message("這是閒聊，不需要圖表。")]),
             vec![Box::new(emit_chart_tool())],
             OutputShape::Intermediate,
@@ -867,7 +858,7 @@ mod tests {
     async fn agent_pipeline_runs_fetch_analyse_chart_finalize() {
         // Each stage gets its own scripted LLM; the fetcher and charter also get mock/real tools.
         let fetcher = ConfiguredAgent::new(
-            &fetcher_config(),
+            &fetcher_config("test fetcher instruction"),
             ScriptedLlm::arc(vec![
                 call("bill_revenue", serde_json::json!({})),
                 message("已取得近兩月營收"),
@@ -876,7 +867,7 @@ mod tests {
             OutputShape::Intermediate,
         );
         let analyst = ConfiguredAgent::new(
-            &analyst_config(),
+            &analyst_config("test analyst instruction"),
             ScriptedLlm::arc(vec![message(
                 "## 營收分析\n5月 NT$120，6月 NT$180，月增約 50%。",
             )]),
@@ -884,7 +875,7 @@ mod tests {
             OutputShape::Intermediate,
         );
         let charter = ConfiguredAgent::new(
-            &charter_config(),
+            &charter_config("test charter instruction"),
             ScriptedLlm::arc(vec![
                 call("emit_chart", chart_args()),
                 message("已產生圖表"),
