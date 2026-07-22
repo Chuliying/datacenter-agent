@@ -21,5 +21,5 @@ COPY --from=builder /app/config /app/config
 
 EXPOSE 8080
 
-ENTRYPOINT ["datacenter-agent"]
+ENTRYPOINT ["/app/datacenter-agent"]
 CMD ["--host", "0.0.0.0", "--port", "8080", "--config", "config/config.toml"]

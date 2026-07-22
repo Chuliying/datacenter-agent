@@ -132,6 +132,11 @@ pub struct ConfiguredAgent {
     /// Whether to capture this stage's model message as the `{id}.message` artifact
     /// ([`SubAgentConfig::capture_message`](crate::agent::config::SubAgentConfig::capture_message)).
     capture_message: bool,
+    /// An artifact this stage **must** produce before it may finish (its required output). Threaded
+    /// into [`run_llm_loop`]'s required-output guard: a model that ends without it is nudged to
+    /// retry, and the stage fails with [`AgentError::MissingArtifact`] if it still doesn't produce
+    /// it. `None` = the stage has no mandatory output. Set via [`with_required_output`](Self::with_required_output).
+    required_output: Option<ArtifactKey>,
 }
 
 impl ConfiguredAgent {
@@ -165,7 +170,21 @@ impl ConfiguredAgent {
             accepts: intern_accepts(&cfg.accepts),
             output,
             capture_message: cfg.capture_message,
+            required_output: None,
         }
+    }
+
+    /// Declares an artifact this stage **must** produce before it may finish.
+    ///
+    /// Consumed by [`run_llm_loop`]'s required-output guard: if the model tries to end without the
+    /// artifact, the loop nudges it to call the producing tool (up to a retry budget) and, failing
+    /// that, the stage fails with [`AgentError::MissingArtifact`] instead of reporting a spurious
+    /// success. Used for the report `composer`, whose whole job is the `report.data` sink — without
+    /// this, a model that never calls the sink finishes `Ok` and the failure surfaces cryptically at
+    /// the downstream `renderer`.
+    pub fn with_required_output(mut self, key: ArtifactKey) -> Self {
+        self.required_output = Some(key);
+        self
     }
 
     /// Renders granted artifacts into a deterministic material block.
@@ -231,7 +250,14 @@ impl SubAgent for ConfiguredAgent {
 
         // The LLM chooses among *only* the granted tools; out-of-set calls are rejected at
         // dispatch inside the loop (payload §2.3).
-        let (text, produced) = run_llm_loop(&self.llm, &system, &user, &self.tools).await?;
+        let (text, produced) = run_llm_loop(
+            &self.llm,
+            &system,
+            &user,
+            &self.tools,
+            self.required_output.as_ref(),
+        )
+        .await?;
 
         // Assemble this stage's full output: everything carried in, plus every tool artifact, plus
         // — when `capture_message` is set — the stage's own **message** as a first-class artifact

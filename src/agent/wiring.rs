@@ -270,12 +270,18 @@ pub fn build_report_pipeline(
         vec![], // the analyst only reasons over provided material
         OutputShape::Intermediate,
     ));
-    let composer: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
-        &report_composer_config(),
-        llm_low, // mechanical transcription — minimal reasoning
-        composer_tools,
-        OutputShape::Intermediate,
-    ));
+    let composer: Arc<dyn SubAgent> = Arc::new(
+        ConfiguredAgent::new(
+            &report_composer_config(),
+            llm_low, // mechanical transcription — minimal reasoning
+            composer_tools,
+            OutputShape::Intermediate,
+        )
+        // The composer's whole job is the `emit_report` sink. Require its output so a model that
+        // ends without calling the tool is retried, and ultimately fails *here* (not cryptically at
+        // the renderer) if it never produces `report.data`.
+        .with_required_output(ArtifactKey::report_data()),
+    );
     let renderer: Arc<dyn SubAgent> = Arc::new(Renderer::with_template(template));
 
     let agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = [
