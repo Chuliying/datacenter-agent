@@ -19,6 +19,7 @@ pub mod dto;
 pub mod error;
 pub mod greeting;
 pub mod handler;
+pub mod openai;
 pub mod route;
 
 pub use crate::appstate::AppState;

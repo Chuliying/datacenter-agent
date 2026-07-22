@@ -67,6 +67,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/report", post(handler::report))
         .route("/report/stream", post(handler::report_stream))
         .route("/agent/stream", post(handler::agent_stream))
+        // OpenAI-compatible endpoint (agentgateway Path C). Added before the auth layer so it
+        // inherits `require_bearer` (D6), exactly like the endpoints above.
+        .route(
+            "/v1/chat/completions",
+            post(handler::chat_completions),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

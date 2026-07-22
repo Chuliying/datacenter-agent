@@ -1,13 +1,14 @@
 slug: agentgateway-openai-endpoint
 title: 新增 OpenAI 相容 /v1/chat/completions 端點接入 agentgateway（保留 /agent/stream）
 created_at: 2026-07-22T05:08:30Z
-updated_at: 2026-07-22T06:02:06Z
+updated_at: 2026-07-22T08:20:30Z
 status: active
 stages:
   brainstorm: { skill: brainstorming, file: brainstorm.md, status: done }
   prd: { skill: to-prd, file: prd.md, status: approved }
   spec: { skill: spec, file: spec.md, status: approved }
   qa-plan: { skill: qa, file: qa-plan.md, status: ready }
+  implement: { skill: implement, file: implement-report.md, status: done }
 inputs:
   - RD 自建 Agent 接入 agentgateway 規格書（使用者提供；參考 https://agentgateway.dev/docs/standalone/latest/，採 Path C = OpenAI 相容 LLM backend）
   - src/server/handler.rs（/agent/stream、insight_frames 映射）

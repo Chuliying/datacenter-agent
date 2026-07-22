@@ -16,7 +16,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -34,8 +34,11 @@ use super::dto::{
     StageData, StagePhase, StreamFrame, ToolArgsData, ToolCallData, UsageData,
 };
 use super::error::AppError;
+use super::openai;
 use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
+use crate::agent::config::PipelineId;
+use crate::agent::engine::Orchestrator;
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
 use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id};
@@ -691,6 +694,392 @@ fn sse_event(frame: StreamFrame) -> Event {
     Event::default()
         .json_data(&frame)
         .expect("unexpected error: StreamFrame is always valid JSON")
+}
+
+// ──── /v1/chat/completions (OpenAI-compatible, agentgateway Path C) ────
+
+/// Build an OpenAI-style error [`Response`] with the given HTTP status.
+///
+/// Unlike [`AppError`] (which serializes to the host's flat `{"error": "..."}`), this emits the
+/// OpenAI envelope `{"error": {"message", "type"}}` an OpenAI client / agentgateway expects.
+fn openai_error(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+    (status, Json(openai::OpenAiErrorBody::new(error_type, message))).into_response()
+}
+
+/// Map a pipeline [`AgentError`] onto an OpenAI error [`Response`] (ERR5).
+///
+/// Parity with [`insight_error_to_app_error`]: a capability failure (LLM transport / MCP tool) is
+/// an upstream `502`; any internal wiring fault is `503`.
+fn agent_error_to_openai(err: AgentError) -> Response {
+    match err {
+        AgentError::Capability(msg) => {
+            openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, msg)
+        }
+        other => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            openai::ERR_SERVER,
+            other.to_string(),
+        ),
+    }
+}
+
+/// Serialize one `chat.completion.chunk` into an SSE `data:` line — a pure `data:` stream with no
+/// `event:` name, as OpenAI expects (spec D1).
+fn openai_chunk_event(chunk: &openai::ChatCompletionChunk) -> Event {
+    Event::default()
+        .json_data(chunk)
+        .expect("chat.completion.chunk is always valid JSON")
+}
+
+/// Build the intent-selected sub-agent pipeline for the OpenAI endpoint (spec Data Flow): the
+/// `/report` pipeline when a report was asked for (see [`wants_report_pipeline`]), else `/insight`.
+/// `sink = Some(_)` selects the streaming shape; `None` is buffered (spec D1/D2).
+fn build_openai_pipeline(
+    state: &AppState,
+    report: bool,
+    sink: Option<Arc<dyn EventSink>>,
+) -> anyhow::Result<(Orchestrator, PipelineId)> {
+    let resolved = state.llm.resolved();
+    if report {
+        let orch = build_report_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.report_analyst_system,
+            &state.prompts.report_composer_system,
+            &state.insight_grants.fetcher,
+            &resolved,
+            state.report_template.clone(),
+            sink,
+        )?;
+        Ok((orch, report_pipeline_id()))
+    } else {
+        let orch = build_insight_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.analyst_system,
+            &state.prompts.charter_system,
+            &state.insight_grants.fetcher,
+            &state.insight_grants.charter,
+            &resolved,
+            sink,
+        )?;
+        Ok((orch, agent_pipeline_id()))
+    }
+}
+
+/// OpenAI-compatible `POST /v1/chat/completions`.
+///
+/// Maps the OpenAI `messages` onto the internal [`AgentRequest`], runs the **same runtime prelude**
+/// as [`agent_stream`] (`plan_stream_turn`: guardrails → intent → answer policy), then drives the
+/// intent-selected sub-agent pipeline and shapes the result as OpenAI:
+///
+/// - `stream=false` (D2): buffered pipeline `run()` → a single `chat.completion` choice.
+/// - `stream=true` (D1, pseudo-streaming): the pipeline's **complete** terminal answer is split
+///   into `chat.completion.chunk`s, then `data: [DONE]`. There is no token stream equal to the
+///   final answer — the terminal pipeline stages assemble it in pure logic — so intermediate
+///   `ContentDelta` previews are not forwarded (see the spec's D1).
+///
+/// Auth is inherited from the shared `require_bearer` layer (D6, `418` on a bad token); the runtime
+/// is required (D7, `503` when `RUNTIME_ENABLED=false`). Errors use the OpenAI envelope (spec
+/// Errors). `session_id` / `option_id` have no OpenAI equivalent, so server-side memory is inert.
+#[instrument(skip_all, fields(route = "/v1/chat/completions"))]
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    req: Result<Json<openai::ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // ── parse body (ERR2: malformed JSON / missing fields) ──
+    let Json(req) = match req {
+        Ok(json) => json,
+        Err(rejection) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                openai::ERR_INVALID_REQUEST,
+                format!("invalid request body: {rejection}"),
+            );
+        }
+    };
+
+    // ── runtime required (ERR1 / D7): the endpoint drives the runtime prelude ──
+    let Some(runtime) = state.runtime.clone().filter(|rt| rt.enabled) else {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            openai::ERR_SERVER,
+            "runtime disabled (RUNTIME_ENABLED=false); /v1/chat/completions requires the runtime",
+        );
+    };
+
+    let stream = req.stream;
+    let model = req.model;
+
+    // ── map messages → AgentRequest (ERR2; D5: system messages ignored) ──
+    let agent_req = match openai::map_request(req.messages) {
+        Ok(request) => request,
+        Err(err) => {
+            let (status, error_type, message) = err.to_openai();
+            return openai_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                error_type,
+                message,
+            );
+        }
+    };
+
+    // `created` + `id` are stamped once here (never in the pure `openai` layer) and shared by every
+    // response shape.
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+
+    // ── runtime prelude, shared verbatim with /agent/stream: audit, guardrails, intent, answer
+    //    policy. The dummy port + no-op emit are never exercised by `plan_stream_turn`. ──
+    let request_id = uuid::Uuid::new_v4();
+    let audit_ctx = AuditCtx {
+        request_id: request_id.to_string(),
+        session_id: agent_req.session_id.clone(),
+        route: "/v1/chat/completions".into(),
+        actor: None,
+    };
+    let input = AgentTurnInput {
+        request_id,
+        prompt: agent_req.prompt.clone(),
+        raw_input: agent_req.prompt.clone(),
+        history: agent_req.history.clone(),
+        session_id: agent_req.session_id.clone(),
+        option_id: agent_req.option_id.clone(),
+    };
+    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
+
+    let plan = {
+        let unused = UnusedAgentPort;
+        let emit_noop = |_event: TurnEvent| {};
+        let deps = AgentTurnDeps {
+            runtime_config: &runtime.config,
+            input_pipeline: &runtime.input_pipeline,
+            answer_policy: runtime.answer_policy.as_ref(),
+            llm_normalizer: runtime.llm_normalizer.as_deref(),
+            sessions: runtime.sessions.as_deref(),
+            agent: &unused,
+            audit: &audit,
+            emit: &emit_noop,
+        };
+        match plan_stream_turn(input, &audit_ctx, deps).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    openai::ERR_SERVER,
+                    format!("runtime prelude: {e}"),
+                );
+            }
+        }
+    };
+
+    // ── act on the plan ──
+    let (agent_input, normalized) = match plan {
+        // Pre-stream validation error (e.g. ERR3 prompt too long → 400). Audit already recorded it.
+        StreamPlan::Error { code, status } => {
+            return openai_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                openai::error_type_for_status(status),
+                code,
+            );
+        }
+        // Guardrail refusal (AC-5 / TC-I04): return the refusal copy as the assistant answer at
+        // `200` — governance parity with /agent/stream (which streams the copy then closes).
+        StreamPlan::Refused { copy, .. } => {
+            return openai_refusal(stream, copy, &id, &model, created);
+        }
+        // The disclaimer `prefix` is intentionally dropped: on /agent/stream the pipeline's terminal
+        // `clear` supersedes it, so the delivered answer never carries it — matched here.
+        StreamPlan::Proceed {
+            agent_input,
+            normalized,
+            ..
+        } => (agent_input, *normalized),
+    };
+
+    // ── build + run the intent-selected pipeline ──
+    let initial = AgentPayload::Initial(InitialPrompt {
+        prompt: agent_input.prompt,
+        history: agent_input
+            .history
+            .into_iter()
+            .map(|turn| Exchange {
+                user: turn.user_prompt,
+                assistant: turn.model_response,
+            })
+            .collect(),
+        now: SystemClock::default().now(),
+    });
+    let report = wants_report_pipeline(&normalized);
+
+    if stream {
+        openai_stream_response(&state, report, initial, id, model, created)
+    } else {
+        openai_buffered_response(&state, report, initial, &id, &model, created).await
+    }
+}
+
+/// Shape a guardrail refusal as an OpenAI `200` (spec Data Flow: Refused → 200 + copy as the whole
+/// assistant answer).
+fn openai_refusal(stream: bool, copy: String, id: &str, model: &str, created: i64) -> Response {
+    if stream {
+        let chunks = openai::build_chunks(&copy, id, model, created);
+        let sse = async_stream::stream! {
+            for chunk in chunks {
+                yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+            }
+            yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+        };
+        Sse::new(sse)
+            .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+            .into_response()
+    } else {
+        // A refusal costs no LLM tokens → usage is zero.
+        Json(openai::build_response(
+            &copy,
+            id,
+            model,
+            created,
+            openai::Usage::default(),
+        ))
+        .into_response()
+    }
+}
+
+/// Non-streaming path (D2): run the buffered pipeline and return one `chat.completion`.
+async fn openai_buffered_response(
+    state: &AppState,
+    report: bool,
+    initial: AgentPayload,
+    id: &str,
+    model: &str,
+    created: i64,
+) -> Response {
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, None) {
+        Ok(pair) => pair,
+        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, format!("{e:#}")),
+    };
+    match orchestrator.run(&pipeline_id, initial).await {
+        // D3: the buffered `OpenAiLlm` emits no `Usage`, so usage is reported as zero.
+        Ok(AgentPayload::Final(result)) => Json(openai::build_response(
+            &result.assistant,
+            id,
+            model,
+            created,
+            openai::Usage::default(),
+        ))
+        .into_response(),
+        Ok(other) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            openai::ERR_SERVER,
+            format!(
+                "pipeline did not produce a final result (got {:?})",
+                other.kind()
+            ),
+        ),
+        Err(err) => agent_error_to_openai(err),
+    }
+}
+
+/// Streaming path (D1, pseudo-streaming): run the pipeline emitting events, accumulate per-stage
+/// usage, and on the terminal complete answer split it into `chat.completion.chunk`s + `[DONE]`.
+fn openai_stream_response(
+    state: &AppState,
+    report: bool,
+    initial: AgentPayload,
+    id: String,
+    model: String,
+    created: i64,
+) -> Response {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
+    {
+        Ok(pair) => pair,
+        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, format!("{e:#}")),
+    };
+
+    // The task owns the orchestrator + sink; when the run finishes every sink clone drops and the
+    // channel closes, so the drain loop below ends naturally.
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&pipeline_id, initial, &*sink)
+            .await
+    });
+
+    let sse_stream = async_stream::stream! {
+        let mut usages: Vec<UsageData> = Vec::new();
+        let mut answer: Option<String> = None;
+        let mut failure: Option<String> = None;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                // Accumulate per-stage token usage (D3). Logged below, not placed on the OpenAI
+                // wire (the `chat.completion.chunk` shape carries no usage field).
+                AgentEvent::Usage {
+                    prompt,
+                    completion,
+                    reasoning,
+                    total,
+                } => usages.push(UsageData {
+                    prompt,
+                    completion,
+                    reasoning,
+                    total,
+                }),
+                // The terminal answer is the complete result; intermediate `ContentDelta` previews
+                // are intentionally ignored (D1).
+                AgentEvent::Finished { assistant } => answer = Some(assistant),
+                AgentEvent::Error { message } => failure = Some(message),
+                _ => {}
+            }
+        }
+        // Channel closed → the run finished. Surface a task panic as a failure.
+        if let Err(join) = run.await {
+            failure.get_or_insert_with(|| format!("agent task failed: {join}"));
+        }
+
+        match answer {
+            Some(text) => {
+                let usage = openai::accumulate_usage(&usages);
+                tracing::info!(
+                    prompt_tokens = usage.prompt_tokens,
+                    completion_tokens = usage.completion_tokens,
+                    total_tokens = usage.total_tokens,
+                    "chat_completions stream usage"
+                );
+                for chunk in openai::build_chunks(&text, &id, &model, created) {
+                    yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+                }
+                yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+            }
+            None => {
+                // A stage failed (ERR5) or the run aborted before `Finished`. Response headers are
+                // already `200` (SSE), so surface the failure in-band as an OpenAI error object,
+                // then `[DONE]`.
+                let message = failure.unwrap_or_else(|| "pipeline produced no answer".into());
+                let body = openai::OpenAiErrorBody::new(openai::ERR_UPSTREAM, message);
+                yield Ok::<_, Infallible>(
+                    Event::default()
+                        .json_data(&body)
+                        .expect("OpenAiErrorBody is always valid JSON"),
+                );
+                yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+            }
+        }
+    };
+
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response()
 }
 
 // ──── shared prelude ───
