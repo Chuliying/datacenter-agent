@@ -461,7 +461,7 @@ pub async fn run_llm_loop<L: LlmCapability>(
     let mut produced: HashMap<ArtifactKey, ArtifactValue> = HashMap::new();
 
     const MAX_STEPS: usize = 8; // guard against a non-terminating tool loop
-    // How many times to nudge a model that ends without its `required` output before giving up.
+                                // How many times to nudge a model that ends without its `required` output before giving up.
     const MAX_OUTPUT_RETRIES: usize = 3;
     let mut output_retries = 0usize;
     for step in 0..MAX_STEPS {
@@ -658,9 +658,7 @@ mod tests {
                 LlmResponse::Message("done".into()),
             ]),
         };
-        let (text, produced) = run_llm_loop(&llm, "sys", "go", &tools, None)
-            .await
-            .unwrap();
+        let (text, produced) = run_llm_loop(&llm, "sys", "go", &tools, None).await.unwrap();
         assert_eq!(text, "done");
         assert_eq!(
             produced.get(&ArtifactKey::fetcher_records()),

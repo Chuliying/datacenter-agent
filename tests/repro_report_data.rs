@@ -78,10 +78,7 @@ fn canned_material() -> HashMap<ArtifactKey, ArtifactValue> {
         會員數穩定成長，總會員自 18,900 增至 19,590。站點營收以台北南港站居首。";
 
     let mut m = HashMap::new();
-    m.insert(
-        ArtifactKey::fetcher_records(),
-        ArtifactValue::Json(records),
-    );
+    m.insert(ArtifactKey::fetcher_records(), ArtifactValue::Json(records));
     m.insert(
         ArtifactKey::message("analyst"),
         ArtifactValue::Text(narrative.to_string()),
