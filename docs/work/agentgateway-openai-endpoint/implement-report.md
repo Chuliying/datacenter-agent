@@ -318,3 +318,17 @@ AC-3（回歸）：lib 181 基線 → 185（純增），`/agent/stream`、`/insi
 - `src/server/handler.rs` — `fold_history_into_prompt` 純函式 + `chat_completions` 織入 history（#1）；`build_chunks` call site 傳 `include_usage`（#5）；`openai_buffered_response`/`openai_stream_response` pipeline-build 失敗補 `ResponseFailed` audit、`openai_stream_response` 改 `async` + call site `.await`（#6）；+3 新測（#1）。
 - `src/server/openai.rs` — `ChatCompletionChunk.usage: Option<Option<Usage>>`、`build_chunks(+include_usage)`、`usage_chunk` `Some(Some)`、call site 更新（#5）；+1 新測、更新 1 pin 測（#5）。
 - `src/server/route.rs` — openai sub-router 改 `HandleErrorLayer` + `tower::timeout::TimeoutLayer` + `handle_openai_middleware_error`（#4）；+1 新測。
+
+---
+
+# 第三輪 — intent history-aware（修第二輪 e2e 發現的多輪 follow-up refuse）
+
+**問題**（第二輪 e2e 發現，qa-report 已知限制 #4）：第二輪 #1 的 `fold_history_into_prompt` 只在 `Proceed` 後織入 pipeline prompt，但 prelude 的 intent 分類 / answer-policy 只看 `AgentTurnInput.prompt`（當前問題），不含 history → off_scope 的 follow-up（前輪營收、本輪「那 AC 佔比呢?」）intent=unknown(0.25) → refuse。
+
+**修法**（使用者指定，handler-only）：把 `fold_history_into_prompt` 呼叫點從「Proceed 後建 `InitialPrompt`」**上移到「建 `AgentTurnInput` 前」**——prelude 看到的 `input.prompt` 已含 folded transcript，故 intent 分類 / answer-policy 感知上下文；`Proceed` 後直接用 `agent_input.prompt`（已 folded，移除 double fold）。**shared `plan_stream_turn`、`/agent/stream`、falcon 全不動。**
+
+**驗證**：`cargo check` + `cargo clippy --all-targets -- -D warnings` 綠；`cargo test` lib **207/0**（回歸純增；`fold_history_into_prompt` 3 unit 仍過）。e2e（本機 stub + 真實 opus-4.7）：同一 follow-up「那 AC 佔比呢?」現在 intent=**revenue**（conf 0.72，原 unknown 0.25）、**無 refused**、正常回答（403 chars、usage 15220/348/15568）；in-scope 多輪亦正常。
+
+**副作用**：folded prompt 一併過 prelude 4000-char cap；適度多輪無虞，極長對話可能觸 cap（屬既有輸入保護）。
+
+**修改檔案（第三輪）**：`src/server/handler.rs` — `fold_history_into_prompt` 呼叫點上移到 prelude 前（`AgentTurnInput.prompt`）；`Proceed` 後 `InitialPrompt.prompt = agent_input.prompt`；doc 更新。純呼叫點搬移，無新邏輯，既有 3 unit 覆蓋。

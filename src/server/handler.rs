@@ -742,17 +742,20 @@ fn with_prefix(prefix: &str, answer: String) -> String {
     }
 }
 
-/// Fold prior conversation turns into the prompt text so the first pipeline stage's LLM sees the
-/// whole conversation.
+/// Fold prior conversation turns into the prompt text so **both** the runtime prelude's intent
+/// classifier and the first pipeline stage's LLM see the whole conversation.
 ///
-/// The sub-agent engine (`ConfiguredAgent::run`) threads only `InitialPrompt.prompt` into the LLM
-/// and ignores `InitialPrompt.history`, so on `/v1/chat/completions` a multi-turn OpenAI request
-/// would otherwise collapse to just its final user message. We render the earlier turns into a
-/// labeled transcript and prepend it to the current question. An empty history returns the prompt
-/// unchanged, so a single-turn request is byte-for-byte what it was before.
+/// Two layers would otherwise drop history: the sub-agent engine (`ConfiguredAgent::run`) threads
+/// only `InitialPrompt.prompt` and ignores `InitialPrompt.history`; and the prelude's intent
+/// classifier / answer-policy look only at `AgentTurnInput.prompt`. So on `/v1/chat/completions` a
+/// multi-turn request would collapse to its final user message — and an off-scope-looking follow-up
+/// would even be refused. `chat_completions` therefore renders the earlier turns into a labeled
+/// transcript and prepends it to the current question **before** calling the prelude. An empty
+/// history returns the prompt unchanged, so a single-turn request is byte-for-byte what it was.
 ///
-/// This lives at the handler layer on purpose: the engine, `/agent/stream`, and falcon behaviour
-/// are all left untouched — only this endpoint's `Initial` prompt is rewritten.
+/// This lives at the handler layer on purpose: the engine, the shared `plan_stream_turn` prelude,
+/// `/agent/stream`, and falcon behaviour are all left untouched — only this endpoint's prompt is
+/// rewritten.
 fn fold_history_into_prompt(history: &[Exchange], prompt: &str) -> String {
     if history.is_empty() {
         return prompt.to_string();
@@ -912,11 +915,27 @@ pub async fn chat_completions(
         route: "/v1/chat/completions".into(),
         actor: None,
     };
+    // Fold prior turns into the prompt **before** the prelude so the intent classifier /
+    // answer-policy — which only see `input.prompt`, never `history` — are given the conversation
+    // context. Without this a follow-up like「那 AC 佔比呢?」is classified in isolation and refused
+    // as off_scope; folded, it is judged against the prior turns. Handler-only: `plan_stream_turn`
+    // and `/agent/stream` are untouched, and the folded prompt is also what the pipeline stage sees.
+    let folded_history: Vec<Exchange> = agent_req
+        .history
+        .iter()
+        .map(|turn| Exchange {
+            user: turn.user_prompt.clone(),
+            assistant: turn.model_response.clone(),
+        })
+        .collect();
+    let folded_prompt = fold_history_into_prompt(&folded_history, &agent_req.prompt);
     let input = AgentTurnInput {
         request_id,
-        prompt: agent_req.prompt.clone(),
-        raw_input: agent_req.prompt.clone(),
-        history: agent_req.history.clone(),
+        prompt: folded_prompt.clone(),
+        raw_input: folded_prompt,
+        // History is folded into `prompt` above; the field stays empty (prelude memory is inert
+        // here anyway — `session_id` is always `None` on this endpoint).
+        history: Vec::new(),
         session_id: agent_req.session_id.clone(),
         option_id: agent_req.option_id.clone(),
     };
@@ -976,20 +995,11 @@ pub async fn chat_completions(
     };
 
     // ── build + run the intent-selected pipeline ──
-    // Finding #1: the engine drops `InitialPrompt.history`, so a multi-turn conversation would lose
-    // every turn but the last. Fold the prior turns into the prompt text here (handler-only; the
-    // engine and `/agent/stream` are untouched) so the first stage's LLM sees the full exchange. The
-    // now-redundant `history` field is left empty — the folded prompt is the single source of truth.
-    let history: Vec<Exchange> = agent_input
-        .history
-        .into_iter()
-        .map(|turn| Exchange {
-            user: turn.user_prompt,
-            assistant: turn.model_response,
-        })
-        .collect();
+    // History was already folded into the prompt before the prelude (see above), so both the intent
+    // classifier and the first pipeline stage see the full exchange. `agent_input.prompt` carries
+    // it; `InitialPrompt.history` stays empty (the engine ignores it anyway).
     let initial = AgentPayload::Initial(InitialPrompt {
-        prompt: fold_history_into_prompt(&history, &agent_input.prompt),
+        prompt: agent_input.prompt,
         history: Vec::new(),
         now: SystemClock::default().now(),
     });
