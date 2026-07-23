@@ -39,7 +39,7 @@ prd: docs/work/agentgateway-openai-endpoint/prd.md
 
 > **實作狀態(2026-07-23,已補齊,符合 OpenAI contract)**：
 > - **非串流 usage 已取值**：`openai_buffered_response` 不再走 buffered `run()`,改走 **streaming client + drain**(`build_openai_pipeline(Some(sink))` → `run_emitting` → 收集 `AgentEvent::Usage`),`accumulate_usage` 填實值(不動 `llm.rs`/`payload.rs`)。
-> - **串流 usage 已上 wire**:`ChatCompletionRequest.stream_options.include_usage` 為 `true` 時,於內容 chunk 之後、`data: [DONE]` 之前多送一個 **usage-only chunk**(`choices: []` + `usage`),符合 OpenAI `include_usage` 語意;未設時 wire 完全不變。
+> - **串流 usage 已上 wire**:`ChatCompletionRequest.stream_options.include_usage` 為 `true` 時,於內容 chunk 之後、`data: [DONE]` 之前多送一個 **usage-only chunk**(`choices: []` + `usage`),符合 OpenAI `include_usage` 語意;未設時 wire 完全不變。**(第二輪 #5 補正)** 啟用 include_usage 時,每個 content chunk 另帶 `usage: null`(見下方「第二輪 §#5」);未啟用則完全不帶 usage 欄位。
 > - **post-stream audit 已補**:buffered/stream 兩路徑均寫 `AuditEvent::ResponseCompleted`(完成)/`ResponseFailed`(失敗),對齊 `/agent/stream`。
 > - **memory 仍 inert**:OpenAI body 無 `session_id`(恆 `None`),無 turn 可複製,故 `append_memory_turn_if_enabled` 省略(設計如此,非落差)。
 
@@ -59,9 +59,28 @@ pipeline 無 system 槽(各 stage 自帶 designed instruction,[payload.rs:179](s
 ### D8 — 非串流 timeout 覆寫 600s（finding #1）
 > 全域 `TimeoutLayer` 為 120s([route.rs](src/server/route.rs));非串流 `/v1/chat/completions` 需 await **整條** sub-agent pipeline,常超過 120s → 被砍成空 body 504。
 route 拆 standard(120s)/ openai(**600s**)兩 sub-router,各自套 `TimeoutLayer` 再 `.merge()`,故只有 `/v1/chat/completions` 得到較長 timeout,其他 7 端點維持 120s。SSE 串流的 response handle 立即回傳,body timeout 本就不影響(D1 偽串流)。
+> **2026-07-23 修正(第二輪 #4)**:openai sub-router 逾時原回空 body → 改回 **OpenAI error envelope**(504),見下方「第二輪 code review 決策 §#4」。
 
 ### D9 — disclaimer prefix 併入答案（finding #7）
 `StreamPlan::Proceed` 的 answer-policy `prefix`(如免責聲明)原被丟棄。OpenAI `delta`/`message` 無撤回語意(不同於 `/agent/stream` 靠終端 `clear` 蓋掉),故改為 **prepend 進最終答案**:`answer = if prefix 非空 { format!("{prefix}\n\n{answer}") } else { answer }`,串流/非串流皆套。
+
+## 第二輪 code review 決策（2026-07-23）
+
+> 本節 D10 與 #2/#4/#5 註記為**第二輪** review 修正（與上方第一輪 finding 編號不同源）。
+
+### D10 — history 織入 prompt（第二輪 #1）
+- **事實**:engine `ConfiguredAgent::run`([engine.rs:234](src/agent/engine.rs:234))`AgentPayload::Initial(p) => (p.prompt, …)` **只取 `p.prompt`**,`InitialPrompt.history` 完全不進 LLM;`map_request` 映射出的 history 因此白費,多輪對話塌成只剩最後一則 user。
+- **決策(handler 層,不動 engine / `/agent/stream` / falcon)**:抽純函式 `fold_history_into_prompt(&[Exchange], &str) -> String`,history 非空時把各輪 render 成 `User: …\nAssistant: …` transcript **prepend** 到目前問題前;空 history 原樣回傳(單輪不變)。`chat_completions` 的 `Proceed` 分支用它組 `Initial.prompt`,`Initial.history` 留空(engine 本就忽略,避免重複)。**僅改 `chat_completions` 一處**;`/agent/stream` 建 `InitialPrompt` 之處未動。
+- **影響**:多輪 OpenAI 請求現能讓第一 stage 的 LLM 看到完整對話;prompt 長度上限(D4,prelude 對「目前問題」驗 4000)在 fold 之前完成,history 不計入該 cap。
+
+### 第二輪 #4 — timeout 回 OpenAI envelope（修正 D8）
+D8 的 openai sub-router 逾時原回**空 body**(tower_http `with_status_code`)。改用 `ServiceBuilder`:`axum::error_handling::HandleErrorLayer`(外)包 `tower::timeout::TimeoutLayer`(內);逾時的 `Elapsed` 由 `handle_openai_middleware_error` 映成 **504 + OpenAI error envelope**(`server_error`)。standard sub-router 的 120s(tower_http,空 body)未動;auth 仍最外層。
+
+### 第二輪 #5 — include_usage 時 content chunk 帶 `usage:null`（修正 D3）
+OpenAI `include_usage` 契約:啟用時**每個 content chunk 帶 `usage: null`**,只有終端 usage-only chunk 帶實值;未啟用完全不帶。`ChatCompletionChunk.usage` 改 `Option<Option<Usage>>`(`None`=省略、`Some(None)`=顯式 `null`、`Some(Some(u))`=實值);`build_chunks` 收 `include_usage` flag 決定一般 chunk 為 `Some(None)` 或 `None`。
+
+### 第二輪 #2 — 斷線 abort：保留現狀（無 code 變更）
+`state.mcp` 為跨請求共用、多工的 rmcp `Peer`(`McpHandle` 包單一 peer)。mid-request abort 對共用 peer 的取消清理語意**離線無法確證**,corruption 風險 > 省下的計算成本,且與 sibling `agent_stream`(同不 abort)一致。supervised cancellation 列為後續(需先外驗 rmcp 取消語意)。
 
 ## Files
 
@@ -228,3 +247,4 @@ prelude 呼叫樣板見 [handler.rs:496](src/server/handler.rs:496)(dummy `Unuse
 |---|---|---|---|
 | 2026-07-22 | 初版;含 D1 偽串流、D2 buffered pipeline 兩項對 PRD 技術假設的修正 | prd v1(approved) | Chuliying + Claude |
 | 2026-07-23 | code review findings 修正:映射放寬(#2)、非串流 timeout 600s(D8/#1)、auth /v1→401(D6/#6)、body 錯誤 413/415/400(#6)、disclaimer prepend(D9/#7)、run.await 權威(#3)、logprobs/system_fingerprint 欄位(#5)、refusal include_usage(#4) | prd v1(approved) | Chuliying + Claude |
+| 2026-07-23 | 第二輪 code review 修正:history 織入 prompt(D10/#1)、timeout 回 OpenAI envelope(D8 修正/#4)、include_usage content chunk `usage:null`(D3 修正/#5)、斷線 abort 保留(#2)、pipeline-build 失敗補 audit(#6);manifest value backtick(#3,非 spec 範圍) | prd v1(approved) | Chuliying + Claude |

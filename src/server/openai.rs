@@ -239,8 +239,14 @@ pub struct ChatCompletionChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// OpenAI `stream_options.include_usage`, encoded in three states via `Option<Option<_>>`:
+    /// `None` → the field is **omitted** (the client did not opt in; the streamed wire is unchanged);
+    /// `Some(None)` → serialized as explicit **`null`** (opted in — every content chunk carries
+    /// `usage: null`); `Some(Some(_))` → the real total on the terminal usage-only chunk from
+    /// [`usage_chunk`]. The single `skip_serializing_if` distinguishes "absent" from the two
+    /// present forms.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
+    pub usage: Option<Option<Usage>>,
     /// OpenAI `system_fingerprint`. We compute none, so it serializes as `null` (present, matching
     /// the OpenAI envelope) rather than being omitted.
     pub system_fingerprint: Option<String>,
@@ -295,15 +301,23 @@ pub fn accumulate_usage(usages: &[UsageData]) -> Usage {
 /// Split a complete answer into an OpenAI chunk sequence (pseudo-streaming, D1):
 /// a leading `role` chunk, content chunks whose concatenation equals `answer`,
 /// then a terminal `finish_reason: "stop"` chunk.
-pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<ChatCompletionChunk> {
+pub fn build_chunks(
+    answer: &str,
+    id: &str,
+    model: &str,
+    created: i64,
+    include_usage: bool,
+) -> Vec<ChatCompletionChunk> {
     let mk = |choices: Vec<ChunkChoice>| ChatCompletionChunk {
         id: id.to_string(),
         object: "chat.completion.chunk",
         created,
         model: model.to_string(),
         choices,
-        // Ordinary content chunks never carry usage (populated only by `usage_chunk`).
-        usage: None,
+        // OpenAI `include_usage`: opted-in content chunks carry an explicit `usage: null`
+        // (`Some(None)`); otherwise the field is omitted (`None`). The real total rides only on the
+        // terminal usage-only chunk (`usage_chunk`).
+        usage: if include_usage { Some(None) } else { None },
         system_fingerprint: None,
     };
     // Leading chunk announces the assistant role.
@@ -351,7 +365,7 @@ pub fn usage_chunk(usage: Usage, id: &str, model: &str, created: i64) -> ChatCom
         created,
         model: model.to_string(),
         choices: Vec::new(),
-        usage: Some(usage),
+        usage: Some(Some(usage)),
         system_fingerprint: None,
     }
 }
@@ -662,7 +676,7 @@ mod tests {
 
     #[test]
     fn build_chunks_streams_answer_with_role_and_stop() {
-        let chunks = build_chunks("hello world", "chatcmpl-x", "m", 0);
+        let chunks = build_chunks("hello world", "chatcmpl-x", "m", 0, false);
         // object tag correct
         assert_eq!(chunks[0].object, "chat.completion.chunk");
         // leading chunk carries role
@@ -683,7 +697,7 @@ mod tests {
     #[test]
     fn build_chunks_handles_empty_answer() {
         // TC-B05: empty answer still yields a valid terminating sequence.
-        let chunks = build_chunks("", "id", "m", 0);
+        let chunks = build_chunks("", "id", "m", 0, false);
         let content: String = chunks
             .iter()
             .filter_map(|c| c.choices[0].delta.content.clone())
@@ -793,11 +807,30 @@ mod tests {
     fn content_chunks_omit_the_usage_field() {
         // The ordinary streamed chunks never carry `usage` (serde skips `None`), so the existing
         // wire shape is unchanged when `include_usage` is off.
-        for chunk in build_chunks("hello world", "id", "m", 0) {
+        for chunk in build_chunks("hello world", "id", "m", 0, false) {
             let v = serde_json::to_value(&chunk).unwrap();
             assert!(
                 v.get("usage").is_none(),
                 "content chunk must not serialize a usage field"
+            );
+        }
+    }
+
+    #[test]
+    fn content_chunks_carry_null_usage_when_include_usage() {
+        // OpenAI `include_usage` contract: once the client opts in, EVERY ordinary chunk carries an
+        // explicit `usage: null` (present, not omitted); only the terminal usage-only chunk from
+        // `usage_chunk` carries the real total. (Finding #5.)
+        for chunk in build_chunks("hello world", "id", "m", 0, true) {
+            let v = serde_json::to_value(&chunk).unwrap();
+            assert!(
+                v.as_object().unwrap().contains_key("usage"),
+                "content chunk must carry a usage key when include_usage is on: {v}"
+            );
+            assert!(
+                v["usage"].is_null(),
+                "content chunk usage must be null when include_usage is on, got {}",
+                v["usage"]
             );
         }
     }
@@ -815,7 +848,7 @@ mod tests {
         assert!(choice["logprobs"].is_null());
 
         // Streaming chunk choices carry it too (the leading role chunk has a choice).
-        let chunks = build_chunks("hello", "id", "m", 0);
+        let chunks = build_chunks("hello", "id", "m", 0, false);
         let cv = serde_json::to_value(&chunks[0]).unwrap();
         let cchoice = cv["choices"][0].as_object().unwrap();
         assert!(
@@ -834,7 +867,7 @@ mod tests {
         assert!(v.as_object().unwrap().contains_key("system_fingerprint"));
         assert!(v["system_fingerprint"].is_null());
 
-        let chunk = &build_chunks("hi", "id", "m", 0)[0];
+        let chunk = &build_chunks("hi", "id", "m", 0, false)[0];
         let cv = serde_json::to_value(chunk).unwrap();
         assert!(cv.as_object().unwrap().contains_key("system_fingerprint"));
         assert!(cv["system_fingerprint"].is_null());

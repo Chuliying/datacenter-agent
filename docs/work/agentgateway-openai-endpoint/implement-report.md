@@ -258,3 +258,63 @@ AC-3（回歸）：lib 181 基線 → 185（純增），`/agent/stream`、`/insi
 - `src/server/handler.rs` — `json_rejection_status`/`with_prefix`/`resolve_outcome` 純函式；`chat_completions` body 錯誤分流 + 取 `prefix` + refusal 傳 `include_usage`；`openai_refusal` 加 `include_usage`；`openai_buffered_response`/`openai_stream_response` 改 Usage-only drain + `run.await` 權威 + prepend prefix；doc 更新 + 7 新測。
 - `src/server/auth.rs` — `require_bearer_openai` + `openai_unauthorized` + 1 新測。
 - `src/server/route.rs` — `build_router` 拆 standard/openai sub-router（120s/600s timeout + 各自 auth）+ `OPENAI_REQUEST_TIMEOUT` 常數 + 1 新測。
+
+---
+
+# 續作 — 第二輪 code review findings 修正（2026-07-23）
+
+修第二輪 review 的 6 項 findings（本節編號 #1–#6 為**第二輪**，與上一節第一輪的 #1–#9 不同源，勿混）。**TDD（RED→GREEN）；不破壞既有測試；三 gate 全綠。**
+基線：進場 `cargo test --lib` → **202/0**（全 suite 0 failed，live 測 `#[ignore]`）。
+
+## 逐項處理
+
+### #1 [🔴] history 被丟棄 → 多輪只用最後一則（handler.rs）
+- **根因**：engine `ConfiguredAgent::run`（engine.rs:234）`AgentPayload::Initial(p) => (p.prompt, …)` 只取 `p.prompt`，`InitialPrompt.history` 完全不進 LLM；`/v1/chat/completions` 的多輪對話因此塌成只剩最後一則 user。
+- **做法（handler 層，未動 engine / `/agent/stream` / falcon）**：抽純函式 `fold_history_into_prompt(&[Exchange], &str) -> String`——history 非空時把各輪 render 成 `User: …\nAssistant: …` 的 transcript，prepend 到目前問題前（`以下是先前的對話紀錄:\n…\n\n目前的問題:\n…`）；history 空則原樣回傳（單輪 byte-for-byte 不變）。`chat_completions` 的 `Proceed` 分支改用它組 `Initial.prompt`，`Initial.history` 留空（engine 本就忽略，避免與 prompt 內 history 重複）。**僅改 `chat_completions` 一處**；`/agent/stream` 建 `InitialPrompt` 的另一處**未動**。
+- **RED**：先放 stub（`fold_history_into_prompt` 只回 `prompt.to_string()`，重現 drop）→ `cargo test --lib fold_history` → 多輪/單輪 2 測 FAILED（`prior user turn missing: 那這個月呢?`、`Q1 present` 失敗，觀察到 bug），空 history 測 PASS。
+- **GREEN**：實作真正 fold → 3 測全 PASS。測：`fold_history_into_prompt_returns_prompt_unchanged_when_history_empty`、`…_includes_a_single_prior_turn_before_the_question`、`…_preserves_multi_turn_chronological_order`。
+
+### #2 [tradeoff] 斷線 abort —— **保留現狀（無 code 變更）**
+延續第一輪 #8 判定：`state.mcp` 為跨請求共用、多工的 rmcp `Peer`（`McpHandle` 包單一 peer）；mid-request abort 會 drop 進行中的 rmcp 請求 future，其對共用 peer 的取消清理語意**離線無法確證**，corruption 風險 > 省下的計算成本，且與 sibling production path `agent_stream`（同樣不 abort）一致。supervised cancellation 列為後續（需先外部驗證 rmcp 取消語意，再引入受控中止）。**不改 code。**
+
+### #3 [🔴] manifest value backtick（.agent/project-manifest.md）
+- **根因**：`scripts/manifest-stack.sh` 的 `manifest_stack_value` sed（`s/^- *\`?${key}\`? *: *//p`）只吃掉 **key** 兩側 backtick，**value** 的 markdown backtick 留著 → `manifest_stack_capability` 的 `case` 拿到 `` `true` `` 不匹配 `true)`（噴「must be true or false」exit 2）；`run_manifest_stack_command` 拿到 `` `cargo test` `` 會被 `bash -c` 當**命令替換**執行。
+- **做法**：把 `## Stack` / `## Paths` 內所有 value 的 markdown backtick 去掉（raw 值），key 的 backtick 保留。`## skill-commons bootstrap`（platforms/profile，本就無 backtick）未動。
+- **驗證（實跑）**：
+  - BEFORE：`manifest_stack_capability has_api` → `❌ … (got: \`true\`)` exit 2；`has_ui` 同；`manifest_stack_value test_cmd` → `` [`cargo test`] ``。
+  - AFTER：`has_api` → `[true]` exit 0、`has_ui` → `[false]` exit 0、`has_e2e` → `[false]`、`typed_contracts` → `[true]`、`test_cmd` → `[cargo test]`、`lint_cmd` → `[cargo clippy -- -D warnings]`、`source_roots` → `[src, config]`；`bootstrap/check.sh` exit 0（維持乾淨）。
+
+### #4 [🟡] timeout 504 空 body → 非 OpenAI envelope（route.rs）
+- **根因**：openai sub-router 的 `tower_http::TimeoutLayer::with_status_code(GATEWAY_TIMEOUT, 600s)` 逾時回**空 body**，OpenAI client / gateway 無法解析。
+- **做法**：openai sub-router 改用 `ServiceBuilder`：外層 `axum::error_handling::HandleErrorLayer::new(handle_openai_middleware_error)` 包內層 `tower::timeout::TimeoutLayer::new(600s)`。新增 `handle_openai_middleware_error(BoxError) -> Response`：`Elapsed` → **504 + OpenAI error envelope**（`error_type_for_status(504)=server_error`），其餘 middleware 錯 → 500 + 同 envelope。auth 仍為最外層（最後 `.layer`）。**standard sub-router 的 120s（`tower_http` with_status_code）行為未動**。tower `timeout` feature 於現有 resolved graph 已啟用（`cargo tree -e features` 確認），未改 Cargo.toml。
+- **RED**：先放 stub（`handle_openai_middleware_error` 回空 body 504，重現 finding）→ 新測 `openai_timeout_returns_openai_error_envelope`（tiny router + 50ms tower TimeoutLayer + sleep(300ms) handler + `oneshot`）→ FAILED（`EOF while parsing a value`，body 空，status 504 已對）。
+- **GREEN**：填入 envelope → PASS（504 且 `error.type=="server_error"`、`error.message` 為字串）。既有 `per_group_timeout_layers_survive_a_merge`（standard 120s）仍 PASS。
+
+### #5 [🟡] include_usage 時 content chunk 缺 `usage:null`（openai.rs）
+- **根因**：`ChatCompletionChunk.usage: Option<Usage>` 一律 `skip_serializing_if`，開 `include_usage` 時一般 chunk **完全不帶** usage 欄位；OpenAI 契約要求開啟時**每個 content chunk 帶 `usage: null`**、只有終端 usage-only chunk 帶實值，未開啟時完全不帶。
+- **做法**：`usage` 欄位型別改 `Option<Option<Usage>>`（`None`→省略、`Some(None)`→序列化 `null`、`Some(Some(u))`→實值，單一 `skip_serializing_if="Option::is_none"` 三態）。`build_chunks` 加 `include_usage: bool` 參數：開→一般 chunk `Some(None)`（顯式 null），關→`None`（省略）。`usage_chunk` 改 `Some(Some(usage))`。所有 call site（openai.rs 測 ×5、handler `openai_refusal`/`openai_stream_response`）傳入 flag。
+- **RED**：先加參數但**忽略**（`let _ = include_usage;`，`usage` 仍 `None`）→ 新測 `content_chunks_carry_null_usage_when_include_usage`（開啟時每 chunk 應含 `usage` key 且為 null）→ FAILED（序列化無 usage key）。
+- **GREEN**：型別 + `mk` 依 flag 填 `Some(None)`/`None` → PASS。pin 測更新：`content_chunks_omit_the_usage_field`（關 → 無 usage key，call 傳 `false`）、`content_chunks_carry_null_usage_when_include_usage`（開 → `usage:null`）；`usage_chunk_serializes_with_empty_choices_and_usage`（`Some(Some)` 仍為物件）不變。既有 refusal include_usage 兩測不受影響。
+
+### #6 [🟡] pipeline-construction 失敗 502 無 audit（handler.rs）
+- **根因**：`openai_buffered_response`/`openai_stream_response` 的 `build_openai_pipeline` 失敗 early-return 502 未寫 audit（與成功/stage 失敗路徑不一致）。
+- **做法**：兩處回 502 前寫 `AuditEvent::ResponseFailed { error_code: message, duration_ms: started.elapsed() }`（warn-only，用已有 `audit`/`audit_ctx`/`started`）。buffered 本為 `async` 直接 `.await`；stream 原為同步 fn，為了在 early-return await audit，**改為 `async fn` + call site `.await`**（成功路徑仍不 await 即回 SSE handle，不阻塞串流）。
+- 測：pipeline-build 失敗需真實 wiring 故障（`McpHandle` 無 fake、`build_*_pipeline` 直建 LLM/MCP），離線無接縫可觸發，故**無專屬 unit 測**（與 finding 未要求測一致），以 compile + clippy + 對齊既有 audit 模式為據；成功/stage-失敗的 audit 已有測涵蓋。
+
+## 驗收 gate（實跑 evidence，2026-07-23）
+| gate | 指令 | 結果 |
+|---|---|---|
+| type-check | `cargo check` | **PASS**（exit 0，Finished，無 error/warning） |
+| lint | `cargo clippy --all-targets -- -D warnings` | **PASS**（exit 0，0 warning） |
+| test | `cargo test` | **PASS** — lib **207/0**（202 基線 + 5 新）、eval 4/0、`deployment_contract` 1/0、`eval_cli` 1/0、`runtime_contract` 4/0；全 suite **0 failed**；5 live 測維持 `#[ignore]`。 |
+| manifest-stack | `source manifest-stack.sh && manifest_stack_capability/value …` | **PASS**（has_api=true、has_ui=false、test_cmd=cargo test，無 backtick；見 #3） |
+
+新增 5 lib 測：handler +3（#1 fold_history）、openai +1（#5 null usage）、route +1（#4 timeout envelope）。AC-3 回歸：202→207 純增，`/agent/stream`、`/insight*`、`/report*`、runtime、既有 openai 端點全綠。
+
+> **rustfmt 註記**：repo 基線在本 toolchain 的 rustfmt 下即有 14 處 diff（含未觸及的 `openai_error` handler.rs:703、既有測試 asserts），非本次引入；`cargo fmt` 非驗收 gate，且全庫格式化會 churn 與 findings 無關的既有碼，故**不執行**；新增碼沿用 repo 既有單行 assert 風格（與既有測試一致）。三 gate（test/check/clippy）全綠。
+
+## 本批修改檔案
+- `.agent/project-manifest.md` — `## Stack` / `## Paths` value 去 markdown backtick（#3）。
+- `src/server/handler.rs` — `fold_history_into_prompt` 純函式 + `chat_completions` 織入 history（#1）；`build_chunks` call site 傳 `include_usage`（#5）；`openai_buffered_response`/`openai_stream_response` pipeline-build 失敗補 `ResponseFailed` audit、`openai_stream_response` 改 `async` + call site `.await`（#6）；+3 新測（#1）。
+- `src/server/openai.rs` — `ChatCompletionChunk.usage: Option<Option<Usage>>`、`build_chunks(+include_usage)`、`usage_chunk` `Some(Some)`、call site 更新（#5）；+1 新測、更新 1 pin 測（#5）。
+- `src/server/route.rs` — openai sub-router 改 `HandleErrorLayer` + `tower::timeout::TimeoutLayer` + `handle_openai_middleware_error`（#4）；+1 新測。

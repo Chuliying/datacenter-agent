@@ -16,11 +16,14 @@
 
 use std::time::Duration;
 
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{BoxError, Json, Router};
+use tower::timeout::TimeoutLayer as TowerTimeoutLayer;
 use tower::ServiceBuilder;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -30,7 +33,37 @@ use tower_http::trace::TraceLayer;
 
 use super::auth::{require_bearer, require_bearer_openai};
 use super::handler;
-use super::AppState;
+use super::{openai, AppState};
+
+/// Convert a middleware error on the OpenAI sub-router into the OpenAI **error envelope**
+/// (`{"error":{"message","type"}}`), so `/v1/chat/completions` never returns the empty body a bare
+/// [`TimeoutLayer`] would (finding #4). The only middleware error today is a request timeout from
+/// the [`tower::timeout`] layer → `504`; any other error maps to `500`. Both are `server_error`, the
+/// same `type` the handler uses for its own 5xx (see [`openai::error_type_for_status`]).
+async fn handle_openai_middleware_error(err: BoxError) -> Response {
+    let (status, message) = if err.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            format!(
+                "request timed out after {}s",
+                OPENAI_REQUEST_TIMEOUT.as_secs()
+            ),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal error: {err}"),
+        )
+    };
+    (
+        status,
+        Json(openai::OpenAiErrorBody::new(
+            openai::error_type_for_status(status.as_u16()),
+            message,
+        )),
+    )
+        .into_response()
+}
 
 /// 64 KiB. Defense-in-depth above the per-field 2 000-char prompt cap.
 const REQUEST_BODY_LIMIT: usize = 64 * 1024;
@@ -84,10 +117,14 @@ pub fn build_router(state: AppState) -> Router {
     // D6 contract for the seven endpoints above) is left untouched.
     let openai = Router::new()
         .route("/v1/chat/completions", post(handler::chat_completions))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::GATEWAY_TIMEOUT,
-            OPENAI_REQUEST_TIMEOUT,
-        ))
+        // `HandleErrorLayer` (outer) catches the `tower::timeout` layer's `Elapsed` error and turns
+        // it into the OpenAI error envelope, instead of the empty body `tower_http`'s
+        // `with_status_code` variant would send (finding #4). Auth stays outermost (applied last).
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_openai_middleware_error))
+                .layer(TowerTimeoutLayer::new(OPENAI_REQUEST_TIMEOUT)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_openai,
@@ -155,5 +192,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Finding #4: a timeout on the OpenAI sub-router must return the OpenAI **error envelope**
+    /// (`{"error":{"type":"server_error",...}}`), not the empty body a bare `TimeoutLayer` sends.
+    #[tokio::test]
+    async fn openai_timeout_returns_openai_error_envelope() {
+        let app = Router::new().route("/v1/chat/completions", post(slow)).layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(handle_openai_middleware_error))
+                .layer(TowerTimeoutLayer::new(Duration::from_millis(50))),
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("timeout body must be JSON (the OpenAI error envelope)");
+        assert_eq!(v["error"]["type"], "server_error");
+        assert!(
+            v["error"]["message"].is_string(),
+            "envelope must carry a message string, got {v}"
+        );
     }
 }

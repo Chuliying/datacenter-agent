@@ -742,6 +742,29 @@ fn with_prefix(prefix: &str, answer: String) -> String {
     }
 }
 
+/// Fold prior conversation turns into the prompt text so the first pipeline stage's LLM sees the
+/// whole conversation.
+///
+/// The sub-agent engine (`ConfiguredAgent::run`) threads only `InitialPrompt.prompt` into the LLM
+/// and ignores `InitialPrompt.history`, so on `/v1/chat/completions` a multi-turn OpenAI request
+/// would otherwise collapse to just its final user message. We render the earlier turns into a
+/// labeled transcript and prepend it to the current question. An empty history returns the prompt
+/// unchanged, so a single-turn request is byte-for-byte what it was before.
+///
+/// This lives at the handler layer on purpose: the engine, `/agent/stream`, and falcon behaviour
+/// are all left untouched — only this endpoint's `Initial` prompt is rewritten.
+fn fold_history_into_prompt(history: &[Exchange], prompt: &str) -> String {
+    if history.is_empty() {
+        return prompt.to_string();
+    }
+    let transcript = history
+        .iter()
+        .map(|turn| format!("User: {}\nAssistant: {}", turn.user, turn.assistant))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("以下是先前的對話紀錄:\n{transcript}\n\n目前的問題:\n{prompt}")
+}
+
 /// Resolve the pipeline task's own return value into the authoritative answer / failure.
 ///
 /// The answer and any failure come from the awaited `run_emitting` **result**, never from draining
@@ -953,16 +976,21 @@ pub async fn chat_completions(
     };
 
     // ── build + run the intent-selected pipeline ──
+    // Finding #1: the engine drops `InitialPrompt.history`, so a multi-turn conversation would lose
+    // every turn but the last. Fold the prior turns into the prompt text here (handler-only; the
+    // engine and `/agent/stream` are untouched) so the first stage's LLM sees the full exchange. The
+    // now-redundant `history` field is left empty — the folded prompt is the single source of truth.
+    let history: Vec<Exchange> = agent_input
+        .history
+        .into_iter()
+        .map(|turn| Exchange {
+            user: turn.user_prompt,
+            assistant: turn.model_response,
+        })
+        .collect();
     let initial = AgentPayload::Initial(InitialPrompt {
-        prompt: agent_input.prompt,
-        history: agent_input
-            .history
-            .into_iter()
-            .map(|turn| Exchange {
-                user: turn.user_prompt,
-                assistant: turn.model_response,
-            })
-            .collect(),
+        prompt: fold_history_into_prompt(&history, &agent_input.prompt),
+        history: Vec::new(),
         now: SystemClock::default().now(),
     });
     let report = wants_report_pipeline(&normalized);
@@ -981,6 +1009,7 @@ pub async fn chat_completions(
             audit_ctx,
             started,
         )
+        .await
     } else {
         openai_buffered_response(
             &state, report, initial, &prefix, &id, &model, created, audit, audit_ctx, started,
@@ -1004,7 +1033,7 @@ fn openai_refusal(
     created: i64,
 ) -> Response {
     if stream {
-        let chunks = openai::build_chunks(&copy, id, model, created);
+        let chunks = openai::build_chunks(&copy, id, model, created, include_usage);
         // A refusal costs no LLM tokens → the usage-only chunk (if requested) carries zeros.
         let usage_chunk = include_usage
             .then(|| openai::usage_chunk(openai::Usage::default(), id, model, created));
@@ -1064,7 +1093,24 @@ async fn openai_buffered_response(
     {
         Ok(pair) => pair,
         Err(e) => {
-            return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, format!("{e:#}"))
+            // Finding #6: a pipeline-construction failure is a ResponseFailed too — audit it before
+            // the 502, so this early return has the same audit trail as a stage failure below
+            // (warn-only, parity with the success/failure paths).
+            let message = format!("{e:#}");
+            let duration_ms = started.elapsed().as_millis() as u64;
+            if let Err(err) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseFailed {
+                        error_code: message.clone(),
+                        duration_ms,
+                    },
+                )
+                .await
+            {
+                warn!(error = %err, "chat_completions: audit ResponseFailed (pipeline build) failed");
+            }
+            return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message);
         }
     };
 
@@ -1152,8 +1198,10 @@ async fn openai_buffered_response(
 /// is sent after the content chunks and before `[DONE]`. The post-stream audit is written at the
 /// tail of the stream (parity with `agent_stream`); memory is inert here (`session_id` is always
 /// `None`), so only the audit side effect is mirrored — the memory append is omitted.
+// `async` only so the pipeline-construction failure below can `await` its audit write (finding #6);
+// the success path still returns the SSE handle without awaiting, so nothing blocks the stream.
 #[allow(clippy::too_many_arguments)]
-fn openai_stream_response(
+async fn openai_stream_response(
     state: &AppState,
     report: bool,
     initial: AgentPayload,
@@ -1172,7 +1220,25 @@ fn openai_stream_response(
     let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
     {
         Ok(pair) => pair,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, format!("{e:#}")),
+        Err(e) => {
+            // Finding #6: audit the pipeline-construction failure before the 502, matching the
+            // buffered path and the stage-failure audit at the stream's tail (warn-only).
+            let message = format!("{e:#}");
+            let duration_ms = started.elapsed().as_millis() as u64;
+            if let Err(err) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseFailed {
+                        error_code: message.clone(),
+                        duration_ms,
+                    },
+                )
+                .await
+            {
+                warn!(error = %err, "chat_completions stream: audit ResponseFailed (pipeline build) failed");
+            }
+            return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message);
+        }
     };
 
     // The task owns the orchestrator + sink; when the run finishes every sink clone drops and the
@@ -1223,7 +1289,7 @@ fn openai_stream_response(
                     total_tokens = usage.total_tokens,
                     "chat_completions stream usage"
                 );
-                for chunk in openai::build_chunks(&answer, &id, &model, created) {
+                for chunk in openai::build_chunks(&answer, &id, &model, created, include_usage) {
                     yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
                 }
                 // OpenAI `stream_options.include_usage`: a terminal usage-only chunk (empty
@@ -1752,6 +1818,58 @@ mod tests {
             with_prefix("disclaimer", "answer".into()),
             "disclaimer\n\nanswer"
         );
+    }
+
+    // ── finding #1: fold prior turns into the prompt (the engine drops InitialPrompt.history) ──
+
+    #[test]
+    fn fold_history_into_prompt_returns_prompt_unchanged_when_history_empty() {
+        // A single-turn request has no prior turns → the prompt is byte-for-byte unchanged.
+        assert_eq!(fold_history_into_prompt(&[], "目前的問題"), "目前的問題");
+    }
+
+    #[test]
+    fn fold_history_into_prompt_includes_a_single_prior_turn_before_the_question() {
+        let history = vec![Exchange {
+            user: "上個月營收多少?".into(),
+            assistant: "上個月營收是 100 萬。".into(),
+        }];
+        let folded = fold_history_into_prompt(&history, "那這個月呢?");
+        // The prior turn (both roles) must reach the prompt — the whole point of the fix.
+        assert!(folded.contains("上個月營收多少?"), "prior user turn missing: {folded}");
+        assert!(
+            folded.contains("上個月營收是 100 萬。"),
+            "prior assistant turn missing: {folded}"
+        );
+        assert!(folded.contains("那這個月呢?"), "current question missing: {folded}");
+        // The current question comes AFTER the folded history.
+        let history_pos = folded.find("上個月營收是 100 萬。").unwrap();
+        let question_pos = folded.find("那這個月呢?").unwrap();
+        assert!(
+            history_pos < question_pos,
+            "history must precede the current question: {folded}"
+        );
+    }
+
+    #[test]
+    fn fold_history_into_prompt_preserves_multi_turn_chronological_order() {
+        let history = vec![
+            Exchange { user: "Q1".into(), assistant: "A1".into() },
+            Exchange { user: "Q2".into(), assistant: "A2".into() },
+        ];
+        let folded = fold_history_into_prompt(&history, "Q3");
+        let (p1, p2, p3) = (
+            folded.find("Q1").expect("Q1 present"),
+            folded.find("Q2").expect("Q2 present"),
+            folded.find("Q3").expect("Q3 present"),
+        );
+        assert!(
+            p1 < p2 && p2 < p3,
+            "turns must appear oldest-first with the current question last: {folded}"
+        );
+        // Each prior turn is labeled by role so the model can read the transcript.
+        assert!(folded.contains("User: Q1"));
+        assert!(folded.contains("Assistant: A1"));
     }
 
     #[test]

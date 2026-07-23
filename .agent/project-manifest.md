@@ -29,27 +29,27 @@
 
 ## Paths
 
-- `source_roots`: `src`, `config`
-- `tests_root`: `tests`
-- `test_glob`: `tests/**/*.rs`
-- `work_root`: `docs/work`
-- `docs_root`: `docs`
-- `legacy_artifacts_root`: `.agent/artifacts`（歷史保留；新 work item 使用 `docs/work`）
+- `source_roots`: src, config
+- `tests_root`: tests
+- `test_glob`: tests/**/*.rs
+- `work_root`: docs/work
+- `docs_root`: docs
+- `legacy_artifacts_root`: .agent/artifacts（歷史保留；新 work item 使用 docs/work）
 
 ## Stack
 
-- `test_cmd`: `cargo test`
-- `typecheck_cmd`: `cargo check`
-- `lint_cmd`: `cargo clippy -- -D warnings`
-- `framework`: `axum 0.8 / tokio / rmcp`
-- `package_manager`: `cargo`
-- `source_extensions`: `rs`, `toml`, `json`, `md`
-- `has_ui`: `false`
-- `has_api`: `true`
-- `typed_contracts`: `true`
-- `has_e2e`: `false`
-- `build_cmd`: `cargo build --release`
-- `format_cmd`: `cargo fmt`
+- `test_cmd`: cargo test
+- `typecheck_cmd`: cargo check
+- `lint_cmd`: cargo clippy -- -D warnings
+- `framework`: axum 0.8 / tokio / rmcp
+- `package_manager`: cargo
+- `source_extensions`: rs, toml, json, md
+- `has_ui`: false
+- `has_api`: true
+- `typed_contracts`: true
+- `has_e2e`: false
+- `build_cmd`: cargo build --release
+- `format_cmd`: cargo fmt
 
 ## Git Workflow
 
