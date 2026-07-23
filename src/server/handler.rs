@@ -16,7 +16,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -706,23 +706,6 @@ fn openai_error(status: StatusCode, error_type: &str, message: impl Into<String>
     (status, Json(openai::OpenAiErrorBody::new(error_type, message))).into_response()
 }
 
-/// Map a pipeline [`AgentError`] onto an OpenAI error [`Response`] (ERR5).
-///
-/// Parity with [`insight_error_to_app_error`]: a capability failure (LLM transport / MCP tool) is
-/// an upstream `502`; any internal wiring fault is `503`.
-fn agent_error_to_openai(err: AgentError) -> Response {
-    match err {
-        AgentError::Capability(msg) => {
-            openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, msg)
-        }
-        other => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            openai::ERR_SERVER,
-            other.to_string(),
-        ),
-    }
-}
-
 /// Serialize one `chat.completion.chunk` into an SSE `data:` line — a pure `data:` stream with no
 /// `event:` name, as OpenAI expects (spec D1).
 fn openai_chunk_event(chunk: &openai::ChatCompletionChunk) -> Event {
@@ -814,6 +797,11 @@ pub async fn chat_completions(
 
     let stream = req.stream;
     let model = req.model;
+    // OpenAI `stream_options.include_usage`: append a terminal usage-only chunk to the stream.
+    let include_usage = req
+        .stream_options
+        .map(|opts| opts.include_usage)
+        .unwrap_or(false);
 
     // ── map messages → AgentRequest (ERR2; D5: system messages ignored) ──
     let agent_req = match openai::map_request(req.messages) {
@@ -881,7 +869,7 @@ pub async fn chat_completions(
     };
 
     // ── act on the plan ──
-    let (agent_input, normalized) = match plan {
+    let (started, agent_input, normalized) = match plan {
         // Pre-stream validation error (e.g. ERR3 prompt too long → 400). Audit already recorded it.
         StreamPlan::Error { code, status } => {
             return openai_error(
@@ -896,12 +884,15 @@ pub async fn chat_completions(
             return openai_refusal(stream, copy, &id, &model, created);
         }
         // The disclaimer `prefix` is intentionally dropped: on /agent/stream the pipeline's terminal
-        // `clear` supersedes it, so the delivered answer never carries it — matched here.
+        // `clear` supersedes it, so the delivered answer never carries it — matched here. `started`
+        // is the turn's start instant (from the prelude), carried forward for the post-response
+        // audit's `duration_ms` (parity with `agent_stream`).
         StreamPlan::Proceed {
+            started,
             agent_input,
             normalized,
             ..
-        } => (agent_input, *normalized),
+        } => (started, agent_input, *normalized),
     };
 
     // ── build + run the intent-selected pipeline ──
@@ -920,9 +911,23 @@ pub async fn chat_completions(
     let report = wants_report_pipeline(&normalized);
 
     if stream {
-        openai_stream_response(&state, report, initial, id, model, created)
+        openai_stream_response(
+            &state,
+            report,
+            initial,
+            id,
+            model,
+            created,
+            include_usage,
+            audit,
+            audit_ctx,
+            started,
+        )
     } else {
-        openai_buffered_response(&state, report, initial, &id, &model, created).await
+        openai_buffered_response(
+            &state, report, initial, &id, &model, created, audit, audit_ctx, started,
+        )
+        .await
     }
 }
 
@@ -953,7 +958,18 @@ fn openai_refusal(stream: bool, copy: String, id: &str, model: &str, created: i6
     }
 }
 
-/// Non-streaming path (D2): run the buffered pipeline and return one `chat.completion`.
+/// Non-streaming path (D2): run the pipeline through a collecting sink and return one
+/// `chat.completion`, then write the post-response audit (parity with `agent_stream`).
+///
+/// This drives the **streaming** client + drain (the same shape as [`openai_stream_response`],
+/// just collected in-process instead of re-emitted as SSE) rather than the buffered `run()`,
+/// because only the streaming client requests `include_usage` and thus emits the per-stage
+/// `AgentEvent::Usage` this endpoint sums into the OpenAI `usage` (spec D3 — the buffered
+/// `OpenAiLlm` emits none, which is why the old `run()` path reported all-zero usage).
+///
+/// Memory is inert on this endpoint (`session_id` is always `None`), so the memory-append side
+/// effect that `agent_stream` performs is intentionally omitted; only the audit is mirrored.
+#[allow(clippy::too_many_arguments)]
 async fn openai_buffered_response(
     state: &AppState,
     report: bool,
@@ -961,35 +977,108 @@ async fn openai_buffered_response(
     id: &str,
     model: &str,
     created: i64,
+    audit: AuditWriter,
+    audit_ctx: AuditCtx,
+    started: Instant,
 ) -> Response {
-    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, None) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
+    {
         Ok(pair) => pair,
-        Err(e) => return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, format!("{e:#}")),
+        Err(e) => {
+            return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, format!("{e:#}"))
+        }
     };
-    match orchestrator.run(&pipeline_id, initial).await {
-        // D3: the buffered `OpenAiLlm` emits no `Usage`, so usage is reported as zero.
-        Ok(AgentPayload::Final(result)) => Json(openai::build_response(
-            &result.assistant,
-            id,
-            model,
-            created,
-            openai::Usage::default(),
-        ))
-        .into_response(),
-        Ok(other) => openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            openai::ERR_SERVER,
-            format!(
-                "pipeline did not produce a final result (got {:?})",
-                other.kind()
-            ),
-        ),
-        Err(err) => agent_error_to_openai(err),
+
+    // The task owns the orchestrator + sink; when the run finishes every sink clone drops and the
+    // channel closes, so the drain loop below ends naturally.
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&pipeline_id, initial, &*sink)
+            .await
+    });
+
+    let mut usages: Vec<UsageData> = Vec::new();
+    let mut answer: Option<String> = None;
+    let mut failure: Option<String> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            // Accumulate per-stage token usage (D3).
+            AgentEvent::Usage {
+                prompt,
+                completion,
+                reasoning,
+                total,
+            } => usages.push(UsageData {
+                prompt,
+                completion,
+                reasoning,
+                total,
+            }),
+            // The finalizer/renderer answer is the complete result.
+            AgentEvent::Finished { assistant } => answer = Some(assistant),
+            AgentEvent::Error { message } => failure = Some(message),
+            _ => {}
+        }
+    }
+    // Channel closed → the run finished. A stage failure already surfaced as `AgentEvent::Error`;
+    // only a task panic needs a fallback.
+    if let Err(join) = run.await {
+        failure.get_or_insert_with(|| format!("agent task failed: {join}"));
+    }
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match answer {
+        Some(text) => {
+            let usage = openai::accumulate_usage(&usages);
+            if let Err(e) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseCompleted {
+                        response_hash: hash_identifier(&text),
+                        response_chars: text.chars().count(),
+                        duration_ms,
+                        status: "completed".to_string(),
+                    },
+                )
+                .await
+            {
+                warn!(error = %e, "chat_completions: audit ResponseCompleted failed");
+            }
+            Json(openai::build_response(&text, id, model, created, usage)).into_response()
+        }
+        None => {
+            // A stage failed (ERR5) or the run aborted before `Finished` (parity with the stream
+            // path: surfaced as an upstream error).
+            let message = failure.unwrap_or_else(|| "pipeline produced no answer".to_string());
+            if let Err(e) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseFailed {
+                        error_code: message.clone(),
+                        duration_ms,
+                    },
+                )
+                .await
+            {
+                warn!(error = %e, "chat_completions: audit ResponseFailed failed");
+            }
+            openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message)
+        }
     }
 }
 
 /// Streaming path (D1, pseudo-streaming): run the pipeline emitting events, accumulate per-stage
 /// usage, and on the terminal complete answer split it into `chat.completion.chunk`s + `[DONE]`.
+///
+/// When `include_usage` is set (OpenAI `stream_options.include_usage`), a terminal usage-only chunk
+/// is sent after the content chunks and before `[DONE]`. The post-stream audit is written at the
+/// tail of the stream (parity with `agent_stream`); memory is inert here (`session_id` is always
+/// `None`), so only the audit side effect is mirrored — the memory append is omitted.
+#[allow(clippy::too_many_arguments)]
 fn openai_stream_response(
     state: &AppState,
     report: bool,
@@ -997,6 +1086,10 @@ fn openai_stream_response(
     id: String,
     model: String,
     created: i64,
+    include_usage: bool,
+    audit: AuditWriter,
+    audit_ctx: AuditCtx,
+    started: Instant,
 ) -> Response {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
     let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
@@ -1047,6 +1140,7 @@ fn openai_stream_response(
             failure.get_or_insert_with(|| format!("agent task failed: {join}"));
         }
 
+        let duration_ms = started.elapsed().as_millis() as u64;
         match answer {
             Some(text) => {
                 let usage = openai::accumulate_usage(&usages);
@@ -1059,13 +1153,46 @@ fn openai_stream_response(
                 for chunk in openai::build_chunks(&text, &id, &model, created) {
                     yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
                 }
+                // OpenAI `stream_options.include_usage`: a terminal usage-only chunk (empty
+                // `choices`, populated `usage`) after the content chunks, before `[DONE]`.
+                if include_usage {
+                    let chunk = openai::usage_chunk(usage, &id, &model, created);
+                    yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+                }
+                // ── post-stream audit (parity with agent_stream) ──
+                if let Err(e) = audit
+                    .write(
+                        &audit_ctx,
+                        AuditEvent::ResponseCompleted {
+                            response_hash: hash_identifier(&text),
+                            response_chars: text.chars().count(),
+                            duration_ms,
+                            status: "completed".to_string(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(error = %e, "chat_completions stream: audit ResponseCompleted failed");
+                }
                 yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
             }
             None => {
                 // A stage failed (ERR5) or the run aborted before `Finished`. Response headers are
                 // already `200` (SSE), so surface the failure in-band as an OpenAI error object,
                 // then `[DONE]`.
-                let message = failure.unwrap_or_else(|| "pipeline produced no answer".into());
+                let message = failure.unwrap_or_else(|| "pipeline produced no answer".to_string());
+                if let Err(e) = audit
+                    .write(
+                        &audit_ctx,
+                        AuditEvent::ResponseFailed {
+                            error_code: message.clone(),
+                            duration_ms,
+                        },
+                    )
+                    .await
+                {
+                    warn!(error = %e, "chat_completions stream: audit ResponseFailed failed");
+                }
                 let body = openai::OpenAiErrorBody::new(openai::ERR_UPSTREAM, message);
                 yield Ok::<_, Infallible>(
                     Event::default()

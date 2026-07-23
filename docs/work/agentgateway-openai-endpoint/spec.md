@@ -35,7 +35,13 @@ prd: docs/work/agentgateway-openai-endpoint/prd.md
 - **決策**:非串流仿 `/agent/stream` 但 buffered——`plan_stream_turn` prelude → `wants_report_pipeline(&normalized)` 選 pipeline → `build_*_pipeline(..., sink=None)` → `Orchestrator::run()` → `final_answer(outcome)`([handler.rs:748](src/server/handler.rs:748))。達成 **REST/stream 同後端(pipeline)**,契合使用者「REST/stream 同組件」判準。
 
 ### D3 — usage 自行累加
-- pipeline 每個 stage 各發一次 `AgentEvent::Usage`([llm.rs:634](src/agent/llm.rs:634)),**目前無任何累計**。新端點累加所有 `Usage`(sum prompt/completion/total,reasoning 有則 sum)填 OpenAI `usage`。⚠️ buffered `OpenAiLlm` **不發 Usage**([llm.rs:401](src/agent/llm.rs:401)):非串流若要 usage,需改用 streaming client + 收集 sink(見 Steps 5;否則非串流 usage 從缺並標註)。
+- pipeline 每個 stage 各發一次 `AgentEvent::Usage`([llm.rs:634](src/agent/llm.rs:634)),**目前無任何累計**。新端點累加所有 `Usage`(sum prompt/completion/total,reasoning 有則 sum)填 OpenAI `usage`。⚠️ buffered `OpenAiLlm` **不發 Usage**([llm.rs:401](src/agent/llm.rs:401)):非串流若要 usage,需改用 streaming client + 收集 sink(見 Steps 5)。
+
+> **實作狀態(2026-07-23,已補齊,符合 OpenAI contract)**：
+> - **非串流 usage 已取值**：`openai_buffered_response` 不再走 buffered `run()`,改走 **streaming client + drain**(`build_openai_pipeline(Some(sink))` → `run_emitting` → 收集 `AgentEvent::Usage`),`accumulate_usage` 填實值(不動 `llm.rs`/`payload.rs`)。
+> - **串流 usage 已上 wire**:`ChatCompletionRequest.stream_options.include_usage` 為 `true` 時,於內容 chunk 之後、`data: [DONE]` 之前多送一個 **usage-only chunk**(`choices: []` + `usage`),符合 OpenAI `include_usage` 語意;未設時 wire 完全不變。
+> - **post-stream audit 已補**:buffered/stream 兩路徑均寫 `AuditEvent::ResponseCompleted`(完成)/`ResponseFailed`(失敗),對齊 `/agent/stream`。
+> - **memory 仍 inert**:OpenAI body 無 `session_id`(恆 `None`),無 turn 可複製,故 `append_memory_turn_if_enabled` 省略(設計如此,非落差)。
 
 ### D4 — prompt 長度上限 4000（runtime）
 走 `plan_stream_turn` prelude → `input_guard::validate_prompt(prompt, 4000)`([input_guard.rs:6](src/runtime/guardrails/input_guard.rs:6)、[config.rs:38](src/runtime/config.rs:38))。非 legacy 2000。

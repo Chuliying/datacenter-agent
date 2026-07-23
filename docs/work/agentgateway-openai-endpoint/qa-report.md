@@ -51,9 +51,9 @@ slug: agentgateway-openai-endpoint
 | ERR5 capability → 502 | `agent_error_to_openai`(邏輯已實作);端到端待 stub 回錯誤驗 | ⚠️ 邏輯實作 |
 
 ## 已知限制（非驗收失敗；spec 已記錄）
-1. **usage 全 0**（D3）：非串流 buffered pipeline 不發 `Usage`、串流 usage 僅 log 不上 wire。實測確認。需 `llm.rs`/`payload.rs` 擴充(範圍外)。
+1. ~~**usage 全 0**（D3）~~ → **已解除（2026-07-23）**：usage 已實作,符合 OpenAI contract。非串流改走 streaming client + drain 收集 `AgentEvent::Usage`,`accumulate_usage` 填實值;串流於 `stream_options.include_usage=true` 時多送 usage-only chunk(`choices:[]` + `usage`)。未動 `llm.rs`/`payload.rs`,僅改新端點 helper。lib 測 181→185(全 suite 195/0)。usage 端到端 curl 待主 agent 事後驗。
 2. **真實上游成功查詢**：`DATACENTER_API_BASE` 正確 host 未知,本次以本機 mock stub 驗證成功路徑;真實資料端到端待正確 host(規格書 C-3)。
-3. **post-stream audit**：新端點未寫 `ResponseCompleted`/`Failed`（prelude 已寫 `RequestReceived`/`InputNormalized`）。
+3. ~~**post-stream audit**~~ → **已解除（2026-07-23）**：buffered/stream 兩路徑均寫 `AuditEvent::ResponseCompleted`/`ResponseFailed`,對齊 `/agent/stream`(prelude 另已寫 `RequestReceived`/`InputNormalized`)。**memory 因 OpenAI body 無 `session_id`(恆 `None`)仍 inert**,無 turn 可複製,故 `append_memory_turn_if_enabled` 省略(設計如此,非落差)。
 
 ## 結論
 

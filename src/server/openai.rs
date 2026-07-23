@@ -42,6 +42,18 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub stream: bool,
+    /// OpenAI `stream_options`; absent for a client that does not ask for a usage chunk.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// OpenAI `stream_options`. Only `include_usage` is honored — the sole option that affects this
+/// endpoint's wire (a terminal usage-only chunk, see [`usage_chunk`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct StreamOptions {
+    /// When `true`, emit a final usage-only chunk before `data: [DONE]`.
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// Why an OpenAI `messages` list could not be mapped onto an [`AgentRequest`].
@@ -134,6 +146,10 @@ pub struct ReasoningDetails {
 }
 
 /// One streaming chunk (`object: "chat.completion.chunk"`).
+///
+/// `usage` is `None` (and serde-skipped) on every ordinary chunk, so the streamed wire shape is
+/// unchanged; it is populated only on the terminal usage-only chunk built by [`usage_chunk`] when
+/// the client sets `stream_options.include_usage` (OpenAI semantics).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
@@ -141,6 +157,8 @@ pub struct ChatCompletionChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// One choice inside a streaming chunk.
@@ -194,6 +212,8 @@ pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<Ch
         created,
         model: model.to_string(),
         choices,
+        // Ordinary content chunks never carry usage (populated only by `usage_chunk`).
+        usage: None,
     };
     // Leading chunk announces the assistant role.
     let mut chunks = vec![mk(vec![ChunkChoice {
@@ -223,6 +243,22 @@ pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<Ch
         finish_reason: Some("stop".into()),
     }]));
     chunks
+}
+
+/// Build the terminal usage-only chunk for OpenAI `stream_options.include_usage` (spec D3).
+///
+/// Its `choices` is empty and `usage` carries the accumulated per-stage total. It is sent after the
+/// content chunks from [`build_chunks`] and before `data: [DONE]`; only when the client opted in
+/// (otherwise the stream is byte-for-byte what it was before this field existed).
+pub fn usage_chunk(usage: Usage, id: &str, model: &str, created: i64) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_string(),
+        choices: Vec::new(),
+        usage: Some(usage),
+    }
 }
 
 // ──── non-streaming response DTO (spec D2) ────
@@ -521,5 +557,65 @@ mod tests {
             serde_json::to_value(&body).unwrap(),
             serde_json::json!({"error": {"message": "bad", "type": "invalid_request_error"}})
         );
+    }
+
+    // ── streaming usage: OpenAI `stream_options.include_usage` (D3) ──
+
+    #[test]
+    fn stream_options_deserializes_include_usage() {
+        let opts: StreamOptions = serde_json::from_str(r#"{"include_usage":true}"#).unwrap();
+        assert!(opts.include_usage);
+        // Absent flag defaults to false (serde default).
+        let opts: StreamOptions = serde_json::from_str("{}").unwrap();
+        assert!(!opts.include_usage);
+    }
+
+    #[test]
+    fn request_stream_options_default_none_and_parse() {
+        // Absent → None (opting out of the usage-only chunk, wire unchanged).
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .unwrap();
+        assert!(req.stream_options.is_none());
+        // Present → carried through.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"stream_options":{"include_usage":true}}"#,
+        )
+        .unwrap();
+        assert!(req.stream_options.unwrap().include_usage);
+    }
+
+    #[test]
+    fn content_chunks_omit_the_usage_field() {
+        // The ordinary streamed chunks never carry `usage` (serde skips `None`), so the existing
+        // wire shape is unchanged when `include_usage` is off.
+        for chunk in build_chunks("hello world", "id", "m", 0) {
+            let v = serde_json::to_value(&chunk).unwrap();
+            assert!(
+                v.get("usage").is_none(),
+                "content chunk must not serialize a usage field"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_chunk_serializes_with_empty_choices_and_usage() {
+        // TC: usage-only chunk pins to `{"choices":[],"usage":{...},...}` (OpenAI include_usage).
+        let usage = Usage {
+            prompt_tokens: 12,
+            completion_tokens: 8,
+            total_tokens: 20,
+            completion_tokens_details: None,
+        };
+        let chunk = usage_chunk(usage, "chatcmpl-x", "m", 42);
+        let v = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(v["object"], "chat.completion.chunk");
+        assert_eq!(v["id"], "chatcmpl-x");
+        assert_eq!(v["created"], 42);
+        assert_eq!(v["model"], "m");
+        assert!(v["choices"].as_array().unwrap().is_empty());
+        assert_eq!(v["usage"]["prompt_tokens"], 12);
+        assert_eq!(v["usage"]["completion_tokens"], 8);
+        assert_eq!(v["usage"]["total_tokens"], 20);
     }
 }

@@ -142,3 +142,58 @@ LLM 為真實 `anthropic/claude-opus-4.7`。stub 對 6 個 `starcharger/api/v2/*
 | T5 串流成功查詢 | SSE chunks + `[DONE]` | **27 chunks** ✓ 首塊 `delta.role="assistant"` → content 塊（累加還原=完整答案）→ 末塊 `delta:{},finish_reason:"stop"` → `data: [DONE]`；`object:"chat.completion.chunk"` |
 
 結論：wiring / auth(D6) / 映射(D5) / prelude / pipeline 驅動 / 非串流(D2) / 串流偽串流(D1) / 錯誤 envelope / SSE `[DONE]` 全部端到端 work。D3 usage 全 0 經實測確認（已知限制）。真實上游成功查詢仍待正確 `DATACENTER_API_BASE` host（規格書 C-3）。
+
+---
+
+# 續作 — usage + audit 補強（2026-07-23）
+
+補齊兩個已知落差：**usage 符合 OpenAI contract**（原限制 #2、#3）與 **post-stream audit**（原限制 #4）。**僅動新端點 helper，不碰 `/insight`、`/report` 的 `run()`，不動 `llm.rs`/`payload.rs`。**
+基線：進場 `cargo test` → lib **181/0**（全 suite 191 passed，其餘 ignored）。
+
+## Step 2（續）— RED-GREEN
+
+### 迴圈 7 — 串流 usage DTO/純函式（`src/server/openai.rs`）
+純資料/序列化 pin，unit RED→GREEN：
+- **RED**：新增 4 測（`stream_options_deserializes_include_usage`、`request_stream_options_default_none_and_parse`、`content_chunks_omit_the_usage_field`、`usage_chunk_serializes_with_empty_choices_and_usage`）引用尚未存在的 `StreamOptions` / `ChatCompletionRequest.stream_options` / `ChatCompletionChunk.usage` / `usage_chunk()` → `cargo test --lib server::openai` **5 compile error**（`cannot find type StreamOptions`×2、`no field stream_options`×2、`cannot find function usage_chunk`）observed。
+- **GREEN**：
+  - `StreamOptions { #[serde(default)] include_usage: bool }`（Deserialize、Default）。
+  - `ChatCompletionRequest` 加 `#[serde(default)] stream_options: Option<StreamOptions>`。
+  - `ChatCompletionChunk` 加 `#[serde(skip_serializing_if = "Option::is_none")] usage: Option<Usage>`；`build_chunks` 的 `mk` closure 填 `usage: None`（平常 chunk wire 不變，`content_chunks_omit_the_usage_field` 驗序列化無 `usage` key）。
+  - `usage_chunk(usage, id, model, created)`：`choices: []` + `usage: Some(..)`，序列化 pin `{"choices":[],"usage":{...},...}`。
+  - → `cargo test --lib server::openai` **19 passed / 0 failed**（15 + 4）。
+
+### 迴圈 8 — 非串流 usage 取值（`handler::openai_buffered_response`，改動一）
+buffered `OpenAiLlm` 不發 `Usage`（`llm.rs:401`），原 `run()` 路徑 usage 恆 0。改成**複用串流 drain 模式**：`build_openai_pipeline(state, report, Some(sink))` → `tokio::spawn(run_emitting)` → drain channel 收集 `answer`(from `Finished`)、`usages`(from `Usage`→`dto::UsageData`)、`failure`(from `Error`)，`run.await` 收 panic → `build_response(&answer, id, model, created, accumulate_usage(&usages))`。整合行為（需 pipeline sink），unit 難覆蓋 → 以 code 對齊既有串流 drain 為主，端到端由 curl 驗（見下）。
+- 副作用：失敗回應改走 `ERR_UPSTREAM`(502) in-band（與串流路徑一致），原 `agent_error_to_openai`(唯一使用點在此)移除以免 dead_code（clippy `-D warnings`）。
+
+### 迴圈 9 — 串流 usage（OpenAI `include_usage`，改動二）
+`openai_stream_response`：當 `include_usage == true`，於 `build_chunks` 末塊之後、`data: [DONE]` 之前多送一個 `usage_chunk`（`choices:[]` + `usage: Some(accumulate_usage(&usages))`）。**未設 `include_usage` 時 wire 完全不變**。`chat_completions` 從 `req.stream_options` 取 `include_usage` 傳入。
+
+### 迴圈 10 — post-stream audit（改動三，對齊 `agent_stream` 646–681）
+`chat_completions` 原 `StreamPlan::Proceed { agent_input, normalized, .. }` 忽略 `started` → 取出 `started`，連同 `audit`(AuditWriter)、`audit_ctx` 傳入 buffered/stream 兩路徑：
+- 有 `Finished` → `AuditEvent::ResponseCompleted { response_hash: hash_identifier(&answer), response_chars, duration_ms: started.elapsed(), status: "completed" }`；寫失敗只 `warn!` 不影響回應。
+- 有 `failure` → `AuditEvent::ResponseFailed { error_code, duration_ms }`。
+- 串流 audit 寫在 `async_stream` 尾端（同 `agent_stream`）；非串流寫在回 response 前。
+- **memory**：OpenAI 端點 `session_id` 恆 `None`（memory inert），故**省略** `append_memory_turn_if_enabled`（無 turn 可複製）。
+
+## 驗收 gate（實跑 evidence，2026-07-23）
+| gate | 指令 | 結果 |
+|---|---|---|
+| type-check | `cargo check` | **PASS**（Finished dev profile，無 error/warning） |
+| lint | `cargo clippy --all-targets -- -D warnings` | **PASS**（無 warning） |
+| test | `cargo test` | **PASS** — lib **185/0**（181 基線 + 4 新 openai 測）、eval bin 4/0、`deployment_contract` 1/0、`eval_cli` 1/0、`runtime_contract` 4/0；全 suite **195 passed / 0 failed**；live 整合測試維持 `#[ignore]`。 |
+
+AC-3（回歸）：lib 181 基線 → 185（純增），`/agent/stream`、`/insight*`、`/report*`、runtime 全綠，未破壞既有端點。
+
+## 已解除的原限制
+- 原限制 #2（非串流 usage 全 0）→ **解除**：改走 streaming client + drain 收集 `AgentEvent::Usage`，`accumulate_usage` 填實值。
+- 原限制 #3（串流 usage 僅 log）→ **解除**：`include_usage=true` 時以 usage-only chunk 上 wire，符合 OpenAI `stream_options.include_usage` 語意；未設時行為不變。
+- 原限制 #4（未寫 post-stream audit）→ **解除**：兩路徑皆補 `ResponseCompleted`/`ResponseFailed`。memory 因無 `session_id` 仍 inert（設計如此）。
+
+## 本批修改檔案
+- `src/server/openai.rs`[MODIFY] — `StreamOptions`、`ChatCompletionRequest.stream_options`、`ChatCompletionChunk.usage`、`usage_chunk()` + 4 新單元測（openai 模組 19/19）。
+- `src/server/handler.rs`[MODIFY] — `chat_completions` 取 `started` + 傳 `include_usage`/`audit`/`audit_ctx`；`openai_buffered_response` 改 drain 模式取 usage + 寫 audit；`openai_stream_response` 加 `include_usage` usage-only chunk + 寫 audit；移除已無使用的 `agent_error_to_openai`；`use std::time::Instant`。
+
+## 待辦（本批範圍外）
+- usage/audit 端到端 curl（含 `include_usage:true` 觀察 usage-only chunk、audit sink 落 `ResponseCompleted/Failed`）由主 agent 事後驗；本批以 unit + 對齊既有模式為據，未造假 mock。
+- 真實上游成功查詢仍待正確 `DATACENTER_API_BASE` host（規格書 C-3，沿用）。
