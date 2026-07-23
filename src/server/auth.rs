@@ -26,6 +26,7 @@ use constant_time_eq::constant_time_eq;
 use tracing::debug;
 
 use super::error::ErrorBody;
+use super::openai::{OpenAiErrorBody, ERR_INVALID_REQUEST};
 use super::AppState;
 
 const TEAPOT_MESSAGE: &str = "I'm a teapot. We cannot brew \
@@ -59,6 +60,46 @@ pub async fn require_bearer(State(state): State<AppState>, req: Request, next: N
     }
 }
 
+/// OpenAI-envelope bearer gate for `POST /v1/chat/completions` (finding #6).
+///
+/// The token check is identical to [`require_bearer`] (same constant-time compare against
+/// `GLOBAL_TOKEN`), but a rejection is `401 Unauthorized` carrying the OpenAI error envelope —
+/// what an OpenAI client / agentgateway expects — instead of the host's `418` teapot. The shared
+/// [`require_bearer`] middleware (and its D6 `418` contract for the other seven endpoints) is
+/// deliberately left untouched.
+///
+/// ## Note
+///
+/// Apply via `middleware::from_fn_with_state(state.clone(), require_bearer_openai)`.
+pub async fn require_bearer_openai(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if check(&state, &req) {
+        next.run(req).await
+    } else {
+        debug!(
+            path = %req.uri().path(),
+            method = %req.method(),
+            "auth: rejected /v1 with 401"
+        );
+        openai_unauthorized()
+    }
+}
+
+/// The `401` + OpenAI error envelope returned when the `/v1/chat/completions` bearer check fails.
+fn openai_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(OpenAiErrorBody::new(
+            ERR_INVALID_REQUEST,
+            "missing or invalid bearer token",
+        )),
+    )
+        .into_response()
+}
+
 /// Check if the request has a valid bearer token
 fn check(state: &AppState, req: &Request) -> bool {
     // Get the authorization header
@@ -86,4 +127,26 @@ fn check(state: &AppState, req: &Request) -> bool {
 
     // Compare the token with the stored token
     constant_time_eq(token.as_bytes(), state.auth_token.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn openai_unauthorized_is_401_with_openai_envelope() {
+        // Finding #6: the /v1 bearer gate rejects with 401 + OpenAI error envelope (not 418).
+        let resp = openai_unauthorized();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"].is_string(),
+            "envelope must carry a message"
+        );
+    }
 }

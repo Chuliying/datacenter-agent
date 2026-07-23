@@ -20,7 +20,7 @@
 //! map onto the existing [`AgentRequest`] and drive the same runtime prelude +
 //! sub-agent pipeline. See `docs/work/agentgateway-openai-endpoint/spec.md`.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::model::History;
 use crate::server::dto::{AgentRequest, UsageData};
@@ -29,13 +29,60 @@ use crate::server::dto::{AgentRequest, UsageData};
 ///
 /// Deserialized from the request `messages`, and reused as the `assistant`
 /// message in a non-streaming [`ChatCompletionResponse`] — hence `Serialize`.
+///
+/// `content` accepts both OpenAI shapes: a plain string, **or** an array of typed content parts
+/// (`[{"type":"text","text":"…"}, …]`). For the array form the text parts are concatenated and any
+/// non-text part (e.g. `image_url`) is ignored — this endpoint is text-only. On the response side
+/// `content` always serializes as a plain string (the OpenAI response shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(deserialize_with = "deserialize_content")]
     pub content: String,
 }
 
+/// Deserialize an OpenAI message `content` from either a plain string or a content-parts array.
+///
+/// A string passes through unchanged. An array is flattened to the concatenation of its `text`
+/// parts (parts of any other `type` are dropped); this keeps a real OpenAI SDK client — which sends
+/// `content` as parts — working, while the pipeline only consumes text.
+fn deserialize_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// One typed part of a content-parts array. Only `text` parts carry text we keep.
+    #[derive(Deserialize)]
+    struct ContentPart {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        text: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Text(String),
+        Parts(Vec<ContentPart>),
+    }
+
+    Ok(match Content::deserialize(deserializer)? {
+        Content::Text(text) => text,
+        Content::Parts(parts) => parts
+            .into_iter()
+            .filter(|part| part.kind == "text")
+            .filter_map(|part| part.text)
+            .collect::<String>(),
+    })
+}
+
 /// Request body for `POST /v1/chat/completions` (OpenAI Chat Completions shape).
+///
+/// Only the fields this endpoint honors are deserialized; unknown fields are ignored (serde's
+/// default). In particular OpenAI's `tools` / `tool_choice` are **deliberately not** captured: this
+/// endpoint fronts a fixed internal sub-agent pipeline and does not expose client-driven
+/// tool-calling, so advertising or selecting tools has no effect here. A client that sends them is
+/// accepted (they are silently dropped) rather than rejected.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -63,58 +110,91 @@ pub struct StreamOptions {
 pub enum MapError {
     /// No messages, or no `user` message to use as the prompt.
     NoUserMessage,
-    /// The turn structure is not a valid alternating conversation
-    /// (e.g. two adjacent `user` messages, or a dangling `assistant`).
+    /// The conversation has messages but no trailing `user` turn to serve as the prompt
+    /// (e.g. it ends with an `assistant` turn).
     BadShape(String),
+}
+
+/// Whether a message role is dropped before shaping the conversation. Only `user` / `assistant`
+/// carry a conversational turn; every other role is ignored rather than folded into one — `system`
+/// / `developer` (the pipeline has no system slot, each stage carries its own designed
+/// instruction), and any other role such as `tool` / `function` (this endpoint advertises no
+/// tools). Dropping unknown roles means replaying a transcript that carries tool messages never
+/// pollutes the user/assistant history.
+fn is_ignored_role(role: &str) -> bool {
+    role != "user" && role != "assistant"
 }
 
 /// Map an OpenAI `messages` list onto the internal [`AgentRequest`].
 ///
-/// The last `user` message becomes `prompt`; earlier `user`/`assistant` pairs
-/// become `history`. `system` messages are ignored (the pipeline has no system
-/// slot — each stage carries its own designed instruction). `session_id` /
-/// `option_id` have no OpenAI equivalent and are left `None`.
+/// The mapping is lenient about turn structure so a real OpenAI client is not rejected for a
+/// non-strictly-alternating history:
+///
+/// - Non-conversational roles (`system` / `developer` / `tool` / …) are dropped (see [`is_ignored_role`]).
+/// - Consecutive messages of the **same** role are merged into one turn, their content joined with
+///   `\n` (two `user` messages in a row become one; likewise `assistant`).
+/// - After merging, the trailing `user` turn becomes `prompt`; the earlier turns fold into
+///   `history`. A conversation that opens with an `assistant` turn pairs it with an empty
+///   `user_prompt` rather than failing.
+/// - There must still be a trailing `user` turn to serve as the prompt: an empty list (or one made
+///   empty by dropping system/developer) is [`MapError::NoUserMessage`]; a list that ends on an
+///   `assistant` turn is [`MapError::BadShape`]. Both surface as HTTP 400.
+///
+/// `session_id` / `option_id` have no OpenAI equivalent and are left `None`.
 pub fn map_request(messages: Vec<ChatMessage>) -> Result<AgentRequest, MapError> {
-    // `system` messages have no pipeline slot (each stage carries its own designed
-    // instruction), so they are dropped before shaping the conversation.
-    let msgs: Vec<&ChatMessage> = messages.iter().filter(|m| m.role != "system").collect();
+    // Drop system/developer, then collapse runs of the same role into one turn so the remainder is
+    // strictly alternating regardless of how the client batched its messages.
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for msg in messages.into_iter().filter(|m| !is_ignored_role(&m.role)) {
+        match merged.last_mut() {
+            Some(prev) if prev.role == msg.role => {
+                prev.content.push('\n');
+                prev.content.push_str(&msg.content);
+            }
+            _ => merged.push(msg),
+        }
+    }
 
-    // The last message must be the current user turn (it becomes `prompt`).
-    let Some((last, earlier)) = msgs.split_last() else {
+    // The current user turn (the last merged message) is the prompt.
+    let Some((last, earlier)) = merged.split_last() else {
         return Err(MapError::NoUserMessage);
     };
     if last.role != "user" {
         return Err(MapError::BadShape(format!(
-            "last message must be role=user, got role={}",
+            "conversation must end with a `user` turn to use as the prompt, got role={}",
             last.role
         )));
     }
     let prompt = last.content.clone();
 
-    // Earlier turns must be a clean alternating (user, assistant) sequence.
-    let mut history = Vec::with_capacity(earlier.len() / 2);
+    // Fold the earlier (already-alternating) turns into history pairs. A leading `assistant` turn
+    // pairs with an empty `user_prompt`; every `user` turn pairs with the `assistant` turn that
+    // follows it (or an empty response if none does).
+    let mut history = Vec::with_capacity(earlier.len().div_ceil(2));
     let mut i = 0;
     while i < earlier.len() {
-        let user = earlier[i];
-        if user.role != "user" {
-            return Err(MapError::BadShape(format!(
-                "expected role=user at history position {i}, got role={}",
-                user.role
-            )));
-        }
-        match earlier.get(i + 1) {
-            Some(assistant) if assistant.role == "assistant" => {
-                history.push(History {
-                    user_prompt: user.content.clone(),
-                    model_response: assistant.content.clone(),
-                });
-                i += 2;
-            }
-            _ => {
-                return Err(MapError::BadShape(
-                    "expected role=assistant after a user message in history".into(),
-                ));
-            }
+        let turn = &earlier[i];
+        if turn.role == "assistant" {
+            history.push(History {
+                user_prompt: String::new(),
+                model_response: turn.content.clone(),
+            });
+            i += 1;
+        } else {
+            let model_response = match earlier.get(i + 1) {
+                Some(next) if next.role == "assistant" => {
+                    i += 2;
+                    next.content.clone()
+                }
+                _ => {
+                    i += 1;
+                    String::new()
+                }
+            };
+            history.push(History {
+                user_prompt: turn.content.clone(),
+                model_response,
+            });
         }
     }
 
@@ -150,7 +230,9 @@ pub struct ReasoningDetails {
 /// `usage` is `None` (and serde-skipped) on every ordinary chunk, so the streamed wire shape is
 /// unchanged; it is populated only on the terminal usage-only chunk built by [`usage_chunk`] when
 /// the client sets `stream_options.include_usage` (OpenAI semantics).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// (No `Eq`: [`ChunkChoice::logprobs`] holds a `serde_json::Value`, which is not `Eq`.)
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
     pub object: &'static str,
@@ -159,15 +241,23 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// OpenAI `system_fingerprint`. We compute none, so it serializes as `null` (present, matching
+    /// the OpenAI envelope) rather than being omitted.
+    pub system_fingerprint: Option<String>,
 }
 
 /// One choice inside a streaming chunk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// (No `Eq`: `logprobs` holds a `serde_json::Value`, which is not `Eq`.)
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChunkChoice {
     pub index: u32,
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// OpenAI `logprobs`; always `null` on this endpoint (logprobs are not produced), serialized
+    /// rather than skipped so the choice shape matches OpenAI.
+    pub logprobs: Option<serde_json::Value>,
 }
 
 /// The incremental `delta` of a streaming chunk.
@@ -214,6 +304,7 @@ pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<Ch
         choices,
         // Ordinary content chunks never carry usage (populated only by `usage_chunk`).
         usage: None,
+        system_fingerprint: None,
     };
     // Leading chunk announces the assistant role.
     let mut chunks = vec![mk(vec![ChunkChoice {
@@ -223,6 +314,7 @@ pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<Ch
             content: None,
         },
         finish_reason: None,
+        logprobs: None,
     }])];
     // Content chunks — char-safe split so multibyte UTF-8 is never cut mid-codepoint.
     let chars: Vec<char> = answer.chars().collect();
@@ -234,6 +326,7 @@ pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<Ch
                 content: Some(piece.iter().collect()),
             },
             finish_reason: None,
+            logprobs: None,
         }]));
     }
     // Terminal chunk carries the stop reason and an empty delta.
@@ -241,6 +334,7 @@ pub fn build_chunks(answer: &str, id: &str, model: &str, created: i64) -> Vec<Ch
         index: 0,
         delta: Delta::default(),
         finish_reason: Some("stop".into()),
+        logprobs: None,
     }]));
     chunks
 }
@@ -258,13 +352,16 @@ pub fn usage_chunk(usage: Usage, id: &str, model: &str, created: i64) -> ChatCom
         model: model.to_string(),
         choices: Vec::new(),
         usage: Some(usage),
+        system_fingerprint: None,
     }
 }
 
 // ──── non-streaming response DTO (spec D2) ────
 
 /// OpenAI `chat.completion` response body (`stream=false`, spec D2).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// (No `Eq`: [`Choice::logprobs`] holds a `serde_json::Value`, which is not `Eq`.)
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: &'static str,
@@ -272,14 +369,22 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
+    /// OpenAI `system_fingerprint`. We compute none, so it serializes as `null` (present, matching
+    /// the OpenAI envelope) rather than being omitted.
+    pub system_fingerprint: Option<String>,
 }
 
 /// One choice inside a non-streaming [`ChatCompletionResponse`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// (No `Eq`: `logprobs` holds a `serde_json::Value`, which is not `Eq`.)
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: String,
+    /// OpenAI `logprobs`; always `null` on this endpoint (logprobs are not produced), serialized
+    /// rather than skipped so the choice shape matches OpenAI.
+    pub logprobs: Option<serde_json::Value>,
 }
 
 /// Assemble a single-choice `chat.completion` response from a complete answer (spec D2).
@@ -306,8 +411,10 @@ pub fn build_response(
                 content: answer.to_string(),
             },
             finish_reason: "stop".into(),
+            logprobs: None,
         }],
         usage,
+        system_fingerprint: None,
     }
 }
 
@@ -416,6 +523,28 @@ mod tests {
     }
 
     #[test]
+    fn ignores_unknown_roles_like_tool() {
+        // Non-conversational roles (tool / function / anything not user|assistant) are dropped,
+        // not folded into history — replaying a transcript that carries tool messages must not
+        // pollute the user turns.
+        let req = map_request(vec![
+            msg("user", "A"),
+            msg("assistant", "a"),
+            msg("tool", "toolresult"),
+            msg("user", "B"),
+        ])
+        .unwrap();
+        assert_eq!(req.prompt, "B");
+        assert_eq!(
+            req.history,
+            vec![History {
+                user_prompt: "A".into(),
+                model_response: "a".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn empty_messages_is_error() {
         assert_eq!(map_request(vec![]).unwrap_err(), MapError::NoUserMessage);
     }
@@ -429,9 +558,84 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_same_role_is_error() {
-        let err = map_request(vec![msg("user", "A"), msg("user", "B")]);
-        assert!(matches!(err, Err(MapError::BadShape(_))));
+    fn merges_adjacent_same_role_user_turns_into_one_prompt() {
+        // Relaxed mapping (was a 400): two adjacent `user` turns are no longer rejected — they
+        // fold into a single prompt, their content joined with `\n`.
+        let req = map_request(vec![msg("user", "A"), msg("user", "B")]).unwrap();
+        assert_eq!(req.prompt, "A\nB");
+        assert!(req.history.is_empty());
+    }
+
+    #[test]
+    fn merges_adjacent_same_role_in_history() {
+        // `[user:A1, user:A2, assistant:b, user:C]`: the two leading users merge into one history
+        // turn (`A1\nA2`), paired with `b`; `C` is the current prompt.
+        let req = map_request(vec![
+            msg("user", "A1"),
+            msg("user", "A2"),
+            msg("assistant", "b"),
+            msg("user", "C"),
+        ])
+        .unwrap();
+        assert_eq!(req.prompt, "C");
+        assert_eq!(
+            req.history,
+            vec![History {
+                user_prompt: "A1\nA2".into(),
+                model_response: "b".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn leading_assistant_pairs_with_an_empty_user_prompt() {
+        // A conversation that opens with an assistant turn: pair it with an empty `user_prompt`
+        // rather than rejecting the shape.
+        let req = map_request(vec![msg("assistant", "a"), msg("user", "B")]).unwrap();
+        assert_eq!(req.prompt, "B");
+        assert_eq!(
+            req.history,
+            vec![History {
+                user_prompt: String::new(),
+                model_response: "a".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn developer_role_is_ignored_like_system() {
+        // OpenAI's `developer` role is the new system synonym — dropped, same as `system`.
+        let req = map_request(vec![msg("developer", "be brief"), msg("user", "Q")]).unwrap();
+        assert_eq!(req.prompt, "Q");
+        assert!(req.history.is_empty());
+    }
+
+    #[test]
+    fn content_parts_array_concatenates_text_parts() {
+        // OpenAI clients may send `content` as an array of typed parts. Text parts are
+        // concatenated; non-text parts (e.g. `image_url`) are ignored.
+        let m: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Hello "},
+                {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+                {"type": "text", "text": "world"}
+            ]
+        }))
+        .expect("content-parts array should deserialize");
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "Hello world");
+    }
+
+    #[test]
+    fn content_parts_array_maps_through_to_prompt() {
+        // End to end: a parts-array user message becomes the prompt with its text concatenated.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"上個月"},{"type":"text","text":"營收?"}]}]}"#,
+        )
+        .unwrap();
+        let mapped = map_request(req.messages).unwrap();
+        assert_eq!(mapped.prompt, "上個月營收?");
     }
 
     #[test]
@@ -596,6 +800,44 @@ mod tests {
                 "content chunk must not serialize a usage field"
             );
         }
+    }
+
+    #[test]
+    fn choices_carry_logprobs_null_for_openai_compat() {
+        // OpenAI puts a `logprobs` field on every choice (null unless logprobs were requested).
+        let resp = build_response("hi", "id", "m", 0, Usage::default());
+        let v = serde_json::to_value(&resp).unwrap();
+        let choice = v["choices"][0].as_object().unwrap();
+        assert!(
+            choice.contains_key("logprobs"),
+            "non-stream choice must carry a logprobs field"
+        );
+        assert!(choice["logprobs"].is_null());
+
+        // Streaming chunk choices carry it too (the leading role chunk has a choice).
+        let chunks = build_chunks("hello", "id", "m", 0);
+        let cv = serde_json::to_value(&chunks[0]).unwrap();
+        let cchoice = cv["choices"][0].as_object().unwrap();
+        assert!(
+            cchoice.contains_key("logprobs"),
+            "chunk choice must carry a logprobs field"
+        );
+        assert!(cchoice["logprobs"].is_null());
+    }
+
+    #[test]
+    fn response_and_chunk_carry_system_fingerprint_field() {
+        // OpenAI includes `system_fingerprint` on the response/chunk envelope; we compute none, so
+        // it serializes as null (present, not omitted) to stay close to the OpenAI wire.
+        let resp = build_response("hi", "id", "m", 0, Usage::default());
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v.as_object().unwrap().contains_key("system_fingerprint"));
+        assert!(v["system_fingerprint"].is_null());
+
+        let chunk = &build_chunks("hi", "id", "m", 0)[0];
+        let cv = serde_json::to_value(chunk).unwrap();
+        assert!(cv.as_object().unwrap().contains_key("system_fingerprint"));
+        assert!(cv["system_fingerprint"].is_null());
     }
 
     #[test]

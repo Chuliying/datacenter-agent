@@ -714,6 +714,55 @@ fn openai_chunk_event(chunk: &openai::ChatCompletionChunk) -> Event {
         .expect("chat.completion.chunk is always valid JSON")
 }
 
+/// Map a `Json` extractor rejection's own HTTP status onto the status this endpoint returns.
+///
+/// A body over the [`REQUEST_BODY_LIMIT`](super::route) stays `413 Payload Too Large`; a missing or
+/// wrong `Content-Type` stays `415 Unsupported Media Type`; every other malformed body (JSON syntax
+/// error, or valid JSON of the wrong shape) collapses to `400 Bad Request`. All three are returned
+/// with the OpenAI error envelope by the caller.
+fn json_rejection_status(rejection_status: StatusCode) -> StatusCode {
+    match rejection_status {
+        StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+/// Prepend the answer-policy disclaimer `prefix` to the delivered answer, if any.
+///
+/// [`StreamPlan::Proceed`] carries a `prefix` (e.g. a "this is not financial advice" disclaimer).
+/// Unlike `/agent/stream` — where it streams as a transient token the pipeline's terminal `clear`
+/// then supersedes — OpenAI's `delta`/`message` have no retract semantics, so the disclaimer would
+/// simply be lost. Prepend it to the final answer instead, so the client actually sees it.
+fn with_prefix(prefix: &str, answer: String) -> String {
+    if prefix.is_empty() {
+        answer
+    } else {
+        format!("{prefix}\n\n{answer}")
+    }
+}
+
+/// Resolve the pipeline task's own return value into the authoritative answer / failure.
+///
+/// The answer and any failure come from the awaited `run_emitting` **result**, never from draining
+/// the lossy [`ChannelSink`] (whose `try_send` may silently drop a `Finished` / `Error` event on a
+/// full buffer, and which the unknown-pipeline early return never emits at all). Only `Usage` events
+/// are read off the channel, where a dropped event merely under-counts tokens.
+///
+/// - a `Final` payload → its `assistant` text is the answer;
+/// - any other terminal payload → a wiring fault (the pipeline ended without a final result);
+/// - an [`AgentError`] → its `Display` is the failure message.
+fn resolve_outcome(outcome: Result<AgentPayload, AgentError>) -> Result<String, String> {
+    match outcome {
+        Ok(AgentPayload::Final(result)) => Ok(result.assistant),
+        Ok(other) => Err(format!(
+            "pipeline produced no final result (got {:?})",
+            other.kind()
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 /// Build the intent-selected sub-agent pipeline for the OpenAI endpoint (spec Data Flow): the
 /// `/report` pipeline when a report was asked for (see [`wants_report_pipeline`]), else `/insight`.
 /// `sink = Some(_)` selects the streaming shape; `None` is buffered (spec D1/D2).
@@ -766,9 +815,12 @@ fn build_openai_pipeline(
 ///   final answer — the terminal pipeline stages assemble it in pure logic — so intermediate
 ///   `ContentDelta` previews are not forwarded (see the spec's D1).
 ///
-/// Auth is inherited from the shared `require_bearer` layer (D6, `418` on a bad token); the runtime
-/// is required (D7, `503` when `RUNTIME_ENABLED=false`). Errors use the OpenAI envelope (spec
-/// Errors). `session_id` / `option_id` have no OpenAI equivalent, so server-side memory is inert.
+/// The answer / failure are taken from the pipeline task's awaited result (authoritative), not from
+/// draining the lossy event channel (finding #3); the answer-policy disclaimer, when the policy
+/// asks for one, is prepended to it (finding #7). Auth is the dedicated `require_bearer_openai`
+/// layer (finding #6, `401` + OpenAI envelope on a bad token, not the host `418`); the runtime is
+/// required (D7, `503` when `RUNTIME_ENABLED=false`). Errors use the OpenAI envelope (spec Errors).
+/// `session_id` / `option_id` have no OpenAI equivalent, so server-side memory is inert.
 #[instrument(skip_all, fields(route = "/v1/chat/completions"))]
 pub async fn chat_completions(
     State(state): State<AppState>,
@@ -778,9 +830,13 @@ pub async fn chat_completions(
     let Json(req) = match req {
         Ok(json) => json,
         Err(rejection) => {
+            // Split by the extractor's own status: body over the limit → 413, missing/wrong
+            // content-type → 415, every other malformed body → 400 — all as the OpenAI envelope
+            // (finding #6).
+            let status = json_rejection_status(rejection.status());
             return openai_error(
-                StatusCode::BAD_REQUEST,
-                openai::ERR_INVALID_REQUEST,
+                status,
+                openai::error_type_for_status(status.as_u16()),
                 format!("invalid request body: {rejection}"),
             );
         }
@@ -869,7 +925,7 @@ pub async fn chat_completions(
     };
 
     // ── act on the plan ──
-    let (started, agent_input, normalized) = match plan {
+    let (started, prefix, agent_input, normalized) = match plan {
         // Pre-stream validation error (e.g. ERR3 prompt too long → 400). Audit already recorded it.
         StreamPlan::Error { code, status } => {
             return openai_error(
@@ -881,18 +937,19 @@ pub async fn chat_completions(
         // Guardrail refusal (AC-5 / TC-I04): return the refusal copy as the assistant answer at
         // `200` — governance parity with /agent/stream (which streams the copy then closes).
         StreamPlan::Refused { copy, .. } => {
-            return openai_refusal(stream, copy, &id, &model, created);
+            return openai_refusal(stream, copy, include_usage, &id, &model, created);
         }
-        // The disclaimer `prefix` is intentionally dropped: on /agent/stream the pipeline's terminal
-        // `clear` supersedes it, so the delivered answer never carries it — matched here. `started`
-        // is the turn's start instant (from the prelude), carried forward for the post-response
-        // audit's `duration_ms` (parity with `agent_stream`).
+        // The answer-policy disclaimer `prefix` (finding #7) is prepended to the delivered answer
+        // below — OpenAI's `delta`/`message` have no retract semantics, so unlike /agent/stream
+        // (whose terminal `clear` supersedes it) it must ride on the answer itself. `started` is the
+        // turn's start instant (from the prelude), carried forward for the post-response audit's
+        // `duration_ms` (parity with `agent_stream`).
         StreamPlan::Proceed {
             started,
+            prefix,
             agent_input,
             normalized,
-            ..
-        } => (started, agent_input, *normalized),
+        } => (started, prefix, agent_input, *normalized),
     };
 
     // ── build + run the intent-selected pipeline ──
@@ -915,6 +972,7 @@ pub async fn chat_completions(
             &state,
             report,
             initial,
+            prefix,
             id,
             model,
             created,
@@ -925,7 +983,7 @@ pub async fn chat_completions(
         )
     } else {
         openai_buffered_response(
-            &state, report, initial, &id, &model, created, audit, audit_ctx, started,
+            &state, report, initial, &prefix, &id, &model, created, audit, audit_ctx, started,
         )
         .await
     }
@@ -933,11 +991,28 @@ pub async fn chat_completions(
 
 /// Shape a guardrail refusal as an OpenAI `200` (spec Data Flow: Refused → 200 + copy as the whole
 /// assistant answer).
-fn openai_refusal(stream: bool, copy: String, id: &str, model: &str, created: i64) -> Response {
+///
+/// When streaming with `include_usage` (OpenAI `stream_options.include_usage`), a terminal
+/// usage-only chunk is appended before `[DONE]`. A refusal spends no LLM tokens, so that usage is
+/// zero (finding #4).
+fn openai_refusal(
+    stream: bool,
+    copy: String,
+    include_usage: bool,
+    id: &str,
+    model: &str,
+    created: i64,
+) -> Response {
     if stream {
         let chunks = openai::build_chunks(&copy, id, model, created);
+        // A refusal costs no LLM tokens → the usage-only chunk (if requested) carries zeros.
+        let usage_chunk = include_usage
+            .then(|| openai::usage_chunk(openai::Usage::default(), id, model, created));
         let sse = async_stream::stream! {
             for chunk in chunks {
+                yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+            }
+            if let Some(chunk) = usage_chunk {
                 yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
             }
             yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
@@ -974,6 +1049,7 @@ async fn openai_buffered_response(
     state: &AppState,
     report: bool,
     initial: AgentPayload,
+    prefix: &str,
     id: &str,
     model: &str,
     created: i64,
@@ -1000,46 +1076,45 @@ async fn openai_buffered_response(
             .await
     });
 
+    // Drain the (lossy) event channel for per-stage token usage only (D3). The answer and any
+    // failure come from the awaited run result below — never from `Finished` / `Error` events,
+    // which `ChannelSink::try_send` may silently drop on a full buffer and which the
+    // unknown-pipeline early return never emits at all (finding #3).
     let mut usages: Vec<UsageData> = Vec::new();
-    let mut answer: Option<String> = None;
-    let mut failure: Option<String> = None;
-
     while let Some(event) = rx.recv().await {
-        match event {
-            // Accumulate per-stage token usage (D3).
-            AgentEvent::Usage {
+        if let AgentEvent::Usage {
+            prompt,
+            completion,
+            reasoning,
+            total,
+        } = event
+        {
+            usages.push(UsageData {
                 prompt,
                 completion,
                 reasoning,
                 total,
-            } => usages.push(UsageData {
-                prompt,
-                completion,
-                reasoning,
-                total,
-            }),
-            // The finalizer/renderer answer is the complete result.
-            AgentEvent::Finished { assistant } => answer = Some(assistant),
-            AgentEvent::Error { message } => failure = Some(message),
-            _ => {}
+            });
         }
     }
-    // Channel closed → the run finished. A stage failure already surfaced as `AgentEvent::Error`;
-    // only a task panic needs a fallback.
-    if let Err(join) = run.await {
-        failure.get_or_insert_with(|| format!("agent task failed: {join}"));
-    }
+    // Channel closed → the run finished. Its result is authoritative for the answer / failure.
+    let result = match run.await {
+        Ok(inner) => resolve_outcome(inner),
+        Err(join) => Err(format!("agent task failed: {join}")),
+    };
 
     let duration_ms = started.elapsed().as_millis() as u64;
-    match answer {
-        Some(text) => {
+    match result {
+        Ok(answer) => {
+            // Prepend the answer-policy disclaimer, if any (finding #7).
+            let answer = with_prefix(prefix, answer);
             let usage = openai::accumulate_usage(&usages);
             if let Err(e) = audit
                 .write(
                     &audit_ctx,
                     AuditEvent::ResponseCompleted {
-                        response_hash: hash_identifier(&text),
-                        response_chars: text.chars().count(),
+                        response_hash: hash_identifier(&answer),
+                        response_chars: answer.chars().count(),
                         duration_ms,
                         status: "completed".to_string(),
                     },
@@ -1048,12 +1123,11 @@ async fn openai_buffered_response(
             {
                 warn!(error = %e, "chat_completions: audit ResponseCompleted failed");
             }
-            Json(openai::build_response(&text, id, model, created, usage)).into_response()
+            Json(openai::build_response(&answer, id, model, created, usage)).into_response()
         }
-        None => {
-            // A stage failed (ERR5) or the run aborted before `Finished` (parity with the stream
-            // path: surfaced as an upstream error).
-            let message = failure.unwrap_or_else(|| "pipeline produced no answer".to_string());
+        Err(message) => {
+            // A stage failed (ERR5), the pipeline produced no final result, or the task panicked
+            // (parity with the stream path: surfaced as an upstream error).
             if let Err(e) = audit
                 .write(
                     &audit_ctx,
@@ -1083,6 +1157,7 @@ fn openai_stream_response(
     state: &AppState,
     report: bool,
     initial: AgentPayload,
+    prefix: String,
     id: String,
     model: String,
     created: i64,
@@ -1109,40 +1184,38 @@ fn openai_stream_response(
     });
 
     let sse_stream = async_stream::stream! {
+        // Drain the (lossy) event channel for per-stage token usage only (D3). The answer / failure
+        // come from the awaited run result below, which is authoritative and never dropped; the
+        // intermediate `ContentDelta` previews are intentionally ignored (D1, pseudo-streaming).
+        // See finding #3.
         let mut usages: Vec<UsageData> = Vec::new();
-        let mut answer: Option<String> = None;
-        let mut failure: Option<String> = None;
-
         while let Some(event) = rx.recv().await {
-            match event {
-                // Accumulate per-stage token usage (D3). Logged below, not placed on the OpenAI
-                // wire (the `chat.completion.chunk` shape carries no usage field).
-                AgentEvent::Usage {
+            if let AgentEvent::Usage {
+                prompt,
+                completion,
+                reasoning,
+                total,
+            } = event
+            {
+                usages.push(UsageData {
                     prompt,
                     completion,
                     reasoning,
                     total,
-                } => usages.push(UsageData {
-                    prompt,
-                    completion,
-                    reasoning,
-                    total,
-                }),
-                // The terminal answer is the complete result; intermediate `ContentDelta` previews
-                // are intentionally ignored (D1).
-                AgentEvent::Finished { assistant } => answer = Some(assistant),
-                AgentEvent::Error { message } => failure = Some(message),
-                _ => {}
+                });
             }
         }
-        // Channel closed → the run finished. Surface a task panic as a failure.
-        if let Err(join) = run.await {
-            failure.get_or_insert_with(|| format!("agent task failed: {join}"));
-        }
+        // Channel closed → the run finished. Its result is authoritative for the answer / failure.
+        let result = match run.await {
+            Ok(inner) => resolve_outcome(inner),
+            Err(join) => Err(format!("agent task failed: {join}")),
+        };
 
         let duration_ms = started.elapsed().as_millis() as u64;
-        match answer {
-            Some(text) => {
+        match result {
+            Ok(answer) => {
+                // Prepend the answer-policy disclaimer, if any (finding #7).
+                let answer = with_prefix(&prefix, answer);
                 let usage = openai::accumulate_usage(&usages);
                 tracing::info!(
                     prompt_tokens = usage.prompt_tokens,
@@ -1150,7 +1223,7 @@ fn openai_stream_response(
                     total_tokens = usage.total_tokens,
                     "chat_completions stream usage"
                 );
-                for chunk in openai::build_chunks(&text, &id, &model, created) {
+                for chunk in openai::build_chunks(&answer, &id, &model, created) {
                     yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
                 }
                 // OpenAI `stream_options.include_usage`: a terminal usage-only chunk (empty
@@ -1164,8 +1237,8 @@ fn openai_stream_response(
                     .write(
                         &audit_ctx,
                         AuditEvent::ResponseCompleted {
-                            response_hash: hash_identifier(&text),
-                            response_chars: text.chars().count(),
+                            response_hash: hash_identifier(&answer),
+                            response_chars: answer.chars().count(),
                             duration_ms,
                             status: "completed".to_string(),
                         },
@@ -1176,11 +1249,10 @@ fn openai_stream_response(
                 }
                 yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
             }
-            None => {
-                // A stage failed (ERR5) or the run aborted before `Finished`. Response headers are
-                // already `200` (SSE), so surface the failure in-band as an OpenAI error object,
-                // then `[DONE]`.
-                let message = failure.unwrap_or_else(|| "pipeline produced no answer".to_string());
+            Err(message) => {
+                // A stage failed (ERR5), the pipeline produced no final result, or the task
+                // panicked. Response headers are already `200` (SSE), so surface the failure in-band
+                // as an OpenAI error object, then `[DONE]`.
                 if let Err(e) = audit
                     .write(
                         &audit_ctx,
@@ -1580,5 +1652,209 @@ mod tests {
         assert!(wants_report_pipeline(&classify("我想要營收報告")));
         // A plain analytics ask (no report vocabulary) → insight pipeline.
         assert!(!wants_report_pipeline(&classify("分析最近三個月的營收")));
+    }
+
+    // ── /v1/chat/completions helpers (findings #3/#4/#6/#7) ──
+
+    #[test]
+    fn json_rejection_status_keeps_413_and_415_else_400() {
+        // Body over the limit → 413; wrong/absent content-type → 415; everything else → 400.
+        assert_eq!(
+            json_rejection_status(StatusCode::PAYLOAD_TOO_LARGE),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            json_rejection_status(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        // JSON syntax error (400) and wrong-shape (422) both collapse to 400.
+        assert_eq!(
+            json_rejection_status(StatusCode::BAD_REQUEST),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            json_rejection_status(StatusCode::UNPROCESSABLE_ENTITY),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn real_json_rejections_map_to_413_415_and_400() {
+        // Drive the actual axum `Json` extractor rejection (no AppState needed) to confirm
+        // `rejection.status()` yields the codes `json_rejection_status` keys off (finding #6).
+        use axum::extract::rejection::JsonRejection;
+        use axum::extract::DefaultBodyLimit;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        // A probe that maps a JsonRejection exactly as `chat_completions` does.
+        async fn probe(payload: Result<Json<serde_json::Value>, JsonRejection>) -> Response {
+            match payload {
+                Ok(_) => StatusCode::OK.into_response(),
+                Err(rej) => json_rejection_status(rej.status()).into_response(),
+            }
+        }
+        let app = axum::Router::new()
+            .route("/p", post(probe))
+            .layer(DefaultBodyLimit::max(16));
+
+        // Body over the 16-byte limit → 413.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/p")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        "{\"a\":\"01234567890123456789\"}".to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Wrong content-type → 415.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/p")
+                    .header("content-type", "text/plain")
+                    .body(axum::body::Body::from("hi".to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Malformed JSON within the limit → 400.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/p")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{".to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn with_prefix_prepends_a_nonempty_disclaimer_only() {
+        assert_eq!(with_prefix("", "answer".into()), "answer");
+        assert_eq!(
+            with_prefix("disclaimer", "answer".into()),
+            "disclaimer\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn resolve_outcome_reads_answer_and_failures_from_the_run_result() {
+        use crate::agent::payload::FinalResult;
+        use std::collections::HashMap;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00+00:00").unwrap();
+        // A Final payload → its assistant text is the authoritative answer.
+        let final_ok = Ok(AgentPayload::Final(FinalResult {
+            user: "u".into(),
+            assistant: "THE ANSWER".into(),
+            now,
+            artifacts: HashMap::new(),
+        }));
+        assert_eq!(resolve_outcome(final_ok), Ok("THE ANSWER".into()));
+
+        // A capability error (incl. the unknown-pipeline early return, which emits NO Error event)
+        // surfaces its Display as the failure — the drain-only path would have missed it entirely.
+        let cap_err = Err(AgentError::Capability("unknown pipeline: p".into()));
+        assert_eq!(
+            resolve_outcome(cap_err),
+            Err("capability error: unknown pipeline: p".into())
+        );
+
+        // A non-Final terminal payload is a wiring fault, not a silent success.
+        let now2 = now;
+        let not_final = Ok(AgentPayload::Initial(InitialPrompt {
+            prompt: "x".into(),
+            history: vec![],
+            now: now2,
+        }));
+        assert!(resolve_outcome(not_final).is_err());
+    }
+
+    /// Collect the payloads of every `data: <payload>` line of an SSE body, in order.
+    fn sse_data_lines(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_appends_a_zero_usage_chunk_when_include_usage() {
+        // AC-5 / finding #4: a streamed refusal honours `stream_options.include_usage` by emitting a
+        // terminal usage-only chunk (zero cost — a refusal spends no LLM tokens) before `[DONE]`.
+        let resp = openai_refusal(true, "refused copy".into(), true, "id", "m", 0);
+        let lines = sse_data_lines(&body_string(resp).await);
+
+        assert_eq!(lines.last().unwrap(), "[DONE]", "stream must end with [DONE]");
+        // The chunk immediately before [DONE] is the usage-only chunk: empty choices, zero usage.
+        let usage_chunk: serde_json::Value =
+            serde_json::from_str(&lines[lines.len() - 2]).expect("usage chunk is JSON");
+        assert!(usage_chunk["choices"].as_array().unwrap().is_empty());
+        assert_eq!(usage_chunk["usage"]["prompt_tokens"], 0);
+        assert_eq!(usage_chunk["usage"]["completion_tokens"], 0);
+        assert_eq!(usage_chunk["usage"]["total_tokens"], 0);
+        // The content chunks (everything before the usage chunk) reconstruct the refusal copy.
+        let content: String = lines[..lines.len() - 2]
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(String::from))
+            .collect();
+        assert_eq!(content, "refused copy");
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_omits_usage_chunk_without_include_usage() {
+        // Wire unchanged when the client did not opt in: no chunk carries a `usage` field.
+        let resp = openai_refusal(true, "refused".into(), false, "id", "m", 0);
+        let lines = sse_data_lines(&body_string(resp).await);
+
+        assert_eq!(lines.last().unwrap(), "[DONE]");
+        for line in &lines {
+            if *line == "[DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(
+                chunk.get("usage").is_none(),
+                "no chunk may carry usage when include_usage is off, got {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_non_stream_returns_a_chat_completion_with_the_copy() {
+        // Non-streaming refusal: a 200 `chat.completion` whose single choice content is the copy.
+        let resp = openai_refusal(false, "refused copy".into(), false, "id", "m", 0);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp).await).expect("json body");
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["content"], "refused copy");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["total_tokens"], 0);
     }
 }

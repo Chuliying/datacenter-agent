@@ -55,8 +55,24 @@ slug: agentgateway-openai-endpoint
 2. **真實上游成功查詢**：`DATACENTER_API_BASE` 正確 host 未知,本次以本機 mock stub 驗證成功路徑;真實資料端到端待正確 host(規格書 C-3)。
 3. ~~**post-stream audit**~~ → **已解除（2026-07-23）**：buffered/stream 兩路徑均寫 `AuditEvent::ResponseCompleted`/`ResponseFailed`,對齊 `/agent/stream`(prelude 另已寫 `RequestReceived`/`InputNormalized`)。**memory 因 OpenAI body 無 `session_id`(恆 `None`)仍 inert**,無 turn 可複製,故 `append_memory_turn_if_enabled` 省略(設計如此,非落差)。
 
+## Code review findings 處理（2026-07-23）
+
+review 對 `/v1/chat/completions` 提 9 項 findings,全數處理,三 gate 全綠（lib 185→**201/0**,全 suite **211/0**,5 live `#[ignore]`;`cargo check` + `cargo clippy --all-targets -- -D warnings` 皆 exit 0）。詳見 `implement-report.md`「續作 — code review findings 修正」。
+
+| # | 嚴重度 | 處理 | 測試證據 |
+|---|---|---|---|
+| #1 非串流 timeout | Important | ✅ 修 | `/v1` 專屬 600s（其他 7 端點維持 120s，sub-router `.merge()`）;`per_group_timeout_layers_survive_a_merge` |
+| #2 map_request 放寬 | Important | ✅ 修 | content 陣列 / developer / 相鄰同 role 合併 / 開場 assistant;6 新 unit（先 RED）+ spec 同步 |
+| #3 lossy sink 正確性 | Important | ✅ 修 | answer/failure 改 `run.await` 權威,drain 只收 Usage;`resolve_outcome_...` unit（含 unknown-pipeline） |
+| #4 refusal include_usage | Minor | ✅ 修 | 串流 refusal 補零值 usage-only chunk;3 refusal body 測 |
+| #5 chunk/response 欄位 | Minor | ✅ 修 | `logprobs`(null) + `system_fingerprint`(null);2 序列化 pin 測 |
+| #6 error status | Minor | ✅ 修 | 413/415/400 分流（`real_json_rejections_...` 經真 axum 抽取器）+ **auth /v1→401 OpenAI envelope**（不動共用 418）;判定分離乾淨故採 401 |
+| #7 disclaimer 可見 | Minor | ✅ 修 | `prefix` prepend 進答案;`with_prefix_...` unit |
+| #8 斷線 abort | Minor | ⏸ 保留現狀+理由 | 共用多工 MCP peer,mid-request abort 取消安全無法離線確證,與 `agent_stream` 一致,不引入 corruption 風險（無 code 變更） |
+| #9 handler 整合測試 | Minor | ⚠️ 部分（結構限制） | 補所有不需 pipeline 的 handler 真實測試（refusal/json-rejection/auth/timeout）;pipeline 兩路徑端到端待 mock 基礎設施/live,未造假 mock |
+
 ## 結論
 
-✅ **驗收通過（PASS，附 notes）**。核心 AC(AC-1..4)以 unit + 端到端實測驗收;AC-3 回歸 181/0 確認未破壞既有端點;AC-5 及 ERR1/3/5 的處理邏輯已實作並透過共用 prelude 覆蓋,少數場景的**直接端到端測**與 usage/真實上游列為上述已知限制/待補,均已誠實記錄,不阻擋核心功能交付。
+✅ **驗收通過（PASS，附 notes）**。核心 AC(AC-1..4)以 unit + 端到端實測驗收;AC-3 回歸(2026-07-23:lib 201/0、全 suite 211/0)確認未破壞既有端點;9 項 review findings 全數處理(#8 保留現狀含理由、#9 結構限制誠實標註),usage/真實上游/pipeline 端到端列為已知限制/待補,均已誠實記錄,不阻擋核心功能交付。
 
 > Closeout 提示:PASS 後可在 `prd.md` 追加 `## Delivery`、`meta.yml` 標 `shipped`、升級長效 ADR/術語;未授權 branch 不自行 merge/push。

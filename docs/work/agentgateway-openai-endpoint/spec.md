@@ -49,11 +49,19 @@ prd: docs/work/agentgateway-openai-endpoint/prd.md
 ### D5 — system message 忽略
 pipeline 無 system 槽(各 stage 自帶 designed instruction,[payload.rs:179](src/agent/payload.rs:179))。傳入 `role:"system"` 忽略(spec 明確;不 prepend,避免污染既有 stage prompt 設計)。
 
-### D6 — auth 沿用 bearer（418）
-新路由掛在 auth layer 之前,自動繼承 `require_bearer`(比對 `GLOBAL_TOKEN`,失敗 **418**,[auth.rs:54](src/server/auth.rs:54))。不改共用 middleware(避免影響其他 7 條端點)。與 OpenAI/gateway 慣例 401 的差異記錄,由平台端知悉(gateway 自管對外認證,418 僅在 gateway 傳錯 token 時出現)。
+### D6 — auth bearer（/v1 回 401,其他 7 端點維持 418）
+> **2026-07-23 修正(finding #6)**:原設計繼承共用 `require_bearer`(失敗 418),對 OpenAI client / gateway 不友善。
+新路由改掛**專屬** `require_bearer_openai`([auth.rs](src/server/auth.rs)):**相同 constant-time 比對 `GLOBAL_TOKEN`**,但失敗回 **401 + OpenAI error envelope**(`invalid_request_error`),符合 OpenAI 慣例。**共用 `require_bearer`(其他 7 端點的 418 契約)完全不動**——route 拆成 standard / openai 兩個 sub-router,各自掛自己的 auth layer 再 `.merge()`。
 
 ### D7 — runtime-off 行為
 端點需 runtime(走 prelude);`RUNTIME_ENABLED=false` 時回 **503** + OpenAI 風格 error body(與 `/agent/stream` 一致,[handler.rs:455](src/server/handler.rs:455))。
+
+### D8 — 非串流 timeout 覆寫 600s（finding #1）
+> 全域 `TimeoutLayer` 為 120s([route.rs](src/server/route.rs));非串流 `/v1/chat/completions` 需 await **整條** sub-agent pipeline,常超過 120s → 被砍成空 body 504。
+route 拆 standard(120s)/ openai(**600s**)兩 sub-router,各自套 `TimeoutLayer` 再 `.merge()`,故只有 `/v1/chat/completions` 得到較長 timeout,其他 7 端點維持 120s。SSE 串流的 response handle 立即回傳,body timeout 本就不影響(D1 偽串流)。
+
+### D9 — disclaimer prefix 併入答案（finding #7）
+`StreamPlan::Proceed` 的 answer-policy `prefix`(如免責聲明)原被丟棄。OpenAI `delta`/`message` 無撤回語意(不同於 `/agent/stream` 靠終端 `clear` 蓋掉),故改為 **prepend 進最終答案**:`answer = if prefix 非空 { format!("{prefix}\n\n{answer}") } else { answer }`,串流/非串流皆套。
 
 ## Files
 
@@ -109,11 +117,13 @@ pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub total
 ### 既有內部型別（引用,不改）
 `AgentRequest`([dto.rs:27](src/server/dto.rs:27))[EXISTING]、`StreamPlan`/`AgentTurnDeps`([turn.rs:70](src/runtime/turn.rs:70))[EXISTING]、`AgentEvent`([agent](src/agent))[EXISTING]、`UsageData`([dto.rs:155](src/server/dto.rs:155))[EXISTING,可複用累加]。
 
-### 映射規則 `messages → AgentRequest`
-- 最後一則 `role:"user"` → `prompt`;其前的 user/assistant **依序配對** → `history: Vec<History>{user_prompt, model_response}`。
-- `role:"system"` → 忽略(D5)。
-- 空 `messages` 或無任何 user → 400（`ERR2`）。
-- 相鄰同 role / 孤立 assistant → 400(格式錯),spec 定義為硬性規則。
+### 映射規則 `messages → AgentRequest`（2026-07-23 放寬,finding #2）
+> 原規則對真實 OpenAI client 的合法形狀過嚴(一律 400),放寬如下:
+- **`content` 接受 string 或 content-parts 陣列** `[{"type":"text","text":..}]`:陣列取所有 `text` part **串接**,非 text part(如 `image_url`)忽略(自訂 untagged `deserialize_with`)。回應側 `content` 恆序列化為 string。
+- **`role:"system"` 與 `role:"developer"`**(OpenAI 新 system 同義)→ 皆忽略(D5)。
+- **不再對非交替結構一律 400**:先把**相鄰同 role** 合併為一則(content 以 `\n` 連接),使序列嚴格交替;再取**最後一則 user** 當 `prompt`、其前摺成 `history: Vec<History>{user_prompt, model_response}`;**開場 assistant** 以空 `user_prompt` 配對。
+- 仍要求有 user 當 prompt:空 `messages`(或全 system/developer 移除後為空)→ 400 `NoUserMessage`;合併後結尾非 user → 400 `BadShape`。皆 `ERR2`(`invalid_request_error`)。
+- **`tools`/`tool_choice`**:本端點驅動固定內部 pipeline,不支援 client 端 tool-calling → **接受但忽略**(不 deserialize,serde 預設丟棄未知欄位)。
 - `session_id`/`option_id` → OpenAI body 無 → `None`(memory 停用,等同 `sessions=None`)。
 
 ## API
@@ -161,9 +171,11 @@ prelude 呼叫樣板見 [handler.rs:496](src/server/handler.rs:496)(dummy `Unuse
 |---|---|---|---|
 | ERR1 | RUNTIME_ENABLED=false | 503 | OpenAI error(D7) |
 | ERR2 | messages 空/無 user/格式錯/非法 JSON | 400 | OpenAI error(`invalid_request_error`) |
+| ERR2a | **body 過大**(超過 64 KiB body limit) | **413** | OpenAI error(finding #6;`json_rejection_status`) |
+| ERR2b | **content-type 錯/缺** | **415** | OpenAI error(finding #6) |
 | ERR3 | prompt > 4000(D4) | 400 | OpenAI error |
-| ERR4 | bearer 失敗 | 418(D6) | 現有 auth 回應 |
-| ERR5 | LLM/MCP capability 失敗 | 502 | OpenAI error(對映 `insight_error_to_app_error` Capability→502) |
+| ERR4 | bearer 失敗 | **401**(D6,finding #6) | **OpenAI error envelope**(`require_bearer_openai`) |
+| ERR5 | LLM/MCP capability 失敗 / pipeline 無最終結果 | 502 | OpenAI error(`upstream_error`;answer/failure 取自 `run.await` 權威值,finding #3) |
 
 ## Steps（分步實作）
 
@@ -215,3 +227,4 @@ prelude 呼叫樣板見 [handler.rs:496](src/server/handler.rs:496)(dummy `Unuse
 | 時間 | 內容 | 對應 PRD 版本 | 作者 |
 |---|---|---|---|
 | 2026-07-22 | 初版;含 D1 偽串流、D2 buffered pipeline 兩項對 PRD 技術假設的修正 | prd v1(approved) | Chuliying + Claude |
+| 2026-07-23 | code review findings 修正:映射放寬(#2)、非串流 timeout 600s(D8/#1)、auth /v1→401(D6/#6)、body 錯誤 413/415/400(#6)、disclaimer prepend(D9/#7)、run.await 權威(#3)、logprobs/system_fingerprint 欄位(#5)、refusal include_usage(#4) | prd v1(approved) | Chuliying + Claude |

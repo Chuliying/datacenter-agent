@@ -197,3 +197,64 @@ AC-3（回歸）：lib 181 基線 → 185（純增），`/agent/stream`、`/insi
 ## 待辦（本批範圍外）
 - usage/audit 端到端 curl（含 `include_usage:true` 觀察 usage-only chunk、audit sink 落 `ResponseCompleted/Failed`）由主 agent 事後驗；本批以 unit + 對齊既有模式為據，未造假 mock。
 - 真實上游成功查詢仍待正確 `DATACENTER_API_BASE` host（規格書 C-3，沿用）。
+
+---
+
+# 續作 — code review findings 修正（2026-07-23）
+
+修 code review 對 `/v1/chat/completions` 的 9 項 findings。**TDD（RED→GREEN）；不破壞既有測試；三 gate 全綠。**
+基線：進場 `cargo test --lib` → **185/0**（全 suite 195/0，5 live 測 `#[ignore]`）。
+
+## 逐項處理
+
+### #1 [Important] 非串流 timeout（route.rs）
+全域 120s `TimeoutLayer` 會把 `/v1` 非串流長查詢砍成空 body 504。**做法**：`build_router` 拆 `standard`(120s)/ `openai`(**600s**) 兩 sub-router，各自 `.layer(TimeoutLayer)` + 各自 auth，再 `Router::new().merge(standard).merge(openai)`；body limit + 共用 middleware（trace/cors/compression/headers，**已把 timeout 從共用堆疊移出**）套在 merge 後。其他 7 端點維持 120s。
+- 測：`route::tests::per_group_timeout_layers_survive_a_merge`——tiny router（50ms/3s）+ sleep(300ms) handler + `oneshot` 驗 504 vs 200，證「per-group timeout 經 merge 仍分別生效」（正是 build_router 的結構）。SSE 不受 body timeout（D1）。
+
+### #2 [Important] map_request 放寬（openai.rs）
+- `ChatMessage.content`：自訂 `deserialize_with`（untagged `String | Vec<ContentPart>`）；陣列取 `text` part 串接、非 text 忽略；回應側仍 string。
+- role 忽略：新增 `is_ignored_role` 涵蓋 `system` + `developer`。
+- 非交替放寬：先合併相鄰同 role（`\n`），再「最後 user→prompt、其前摺 history、開場 assistant 配空 user_prompt」；空→`NoUserMessage`、結尾非 user→`BadShape`（皆 400）。
+- `tools`/`tool_choice`：`ChatCompletionRequest` doc 註明接受但忽略（不 deserialize）。
+- RED：6 新測（`developer_role_is_ignored_like_system`、`content_parts_array_concatenates_text_parts`、`content_parts_array_maps_through_to_prompt`、`merges_adjacent_same_role_user_turns_into_one_prompt`、`merges_adjacent_same_role_in_history`、`leading_assistant_pairs_with_an_empty_user_prompt`）先跑 **6 FAILED**（行為失敗，非編譯錯）→ 實作後 GREEN。舊 `adjacent_same_role_is_error`（斷言舊 400 行為）改寫為 `merges_...`（新行為）。
+- spec.md 映射規則同步更新。
+
+### #3 [Important] lossy sink 正確性（handler.rs buffered + stream）
+新增純函式 `resolve_outcome(Result<AgentPayload,AgentError>) -> Result<String,String>`：`Ok(Final)`→answer；`Ok(other)`→Err(無最終結果)；`Err(e)`→Err(`e.to_string()`）。兩路徑 drain **只收 `AgentEvent::Usage`**，answer/failure 改自 `run.await`（`Err(join)`→panic 訊息）。徹底解除對 lossy `try_send` 丟 `Finished`/`Error` 的依賴，並正確涵蓋 unknown-pipeline 早退（engine.rs 不發 Error 事件）。
+- 測：`resolve_outcome_reads_answer_and_failures_from_the_run_result`（Final→answer、Capability(unknown pipeline)→failure、非 Final→Err）。端到端（sink 真的丟事件）為離線不可測，見 #9。
+
+### #4 [Minor] refusal include_usage（handler.rs `openai_refusal`）
+簽名加 `include_usage`；串流 refusal 於 `[DONE]` 前補**零值** usage-only chunk（refusal 無 LLM 成本）。RED = arity mismatch（`this function takes 5 arguments but 6 were supplied`）。
+- 測（讀 SSE body，無需 AppState）：`refusal_stream_appends_a_zero_usage_chunk_when_include_usage`、`refusal_stream_omits_usage_chunk_without_include_usage`、`refusal_non_stream_returns_a_chat_completion_with_the_copy`。
+
+### #5 [Minor] chunk/response OpenAI 欄位（openai.rs）
+`Choice`/`ChunkChoice` 加 `logprobs: Option<serde_json::Value>`（**不 skip → 序列化為 `null`**，貼 OpenAI）；`ChatCompletionResponse`/`ChatCompletionChunk` 加 `system_fingerprint: Option<String>`（**同樣不 skip → `null`**，符合 OpenAI envelope 恆含此欄位）。因 `serde_json::Value` 非 `Eq`，四型別移除 `Eq` derive（保留 `PartialEq`；無外部 `Eq` 依賴）。RED（`contains_key` 對缺欄位失敗）→ 2 測 GREEN：`choices_carry_logprobs_null_for_openai_compat`、`response_and_chunk_carry_system_fingerprint_field`。
+
+### #6 [Minor] error status（handler.rs + auth.rs + route.rs）
+- `JsonRejection` 分流：新增純函式 `json_rejection_status(StatusCode)->StatusCode`（413→413、415→415、其餘→400），handler 用 `rejection.status()` 餵入 + `error_type_for_status` 取 OpenAI type。
+- auth 418→401：**不動共用 `require_bearer`**（D6，避免 breaking 其他 7 端點）。新增 `auth::require_bearer_openai`（**同 constant-time 比對 `GLOBAL_TOKEN`**，失敗回 **401 + OpenAI envelope**）+ 私有 `openai_unauthorized()`；route 的 openai sub-router 掛此 auth，standard sub-router 維持 `require_bearer`（418）。**判定：router 拆 sub-router 後此分離乾淨，故採 401**（非保留 418）。
+- 測：`json_rejection_status_keeps_413_and_415_else_400`（純函式）、`real_json_rejections_map_to_413_415_and_400`（**真的驅動 axum `Json` 抽取器**經 tiny router + `oneshot`，證 `rejection.status()` 產生的碼與映射一致，無需 AppState）、`auth::tests::openai_unauthorized_is_401_with_openai_envelope`。
+
+### #7 [Minor] disclaimer 可見（handler.rs）
+新增純函式 `with_prefix(&str, String)->String`；`chat_completions` 取回 `StreamPlan::Proceed.prefix` 傳入 buffered/stream，於取得 answer 後 prepend（`{prefix}\n\n{answer}`）。串流/非串流皆套。測：`with_prefix_prepends_a_nonempty_disclaimer_only`。
+
+### #8 [Minor] 斷線 abort —— **保留現狀（不加 abort）**
+評估：spawned run task 被 drop 時 tokio 不自動 abort（維持執行）。`build_*_pipeline` 內 MCP 走 `state.mcp.clone()`——`McpHandle` 是 `#[derive(Clone)]` 包 `Peer<RoleClient>` 的**跨請求共用多工 session**（單一 rmcp peer）。mid-tool-call abort 會 drop 進行中的 rmcp 請求 future，對**共用 peer** 的取消清理無法離線確證，有影響其他併發請求 session 的 corruption 風險。且 sibling production path `agent_stream` 亦不 abort。故**保留現狀**，與 `agent_stream` 一致，不引入 corruption 風險（符合 finding 指引「不確定則保留」）。**無 code 變更。**
+
+### #9 [Minor] handler 整合測試 —— 結構限制，誠實標註
+`McpHandle` 無 fake（僅 live `connect_http`），`build_*_pipeline` 直接建 `OpenAiLlm`/`McpTool`——handler 層無注入 fake LLM/MCP 的接縫，故「真的跑 pipeline」的 buffered/stream 端到端**離線不可自動測**（既有 `tests/*_datacenter.rs` 全 `#[ignore]` 需 live）。本批已補所有**不需 pipeline** 的 handler 層真實測試（refusal 兩路徑 body、json rejection 經真 axum 抽取器、auth 401 envelope、timeout 經真 router）。pipeline 兩路徑端到端仍待 mock 基礎設施/live，**未造假 mock**。
+
+## 驗收 gate（實跑 evidence，2026-07-23）
+| gate | 指令 | 結果 |
+|---|---|---|
+| type-check | `cargo check` | **PASS**（exit 0，Finished，無 error/warning） |
+| lint | `cargo clippy --all-targets -- -D warnings` | **PASS**（exit 0，無 warning） |
+| test | `cargo test` | **PASS** — lib **201/0**（185 基線 + 16 新）、eval 4/0、`deployment_contract` 1/0、`eval_cli` 1/0、`runtime_contract` 4/0；**全 suite 211 passed / 0 failed**；5 live 測維持 `#[ignore]`。 |
+
+新增 16 lib 測：openai +7（#2 淨 +5、#5 +2）、handler +7（#3/#4/#6/#7）、auth +1（#6）、route +1（#1）。AC-3 回歸：185→201 純增，`/agent/stream`、`/insight*`、`/report*`、runtime 全綠。
+
+## 本批修改檔案
+- `src/server/openai.rs` — `deserialize_content` + `ChatMessage.content` 放寬、`is_ignored_role` + `map_request` 重寫、`ChatCompletionRequest` tools/tool_choice doc、`Choice`/`ChunkChoice` `logprobs`、`ChatCompletionResponse`/`ChatCompletionChunk` `system_fingerprint`（移除 4 型別 `Eq`）、3 constructor 補欄位 + 8 新測。
+- `src/server/handler.rs` — `json_rejection_status`/`with_prefix`/`resolve_outcome` 純函式；`chat_completions` body 錯誤分流 + 取 `prefix` + refusal 傳 `include_usage`；`openai_refusal` 加 `include_usage`；`openai_buffered_response`/`openai_stream_response` 改 Usage-only drain + `run.await` 權威 + prepend prefix；doc 更新 + 7 新測。
+- `src/server/auth.rs` — `require_bearer_openai` + `openai_unauthorized` + 1 新測。
+- `src/server/route.rs` — `build_router` 拆 standard/openai sub-router（120s/600s timeout + 各自 auth）+ `OPENAI_REQUEST_TIMEOUT` 常數 + 1 新測。
