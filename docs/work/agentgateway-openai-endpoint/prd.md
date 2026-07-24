@@ -67,3 +67,15 @@ kind: to-prd-snapshot
 | 時間 | 內容 | 對應版本 | 作者 |
 |------|------|---------|------|
 | 2026-07-22 | 初版（to-prd 快照，from brainstorm + 規格書） | brainstorm v1 | Chuliying + Claude |
+
+## Delivery
+
+- **發布日**：2026-07-24（branch closeout — push 至 fork + 建 PR）。
+- **與 PRD 的偏差**（spec/實作基於 code 研究 + 兩輪 fable review 調整）：
+  - **FR3 / D1 串流**：PRD 假設可真串流；定案為**偽串流**（pipeline 最終答案由終端純邏輯 stage 事後組裝，無 token 流等於最終答案）。
+  - **FR4 / D2 非串流**：PRD 說接 `run_agent_turn`；改走 **buffered → 後為 usage 改 streaming+drain 的 pipeline**（`run_agent_turn` 驅動舊 monolith，非 pipeline）。
+  - **FR7 / D6 auth**：PRD 說沿用 418；改為 `/v1` **專屬 401 + OpenAI envelope**（review 第一輪 #6），其他 7 端點維持 418。
+  - **新增（PRD 未列，review 後補）**：messages content-parts 陣列 / `developer` / 非交替放寬；history 織入（且在 prelude 前折入使 **intent 亦 history-aware**）；`stream_options.include_usage`；timeout 回 OpenAI envelope（`/v1` 600s）；manifest value 去 backtick。
+  - **保留未做**：#8 斷線 abort（shared rmcp Peer 取消安全待外驗）；真實上游成功查詢（`DATACENTER_API_BASE` host 待確認）；#9 真 pipeline 整合測試（`McpHandle` 無 fake 接縫，結構限制）。
+- **驗收**：[qa-report.md](qa-report.md) **PASS**（cargo lib 207/0、全 suite 0 failed、clippy 綠；兩輪 fable review + 逐項修復；端到端本機 mock stub + 真實 opus-4.7）。
+- **升級資產**：無（本 work item 無 `adr.md` / `glossary.md`；技術決策記於 spec D1–D9 + qa-report findings 表）。
