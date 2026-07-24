@@ -109,7 +109,10 @@ pub fn build_router(state: AppState) -> Router {
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(middleware::from_fn_with_state(state.clone(), require_bearer));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
 
     // OpenAI-compatible endpoint (agentgateway Path C): longer timeout for the full-pipeline
     // non-streaming path (finding #1), and a dedicated bearer gate that rejects with `401` + the
@@ -160,12 +163,19 @@ mod tests {
     /// shrunk here so the test is fast and its margins are wide enough to be non-flaky.
     #[tokio::test]
     async fn per_group_timeout_layers_survive_a_merge() {
-        let short = Router::new().route("/standard", get(slow)).layer(
-            TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, Duration::from_millis(50)),
-        );
-        let long = Router::new().route("/openai", get(slow)).layer(
-            TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, Duration::from_secs(3)),
-        );
+        let short =
+            Router::new()
+                .route("/standard", get(slow))
+                .layer(TimeoutLayer::with_status_code(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Duration::from_millis(50),
+                ));
+        let long = Router::new()
+            .route("/openai", get(slow))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::GATEWAY_TIMEOUT,
+                Duration::from_secs(3),
+            ));
         let app = Router::new().merge(short).merge(long);
 
         // Short-timeout group: the 300 ms handler is cut off with a 504.
@@ -198,11 +208,13 @@ mod tests {
     /// (`{"error":{"type":"server_error",...}}`), not the empty body a bare `TimeoutLayer` sends.
     #[tokio::test]
     async fn openai_timeout_returns_openai_error_envelope() {
-        let app = Router::new().route("/v1/chat/completions", post(slow)).layer(
-            ServiceBuilder::new()
-                .layer(HandleErrorLayer::new(handle_openai_middleware_error))
-                .layer(TowerTimeoutLayer::new(Duration::from_millis(50))),
-        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(slow))
+            .layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(handle_openai_middleware_error))
+                    .layer(TowerTimeoutLayer::new(Duration::from_millis(50))),
+            );
         let resp = app
             .oneshot(
                 Request::builder()

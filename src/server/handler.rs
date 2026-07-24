@@ -703,7 +703,11 @@ fn sse_event(frame: StreamFrame) -> Event {
 /// Unlike [`AppError`] (which serializes to the host's flat `{"error": "..."}`), this emits the
 /// OpenAI envelope `{"error": {"message", "type"}}` an OpenAI client / agentgateway expects.
 fn openai_error(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
-    (status, Json(openai::OpenAiErrorBody::new(error_type, message))).into_response()
+    (
+        status,
+        Json(openai::OpenAiErrorBody::new(error_type, message)),
+    )
+        .into_response()
 }
 
 /// Serialize one `chat.completion.chunk` into an SSE `data:` line — a pure `data:` stream with no
@@ -1846,12 +1850,18 @@ mod tests {
         }];
         let folded = fold_history_into_prompt(&history, "那這個月呢?");
         // The prior turn (both roles) must reach the prompt — the whole point of the fix.
-        assert!(folded.contains("上個月營收多少?"), "prior user turn missing: {folded}");
+        assert!(
+            folded.contains("上個月營收多少?"),
+            "prior user turn missing: {folded}"
+        );
         assert!(
             folded.contains("上個月營收是 100 萬。"),
             "prior assistant turn missing: {folded}"
         );
-        assert!(folded.contains("那這個月呢?"), "current question missing: {folded}");
+        assert!(
+            folded.contains("那這個月呢?"),
+            "current question missing: {folded}"
+        );
         // The current question comes AFTER the folded history.
         let history_pos = folded.find("上個月營收是 100 萬。").unwrap();
         let question_pos = folded.find("那這個月呢?").unwrap();
@@ -1864,8 +1874,14 @@ mod tests {
     #[test]
     fn fold_history_into_prompt_preserves_multi_turn_chronological_order() {
         let history = vec![
-            Exchange { user: "Q1".into(), assistant: "A1".into() },
-            Exchange { user: "Q2".into(), assistant: "A2".into() },
+            Exchange {
+                user: "Q1".into(),
+                assistant: "A1".into(),
+            },
+            Exchange {
+                user: "Q2".into(),
+                assistant: "A2".into(),
+            },
         ];
         let folded = fold_history_into_prompt(&history, "Q3");
         let (p1, p2, p3) = (
@@ -1937,7 +1953,11 @@ mod tests {
         let resp = openai_refusal(true, "refused copy".into(), true, "id", "m", 0);
         let lines = sse_data_lines(&body_string(resp).await);
 
-        assert_eq!(lines.last().unwrap(), "[DONE]", "stream must end with [DONE]");
+        assert_eq!(
+            lines.last().unwrap(),
+            "[DONE]",
+            "stream must end with [DONE]"
+        );
         // The chunk immediately before [DONE] is the usage-only chunk: empty choices, zero usage.
         let usage_chunk: serde_json::Value =
             serde_json::from_str(&lines[lines.len() - 2]).expect("usage chunk is JSON");
@@ -1949,7 +1969,11 @@ mod tests {
         let content: String = lines[..lines.len() - 2]
             .iter()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter_map(|c| c["choices"][0]["delta"]["content"].as_str().map(String::from))
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(String::from)
+            })
             .collect();
         assert_eq!(content, "refused copy");
     }

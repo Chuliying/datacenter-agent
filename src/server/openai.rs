@@ -294,7 +294,9 @@ pub fn accumulate_usage(usages: &[UsageData]) -> Usage {
             reasoning = Some(reasoning.unwrap_or(0) + r);
         }
     }
-    out.completion_tokens_details = reasoning.map(|r| ReasoningDetails { reasoning_tokens: r });
+    out.completion_tokens_details = reasoning.map(|r| ReasoningDetails {
+        reasoning_tokens: r,
+    });
     out
 }
 
@@ -518,7 +520,12 @@ mod tests {
 
     #[test]
     fn pairs_earlier_turns_into_history() {
-        let req = map_request(vec![msg("user", "A"), msg("assistant", "a"), msg("user", "B")]).unwrap();
+        let req = map_request(vec![
+            msg("user", "A"),
+            msg("assistant", "a"),
+            msg("user", "B"),
+        ])
+        .unwrap();
         assert_eq!(req.prompt, "B");
         assert_eq!(
             req.history,
@@ -655,8 +662,18 @@ mod tests {
     #[test]
     fn accumulates_usage_across_stages() {
         let usages = vec![
-            UsageData { prompt: 10, completion: 5, reasoning: None, total: 15 },
-            UsageData { prompt: 8, completion: 4, reasoning: Some(3), total: 12 },
+            UsageData {
+                prompt: 10,
+                completion: 5,
+                reasoning: None,
+                total: 15,
+            },
+            UsageData {
+                prompt: 8,
+                completion: 4,
+                reasoning: Some(3),
+                total: 12,
+            },
         ];
         let u = accumulate_usage(&usages);
         assert_eq!(u.prompt_tokens, 18);
@@ -664,13 +681,20 @@ mod tests {
         assert_eq!(u.total_tokens, 27);
         assert_eq!(
             u.completion_tokens_details,
-            Some(ReasoningDetails { reasoning_tokens: 3 })
+            Some(ReasoningDetails {
+                reasoning_tokens: 3
+            })
         );
     }
 
     #[test]
     fn accumulates_usage_without_reasoning() {
-        let u = accumulate_usage(&[UsageData { prompt: 1, completion: 2, reasoning: None, total: 3 }]);
+        let u = accumulate_usage(&[UsageData {
+            prompt: 1,
+            completion: 2,
+            reasoning: None,
+            total: 3,
+        }]);
         assert!(u.completion_tokens_details.is_none());
     }
 
@@ -680,7 +704,10 @@ mod tests {
         // object tag correct
         assert_eq!(chunks[0].object, "chat.completion.chunk");
         // leading chunk carries role
-        assert_eq!(chunks.first().unwrap().choices[0].delta.role.as_deref(), Some("assistant"));
+        assert_eq!(
+            chunks.first().unwrap().choices[0].delta.role.as_deref(),
+            Some("assistant")
+        );
         // content chunks concatenate back to the original answer
         let content: String = chunks
             .iter()
@@ -703,7 +730,10 @@ mod tests {
             .filter_map(|c| c.choices[0].delta.content.clone())
             .collect();
         assert_eq!(content, "");
-        assert_eq!(chunks.last().unwrap().choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            chunks.last().unwrap().choices[0].finish_reason.as_deref(),
+            Some("stop")
+        );
     }
 
     // ── non-streaming response (spec D2 / AC-1) ──
