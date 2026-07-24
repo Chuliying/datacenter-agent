@@ -16,7 +16,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -34,8 +34,11 @@ use super::dto::{
     StageData, StagePhase, StreamFrame, ToolArgsData, ToolCallData, UsageData,
 };
 use super::error::AppError;
+use super::openai;
 use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
+use crate::agent::config::PipelineId;
+use crate::agent::engine::Orchestrator;
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
 use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id};
@@ -693,6 +696,671 @@ fn sse_event(frame: StreamFrame) -> Event {
         .expect("unexpected error: StreamFrame is always valid JSON")
 }
 
+// ──── /v1/chat/completions (OpenAI-compatible, agentgateway Path C) ────
+
+/// Build an OpenAI-style error [`Response`] with the given HTTP status.
+///
+/// Unlike [`AppError`] (which serializes to the host's flat `{"error": "..."}`), this emits the
+/// OpenAI envelope `{"error": {"message", "type"}}` an OpenAI client / agentgateway expects.
+fn openai_error(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(openai::OpenAiErrorBody::new(error_type, message)),
+    )
+        .into_response()
+}
+
+/// Serialize one `chat.completion.chunk` into an SSE `data:` line — a pure `data:` stream with no
+/// `event:` name, as OpenAI expects (spec D1).
+fn openai_chunk_event(chunk: &openai::ChatCompletionChunk) -> Event {
+    Event::default()
+        .json_data(chunk)
+        .expect("chat.completion.chunk is always valid JSON")
+}
+
+/// Map a `Json` extractor rejection's own HTTP status onto the status this endpoint returns.
+///
+/// A body over the [`REQUEST_BODY_LIMIT`](super::route) stays `413 Payload Too Large`; a missing or
+/// wrong `Content-Type` stays `415 Unsupported Media Type`; every other malformed body (JSON syntax
+/// error, or valid JSON of the wrong shape) collapses to `400 Bad Request`. All three are returned
+/// with the OpenAI error envelope by the caller.
+fn json_rejection_status(rejection_status: StatusCode) -> StatusCode {
+    match rejection_status {
+        StatusCode::PAYLOAD_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+/// Prepend the answer-policy disclaimer `prefix` to the delivered answer, if any.
+///
+/// [`StreamPlan::Proceed`] carries a `prefix` (e.g. a "this is not financial advice" disclaimer).
+/// Unlike `/agent/stream` — where it streams as a transient token the pipeline's terminal `clear`
+/// then supersedes — OpenAI's `delta`/`message` have no retract semantics, so the disclaimer would
+/// simply be lost. Prepend it to the final answer instead, so the client actually sees it.
+fn with_prefix(prefix: &str, answer: String) -> String {
+    if prefix.is_empty() {
+        answer
+    } else {
+        format!("{prefix}\n\n{answer}")
+    }
+}
+
+/// Fold prior conversation turns into the prompt text so **both** the runtime prelude's intent
+/// classifier and the first pipeline stage's LLM see the whole conversation.
+///
+/// Two layers would otherwise drop history: the sub-agent engine (`ConfiguredAgent::run`) threads
+/// only `InitialPrompt.prompt` and ignores `InitialPrompt.history`; and the prelude's intent
+/// classifier / answer-policy look only at `AgentTurnInput.prompt`. So on `/v1/chat/completions` a
+/// multi-turn request would collapse to its final user message — and an off-scope-looking follow-up
+/// would even be refused. `chat_completions` therefore renders the earlier turns into a labeled
+/// transcript and prepends it to the current question **before** calling the prelude. An empty
+/// history returns the prompt unchanged, so a single-turn request is byte-for-byte what it was.
+///
+/// This lives at the handler layer on purpose: the engine, the shared `plan_stream_turn` prelude,
+/// `/agent/stream`, and falcon behaviour are all left untouched — only this endpoint's prompt is
+/// rewritten.
+fn fold_history_into_prompt(history: &[Exchange], prompt: &str) -> String {
+    if history.is_empty() {
+        return prompt.to_string();
+    }
+    let transcript = history
+        .iter()
+        .map(|turn| format!("User: {}\nAssistant: {}", turn.user, turn.assistant))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("以下是先前的對話紀錄:\n{transcript}\n\n目前的問題:\n{prompt}")
+}
+
+/// Resolve the pipeline task's own return value into the authoritative answer / failure.
+///
+/// The answer and any failure come from the awaited `run_emitting` **result**, never from draining
+/// the lossy [`ChannelSink`] (whose `try_send` may silently drop a `Finished` / `Error` event on a
+/// full buffer, and which the unknown-pipeline early return never emits at all). Only `Usage` events
+/// are read off the channel, where a dropped event merely under-counts tokens.
+///
+/// - a `Final` payload → its `assistant` text is the answer;
+/// - any other terminal payload → a wiring fault (the pipeline ended without a final result);
+/// - an [`AgentError`] → its `Display` is the failure message.
+fn resolve_outcome(outcome: Result<AgentPayload, AgentError>) -> Result<String, String> {
+    match outcome {
+        Ok(AgentPayload::Final(result)) => Ok(result.assistant),
+        Ok(other) => Err(format!(
+            "pipeline produced no final result (got {:?})",
+            other.kind()
+        )),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Build the intent-selected sub-agent pipeline for the OpenAI endpoint (spec Data Flow): the
+/// `/report` pipeline when a report was asked for (see [`wants_report_pipeline`]), else `/insight`.
+/// `sink = Some(_)` selects the streaming shape; `None` is buffered (spec D1/D2).
+fn build_openai_pipeline(
+    state: &AppState,
+    report: bool,
+    sink: Option<Arc<dyn EventSink>>,
+) -> anyhow::Result<(Orchestrator, PipelineId)> {
+    let resolved = state.llm.resolved();
+    if report {
+        let orch = build_report_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.report_analyst_system,
+            &state.prompts.report_composer_system,
+            &state.insight_grants.fetcher,
+            &resolved,
+            state.report_template.clone(),
+            sink,
+        )?;
+        Ok((orch, report_pipeline_id()))
+    } else {
+        let orch = build_insight_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.analyst_system,
+            &state.prompts.charter_system,
+            &state.insight_grants.fetcher,
+            &state.insight_grants.charter,
+            &resolved,
+            sink,
+        )?;
+        Ok((orch, agent_pipeline_id()))
+    }
+}
+
+/// OpenAI-compatible `POST /v1/chat/completions`.
+///
+/// Maps the OpenAI `messages` onto the internal [`AgentRequest`], runs the **same runtime prelude**
+/// as [`agent_stream`] (`plan_stream_turn`: guardrails → intent → answer policy), then drives the
+/// intent-selected sub-agent pipeline and shapes the result as OpenAI:
+///
+/// - `stream=false` (D2): buffered pipeline `run()` → a single `chat.completion` choice.
+/// - `stream=true` (D1, pseudo-streaming): the pipeline's **complete** terminal answer is split
+///   into `chat.completion.chunk`s, then `data: [DONE]`. There is no token stream equal to the
+///   final answer — the terminal pipeline stages assemble it in pure logic — so intermediate
+///   `ContentDelta` previews are not forwarded (see the spec's D1).
+///
+/// The answer / failure are taken from the pipeline task's awaited result (authoritative), not from
+/// draining the lossy event channel (finding #3); the answer-policy disclaimer, when the policy
+/// asks for one, is prepended to it (finding #7). Auth is the dedicated `require_bearer_openai`
+/// layer (finding #6, `401` + OpenAI envelope on a bad token, not the host `418`); the runtime is
+/// required (D7, `503` when `RUNTIME_ENABLED=false`). Errors use the OpenAI envelope (spec Errors).
+/// `session_id` / `option_id` have no OpenAI equivalent, so server-side memory is inert.
+#[instrument(skip_all, fields(route = "/v1/chat/completions"))]
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    req: Result<Json<openai::ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    // ── parse body (ERR2: malformed JSON / missing fields) ──
+    let Json(req) = match req {
+        Ok(json) => json,
+        Err(rejection) => {
+            // Split by the extractor's own status: body over the limit → 413, missing/wrong
+            // content-type → 415, every other malformed body → 400 — all as the OpenAI envelope
+            // (finding #6).
+            let status = json_rejection_status(rejection.status());
+            return openai_error(
+                status,
+                openai::error_type_for_status(status.as_u16()),
+                format!("invalid request body: {rejection}"),
+            );
+        }
+    };
+
+    // ── runtime required (ERR1 / D7): the endpoint drives the runtime prelude ──
+    let Some(runtime) = state.runtime.clone().filter(|rt| rt.enabled) else {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            openai::ERR_SERVER,
+            "runtime disabled (RUNTIME_ENABLED=false); /v1/chat/completions requires the runtime",
+        );
+    };
+
+    let stream = req.stream;
+    let model = req.model;
+    // OpenAI `stream_options.include_usage`: append a terminal usage-only chunk to the stream.
+    let include_usage = req
+        .stream_options
+        .map(|opts| opts.include_usage)
+        .unwrap_or(false);
+
+    // ── map messages → AgentRequest (ERR2; D5: system messages ignored) ──
+    let agent_req = match openai::map_request(req.messages) {
+        Ok(request) => request,
+        Err(err) => {
+            let (status, error_type, message) = err.to_openai();
+            return openai_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                error_type,
+                message,
+            );
+        }
+    };
+
+    // `created` + `id` are stamped once here (never in the pure `openai` layer) and shared by every
+    // response shape.
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default();
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+
+    // ── runtime prelude, shared verbatim with /agent/stream: audit, guardrails, intent, answer
+    //    policy. The dummy port + no-op emit are never exercised by `plan_stream_turn`. ──
+    let request_id = uuid::Uuid::new_v4();
+    let audit_ctx = AuditCtx {
+        request_id: request_id.to_string(),
+        session_id: agent_req.session_id.clone(),
+        route: "/v1/chat/completions".into(),
+        actor: None,
+    };
+    // Fold prior turns into the prompt **before** the prelude so the intent classifier /
+    // answer-policy — which only see `input.prompt`, never `history` — are given the conversation
+    // context. Without this a follow-up like「那 AC 佔比呢?」is classified in isolation and refused
+    // as off_scope; folded, it is judged against the prior turns. Handler-only: `plan_stream_turn`
+    // and `/agent/stream` are untouched, and the folded prompt is also what the pipeline stage sees.
+    let folded_history: Vec<Exchange> = agent_req
+        .history
+        .iter()
+        .map(|turn| Exchange {
+            user: turn.user_prompt.clone(),
+            assistant: turn.model_response.clone(),
+        })
+        .collect();
+    let folded_prompt = fold_history_into_prompt(&folded_history, &agent_req.prompt);
+    let input = AgentTurnInput {
+        request_id,
+        prompt: folded_prompt.clone(),
+        raw_input: folded_prompt,
+        // History is folded into `prompt` above; the field stays empty (prelude memory is inert
+        // here anyway — `session_id` is always `None` on this endpoint).
+        history: Vec::new(),
+        session_id: agent_req.session_id.clone(),
+        option_id: agent_req.option_id.clone(),
+    };
+    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
+
+    let plan = {
+        let unused = UnusedAgentPort;
+        let emit_noop = |_event: TurnEvent| {};
+        let deps = AgentTurnDeps {
+            runtime_config: &runtime.config,
+            input_pipeline: &runtime.input_pipeline,
+            answer_policy: runtime.answer_policy.as_ref(),
+            llm_normalizer: runtime.llm_normalizer.as_deref(),
+            sessions: runtime.sessions.as_deref(),
+            agent: &unused,
+            audit: &audit,
+            emit: &emit_noop,
+        };
+        match plan_stream_turn(input, &audit_ctx, deps).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    openai::ERR_SERVER,
+                    format!("runtime prelude: {e}"),
+                );
+            }
+        }
+    };
+
+    // ── act on the plan ──
+    let (started, prefix, agent_input, normalized) = match plan {
+        // Pre-stream validation error (e.g. ERR3 prompt too long → 400). Audit already recorded it.
+        StreamPlan::Error { code, status } => {
+            return openai_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                openai::error_type_for_status(status),
+                code,
+            );
+        }
+        // Guardrail refusal (AC-5 / TC-I04): return the refusal copy as the assistant answer at
+        // `200` — governance parity with /agent/stream (which streams the copy then closes).
+        StreamPlan::Refused { copy, .. } => {
+            return openai_refusal(stream, copy, include_usage, &id, &model, created);
+        }
+        // The answer-policy disclaimer `prefix` (finding #7) is prepended to the delivered answer
+        // below — OpenAI's `delta`/`message` have no retract semantics, so unlike /agent/stream
+        // (whose terminal `clear` supersedes it) it must ride on the answer itself. `started` is the
+        // turn's start instant (from the prelude), carried forward for the post-response audit's
+        // `duration_ms` (parity with `agent_stream`).
+        StreamPlan::Proceed {
+            started,
+            prefix,
+            agent_input,
+            normalized,
+        } => (started, prefix, agent_input, *normalized),
+    };
+
+    // ── build + run the intent-selected pipeline ──
+    // History was already folded into the prompt before the prelude (see above), so both the intent
+    // classifier and the first pipeline stage see the full exchange. `agent_input.prompt` carries
+    // it; `InitialPrompt.history` stays empty (the engine ignores it anyway).
+    let initial = AgentPayload::Initial(InitialPrompt {
+        prompt: agent_input.prompt,
+        history: Vec::new(),
+        now: SystemClock::default().now(),
+    });
+    let report = wants_report_pipeline(&normalized);
+
+    if stream {
+        openai_stream_response(
+            &state,
+            report,
+            initial,
+            prefix,
+            id,
+            model,
+            created,
+            include_usage,
+            audit,
+            audit_ctx,
+            started,
+        )
+        .await
+    } else {
+        openai_buffered_response(
+            &state, report, initial, &prefix, &id, &model, created, audit, audit_ctx, started,
+        )
+        .await
+    }
+}
+
+/// Shape a guardrail refusal as an OpenAI `200` (spec Data Flow: Refused → 200 + copy as the whole
+/// assistant answer).
+///
+/// When streaming with `include_usage` (OpenAI `stream_options.include_usage`), a terminal
+/// usage-only chunk is appended before `[DONE]`. A refusal spends no LLM tokens, so that usage is
+/// zero (finding #4).
+fn openai_refusal(
+    stream: bool,
+    copy: String,
+    include_usage: bool,
+    id: &str,
+    model: &str,
+    created: i64,
+) -> Response {
+    if stream {
+        let chunks = openai::build_chunks(&copy, id, model, created, include_usage);
+        // A refusal costs no LLM tokens → the usage-only chunk (if requested) carries zeros.
+        let usage_chunk = include_usage
+            .then(|| openai::usage_chunk(openai::Usage::default(), id, model, created));
+        let sse = async_stream::stream! {
+            for chunk in chunks {
+                yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+            }
+            if let Some(chunk) = usage_chunk {
+                yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+            }
+            yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+        };
+        Sse::new(sse)
+            .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+            .into_response()
+    } else {
+        // A refusal costs no LLM tokens → usage is zero.
+        Json(openai::build_response(
+            &copy,
+            id,
+            model,
+            created,
+            openai::Usage::default(),
+        ))
+        .into_response()
+    }
+}
+
+/// Non-streaming path (D2): run the pipeline through a collecting sink and return one
+/// `chat.completion`, then write the post-response audit (parity with `agent_stream`).
+///
+/// This drives the **streaming** client + drain (the same shape as [`openai_stream_response`],
+/// just collected in-process instead of re-emitted as SSE) rather than the buffered `run()`,
+/// because only the streaming client requests `include_usage` and thus emits the per-stage
+/// `AgentEvent::Usage` this endpoint sums into the OpenAI `usage` (spec D3 — the buffered
+/// `OpenAiLlm` emits none, which is why the old `run()` path reported all-zero usage).
+///
+/// Memory is inert on this endpoint (`session_id` is always `None`), so the memory-append side
+/// effect that `agent_stream` performs is intentionally omitted; only the audit is mirrored.
+#[allow(clippy::too_many_arguments)]
+async fn openai_buffered_response(
+    state: &AppState,
+    report: bool,
+    initial: AgentPayload,
+    prefix: &str,
+    id: &str,
+    model: &str,
+    created: i64,
+    audit: AuditWriter,
+    audit_ctx: AuditCtx,
+    started: Instant,
+) -> Response {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Finding #6: a pipeline-construction failure is a ResponseFailed too — audit it before
+            // the 502, so this early return has the same audit trail as a stage failure below
+            // (warn-only, parity with the success/failure paths).
+            let message = format!("{e:#}");
+            let duration_ms = started.elapsed().as_millis() as u64;
+            if let Err(err) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseFailed {
+                        error_code: message.clone(),
+                        duration_ms,
+                    },
+                )
+                .await
+            {
+                warn!(error = %err, "chat_completions: audit ResponseFailed (pipeline build) failed");
+            }
+            return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message);
+        }
+    };
+
+    // The task owns the orchestrator + sink; when the run finishes every sink clone drops and the
+    // channel closes, so the drain loop below ends naturally.
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&pipeline_id, initial, &*sink)
+            .await
+    });
+
+    // Drain the (lossy) event channel for per-stage token usage only (D3). The answer and any
+    // failure come from the awaited run result below — never from `Finished` / `Error` events,
+    // which `ChannelSink::try_send` may silently drop on a full buffer and which the
+    // unknown-pipeline early return never emits at all (finding #3).
+    let mut usages: Vec<UsageData> = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Usage {
+            prompt,
+            completion,
+            reasoning,
+            total,
+        } = event
+        {
+            usages.push(UsageData {
+                prompt,
+                completion,
+                reasoning,
+                total,
+            });
+        }
+    }
+    // Channel closed → the run finished. Its result is authoritative for the answer / failure.
+    let result = match run.await {
+        Ok(inner) => resolve_outcome(inner),
+        Err(join) => Err(format!("agent task failed: {join}")),
+    };
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(answer) => {
+            // Prepend the answer-policy disclaimer, if any (finding #7).
+            let answer = with_prefix(prefix, answer);
+            let usage = openai::accumulate_usage(&usages);
+            if let Err(e) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseCompleted {
+                        response_hash: hash_identifier(&answer),
+                        response_chars: answer.chars().count(),
+                        duration_ms,
+                        status: "completed".to_string(),
+                    },
+                )
+                .await
+            {
+                warn!(error = %e, "chat_completions: audit ResponseCompleted failed");
+            }
+            Json(openai::build_response(&answer, id, model, created, usage)).into_response()
+        }
+        Err(message) => {
+            // A stage failed (ERR5), the pipeline produced no final result, or the task panicked
+            // (parity with the stream path: surfaced as an upstream error).
+            if let Err(e) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseFailed {
+                        error_code: message.clone(),
+                        duration_ms,
+                    },
+                )
+                .await
+            {
+                warn!(error = %e, "chat_completions: audit ResponseFailed failed");
+            }
+            openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message)
+        }
+    }
+}
+
+/// Streaming path (D1, pseudo-streaming): run the pipeline emitting events, accumulate per-stage
+/// usage, and on the terminal complete answer split it into `chat.completion.chunk`s + `[DONE]`.
+///
+/// When `include_usage` is set (OpenAI `stream_options.include_usage`), a terminal usage-only chunk
+/// is sent after the content chunks and before `[DONE]`. The post-stream audit is written at the
+/// tail of the stream (parity with `agent_stream`); memory is inert here (`session_id` is always
+/// `None`), so only the audit side effect is mirrored — the memory append is omitted.
+// `async` only so the pipeline-construction failure below can `await` its audit write (finding #6);
+// the success path still returns the SSE handle without awaiting, so nothing blocks the stream.
+#[allow(clippy::too_many_arguments)]
+async fn openai_stream_response(
+    state: &AppState,
+    report: bool,
+    initial: AgentPayload,
+    prefix: String,
+    id: String,
+    model: String,
+    created: i64,
+    include_usage: bool,
+    audit: AuditWriter,
+    audit_ctx: AuditCtx,
+    started: Instant,
+) -> Response {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Finding #6: audit the pipeline-construction failure before the 502, matching the
+            // buffered path and the stage-failure audit at the stream's tail (warn-only).
+            let message = format!("{e:#}");
+            let duration_ms = started.elapsed().as_millis() as u64;
+            if let Err(err) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseFailed {
+                        error_code: message.clone(),
+                        duration_ms,
+                    },
+                )
+                .await
+            {
+                warn!(error = %err, "chat_completions stream: audit ResponseFailed (pipeline build) failed");
+            }
+            return openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message);
+        }
+    };
+
+    // The task owns the orchestrator + sink; when the run finishes every sink clone drops and the
+    // channel closes, so the drain loop below ends naturally.
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&pipeline_id, initial, &*sink)
+            .await
+    });
+
+    let sse_stream = async_stream::stream! {
+        // Drain the (lossy) event channel for per-stage token usage only (D3). The answer / failure
+        // come from the awaited run result below, which is authoritative and never dropped; the
+        // intermediate `ContentDelta` previews are intentionally ignored (D1, pseudo-streaming).
+        // See finding #3.
+        let mut usages: Vec<UsageData> = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::Usage {
+                prompt,
+                completion,
+                reasoning,
+                total,
+            } = event
+            {
+                usages.push(UsageData {
+                    prompt,
+                    completion,
+                    reasoning,
+                    total,
+                });
+            }
+        }
+        // Channel closed → the run finished. Its result is authoritative for the answer / failure.
+        let result = match run.await {
+            Ok(inner) => resolve_outcome(inner),
+            Err(join) => Err(format!("agent task failed: {join}")),
+        };
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Ok(answer) => {
+                // Prepend the answer-policy disclaimer, if any (finding #7).
+                let answer = with_prefix(&prefix, answer);
+                let usage = openai::accumulate_usage(&usages);
+                tracing::info!(
+                    prompt_tokens = usage.prompt_tokens,
+                    completion_tokens = usage.completion_tokens,
+                    total_tokens = usage.total_tokens,
+                    "chat_completions stream usage"
+                );
+                for chunk in openai::build_chunks(&answer, &id, &model, created, include_usage) {
+                    yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+                }
+                // OpenAI `stream_options.include_usage`: a terminal usage-only chunk (empty
+                // `choices`, populated `usage`) after the content chunks, before `[DONE]`.
+                if include_usage {
+                    let chunk = openai::usage_chunk(usage, &id, &model, created);
+                    yield Ok::<_, Infallible>(openai_chunk_event(&chunk));
+                }
+                // ── post-stream audit (parity with agent_stream) ──
+                if let Err(e) = audit
+                    .write(
+                        &audit_ctx,
+                        AuditEvent::ResponseCompleted {
+                            response_hash: hash_identifier(&answer),
+                            response_chars: answer.chars().count(),
+                            duration_ms,
+                            status: "completed".to_string(),
+                        },
+                    )
+                    .await
+                {
+                    warn!(error = %e, "chat_completions stream: audit ResponseCompleted failed");
+                }
+                yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+            }
+            Err(message) => {
+                // A stage failed (ERR5), the pipeline produced no final result, or the task
+                // panicked. Response headers are already `200` (SSE), so surface the failure in-band
+                // as an OpenAI error object, then `[DONE]`.
+                if let Err(e) = audit
+                    .write(
+                        &audit_ctx,
+                        AuditEvent::ResponseFailed {
+                            error_code: message.clone(),
+                            duration_ms,
+                        },
+                    )
+                    .await
+                {
+                    warn!(error = %e, "chat_completions stream: audit ResponseFailed failed");
+                }
+                let body = openai::OpenAiErrorBody::new(openai::ERR_UPSTREAM, message);
+                yield Ok::<_, Infallible>(
+                    Event::default()
+                        .json_data(&body)
+                        .expect("OpenAiErrorBody is always valid JSON"),
+                );
+                yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+            }
+        }
+    };
+
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response()
+}
+
 // ──── shared prelude ───
 
 /// Validate the current prompt contract.
@@ -1064,5 +1732,281 @@ mod tests {
         assert!(wants_report_pipeline(&classify("我想要營收報告")));
         // A plain analytics ask (no report vocabulary) → insight pipeline.
         assert!(!wants_report_pipeline(&classify("分析最近三個月的營收")));
+    }
+
+    // ── /v1/chat/completions helpers (findings #3/#4/#6/#7) ──
+
+    #[test]
+    fn json_rejection_status_keeps_413_and_415_else_400() {
+        // Body over the limit → 413; wrong/absent content-type → 415; everything else → 400.
+        assert_eq!(
+            json_rejection_status(StatusCode::PAYLOAD_TOO_LARGE),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            json_rejection_status(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        // JSON syntax error (400) and wrong-shape (422) both collapse to 400.
+        assert_eq!(
+            json_rejection_status(StatusCode::BAD_REQUEST),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            json_rejection_status(StatusCode::UNPROCESSABLE_ENTITY),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn real_json_rejections_map_to_413_415_and_400() {
+        // Drive the actual axum `Json` extractor rejection (no AppState needed) to confirm
+        // `rejection.status()` yields the codes `json_rejection_status` keys off (finding #6).
+        use axum::extract::rejection::JsonRejection;
+        use axum::extract::DefaultBodyLimit;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        // A probe that maps a JsonRejection exactly as `chat_completions` does.
+        async fn probe(payload: Result<Json<serde_json::Value>, JsonRejection>) -> Response {
+            match payload {
+                Ok(_) => StatusCode::OK.into_response(),
+                Err(rej) => json_rejection_status(rej.status()).into_response(),
+            }
+        }
+        let app = axum::Router::new()
+            .route("/p", post(probe))
+            .layer(DefaultBodyLimit::max(16));
+
+        // Body over the 16-byte limit → 413.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/p")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        "{\"a\":\"01234567890123456789\"}".to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Wrong content-type → 415.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/p")
+                    .header("content-type", "text/plain")
+                    .body(axum::body::Body::from("hi".to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Malformed JSON within the limit → 400.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/p")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{".to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn with_prefix_prepends_a_nonempty_disclaimer_only() {
+        assert_eq!(with_prefix("", "answer".into()), "answer");
+        assert_eq!(
+            with_prefix("disclaimer", "answer".into()),
+            "disclaimer\n\nanswer"
+        );
+    }
+
+    // ── finding #1: fold prior turns into the prompt (the engine drops InitialPrompt.history) ──
+
+    #[test]
+    fn fold_history_into_prompt_returns_prompt_unchanged_when_history_empty() {
+        // A single-turn request has no prior turns → the prompt is byte-for-byte unchanged.
+        assert_eq!(fold_history_into_prompt(&[], "目前的問題"), "目前的問題");
+    }
+
+    #[test]
+    fn fold_history_into_prompt_includes_a_single_prior_turn_before_the_question() {
+        let history = vec![Exchange {
+            user: "上個月營收多少?".into(),
+            assistant: "上個月營收是 100 萬。".into(),
+        }];
+        let folded = fold_history_into_prompt(&history, "那這個月呢?");
+        // The prior turn (both roles) must reach the prompt — the whole point of the fix.
+        assert!(
+            folded.contains("上個月營收多少?"),
+            "prior user turn missing: {folded}"
+        );
+        assert!(
+            folded.contains("上個月營收是 100 萬。"),
+            "prior assistant turn missing: {folded}"
+        );
+        assert!(
+            folded.contains("那這個月呢?"),
+            "current question missing: {folded}"
+        );
+        // The current question comes AFTER the folded history.
+        let history_pos = folded.find("上個月營收是 100 萬。").unwrap();
+        let question_pos = folded.find("那這個月呢?").unwrap();
+        assert!(
+            history_pos < question_pos,
+            "history must precede the current question: {folded}"
+        );
+    }
+
+    #[test]
+    fn fold_history_into_prompt_preserves_multi_turn_chronological_order() {
+        let history = vec![
+            Exchange {
+                user: "Q1".into(),
+                assistant: "A1".into(),
+            },
+            Exchange {
+                user: "Q2".into(),
+                assistant: "A2".into(),
+            },
+        ];
+        let folded = fold_history_into_prompt(&history, "Q3");
+        let (p1, p2, p3) = (
+            folded.find("Q1").expect("Q1 present"),
+            folded.find("Q2").expect("Q2 present"),
+            folded.find("Q3").expect("Q3 present"),
+        );
+        assert!(
+            p1 < p2 && p2 < p3,
+            "turns must appear oldest-first with the current question last: {folded}"
+        );
+        // Each prior turn is labeled by role so the model can read the transcript.
+        assert!(folded.contains("User: Q1"));
+        assert!(folded.contains("Assistant: A1"));
+    }
+
+    #[test]
+    fn resolve_outcome_reads_answer_and_failures_from_the_run_result() {
+        use crate::agent::payload::FinalResult;
+        use std::collections::HashMap;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-23T00:00:00+00:00").unwrap();
+        // A Final payload → its assistant text is the authoritative answer.
+        let final_ok = Ok(AgentPayload::Final(FinalResult {
+            user: "u".into(),
+            assistant: "THE ANSWER".into(),
+            now,
+            artifacts: HashMap::new(),
+        }));
+        assert_eq!(resolve_outcome(final_ok), Ok("THE ANSWER".into()));
+
+        // A capability error (incl. the unknown-pipeline early return, which emits NO Error event)
+        // surfaces its Display as the failure — the drain-only path would have missed it entirely.
+        let cap_err = Err(AgentError::Capability("unknown pipeline: p".into()));
+        assert_eq!(
+            resolve_outcome(cap_err),
+            Err("capability error: unknown pipeline: p".into())
+        );
+
+        // A non-Final terminal payload is a wiring fault, not a silent success.
+        let now2 = now;
+        let not_final = Ok(AgentPayload::Initial(InitialPrompt {
+            prompt: "x".into(),
+            history: vec![],
+            now: now2,
+        }));
+        assert!(resolve_outcome(not_final).is_err());
+    }
+
+    /// Collect the payloads of every `data: <payload>` line of an SSE body, in order.
+    fn sse_data_lines(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_appends_a_zero_usage_chunk_when_include_usage() {
+        // AC-5 / finding #4: a streamed refusal honours `stream_options.include_usage` by emitting a
+        // terminal usage-only chunk (zero cost — a refusal spends no LLM tokens) before `[DONE]`.
+        let resp = openai_refusal(true, "refused copy".into(), true, "id", "m", 0);
+        let lines = sse_data_lines(&body_string(resp).await);
+
+        assert_eq!(
+            lines.last().unwrap(),
+            "[DONE]",
+            "stream must end with [DONE]"
+        );
+        // The chunk immediately before [DONE] is the usage-only chunk: empty choices, zero usage.
+        let usage_chunk: serde_json::Value =
+            serde_json::from_str(&lines[lines.len() - 2]).expect("usage chunk is JSON");
+        assert!(usage_chunk["choices"].as_array().unwrap().is_empty());
+        assert_eq!(usage_chunk["usage"]["prompt_tokens"], 0);
+        assert_eq!(usage_chunk["usage"]["completion_tokens"], 0);
+        assert_eq!(usage_chunk["usage"]["total_tokens"], 0);
+        // The content chunks (everything before the usage chunk) reconstruct the refusal copy.
+        let content: String = lines[..lines.len() - 2]
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|c| {
+                c["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(String::from)
+            })
+            .collect();
+        assert_eq!(content, "refused copy");
+    }
+
+    #[tokio::test]
+    async fn refusal_stream_omits_usage_chunk_without_include_usage() {
+        // Wire unchanged when the client did not opt in: no chunk carries a `usage` field.
+        let resp = openai_refusal(true, "refused".into(), false, "id", "m", 0);
+        let lines = sse_data_lines(&body_string(resp).await);
+
+        assert_eq!(lines.last().unwrap(), "[DONE]");
+        for line in &lines {
+            if *line == "[DONE]" {
+                continue;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(
+                chunk.get("usage").is_none(),
+                "no chunk may carry usage when include_usage is off, got {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_non_stream_returns_a_chat_completion_with_the_copy() {
+        // Non-streaming refusal: a 200 `chat.completion` whose single choice content is the copy.
+        let resp = openai_refusal(false, "refused copy".into(), false, "id", "m", 0);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_str(&body_string(resp).await).expect("json body");
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["content"], "refused copy");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["total_tokens"], 0);
     }
 }
