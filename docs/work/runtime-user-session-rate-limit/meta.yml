@@ -1,0 +1,29 @@
+schema_version: work-item/v3
+slug: runtime-user-session-rate-limit
+title: Runtime SQLite persistence and layered rate-limit POC
+created_at: 2026-08-13T09:46:26+08:00
+updated_at: 2026-08-20T17:30:00+08:00
+execution_mode: team-feature
+work_status: active
+delivery_status: not_requested
+stages:
+  prd: { skill: prd-interview, file: prd.md, status: approved }
+  spec: { skill: spec, file: spec.md, status: awaiting-approval }
+  qa: { skill: qa, file: qa-plan.md, status: ready }
+inputs:
+  - user:runtime-owned-rate-limit-and-user-session-storage-2026-08-13
+  - user:per-user-usd-20-monthly-openrouter-budget-2026-08-13
+  - user:asia-taipei-month-boundary-confirmed-2026-08-13
+  - user:shared-openrouter-key-runtime-redis-ledger-confirmed-2026-08-13
+  - user:minimized-session-retention-confirmed-2026-08-13
+  - user:sqlite-single-replica-poc-confirmed-2026-08-13
+  - user:handwritten-layered-rate-limit-draft-2026-08-13
+  - user:approved-reviewed-rate-limit-optimizations-2026-08-13
+  - user:approved-prd-v0.5.0-and-pre-authorized-spec-qa-pr-in-one-pass-2026-08-13
+  - docs/reference/prd.md
+  - docs/reference/modules/runtime-memory.md
+  - docs/reference/endpoints/agent-stream.md
+  - src/runtime/memory/store.rs
+  - src/runtime/turn.rs
+  - src/server/handler.rs
+  - external:falcon-client/src/lib/chief-of-staff/agent-runtime/identity.ts

@@ -13,6 +13,7 @@
 |---|---|---|---|---|---|---|
 | [eval-evaluator-registry-fix](./eval-evaluator-registry-fix/prd.md) | feature | runtime | eval | team-feature | PRD ready | — |
 | [evidence-pack-skillpackage-finalllmport](./evidence-pack-skillpackage-finalllmport/prd.md) | feature | runtime | evidence | team-feature | PRD ready | — |
+| [runtime-user-session-rate-limit](./runtime-user-session-rate-limit/prd.md) | feature | runtime | persistence | team-feature | PRD approved; spec + qa-plan in PR review | [PR #10](https://github.com/h-alice/datacenter-agent/pull/10) open |
 
 ## Completed（保留在原地，尚未 archive）
 
