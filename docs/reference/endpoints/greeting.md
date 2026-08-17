@@ -5,7 +5,13 @@
 > **Source**：[`src/server/handler.rs`](../../../src/server/handler.rs) → `greeting()`；預生成 [`src/server/greeting.rs`](../../../src/server/greeting.rs)；回應型別 [`dto.rs`](../../../src/server/dto.rs) → `GreetingResponse`
 
 ## 用途
-回傳一句**預生成、具資料感知**的歡迎詞。開機時數個背景任務跑 greeting prompt 過同一條 tool-calling 迴圈，把結果存進 `AppState::greetings`；本端點隨機挑一句。
+回傳一句**預生成、具資料感知**的歡迎詞。開機時數個背景任務各跑一次**兩階段 greeting
+pipeline**（`fetcher → analyst`），把結果存進 `AppState::greetings`；本端點隨機挑一句。
+
+> **接線已改變。** greeting 過去走 `llm_connector::generate` 的 tool-calling 迴圈，
+> 現在改用 [sub-agent 層](../modules/agent.md)的 `build_greeting_pipeline`，
+> 用 `greeting_fetcher_system` / `greeting_analyst_system` 兩份 prompt
+> （原本的單一 `greeting_system` 已移除）。
 
 ## 契約
 | 項目 | 值 |
@@ -23,7 +29,8 @@
 ## 行為註記
 - 從 `state.greetings`（`Mutex<Vec<String>>`）隨機 `choose`。
 - 若 vector 還空（背景任務未完成）→ `AppError::ServiceUnavailable`。
-- 生成邏輯與 prompt 來源見 [server 模組 · greeting](../modules/server.md#greeting) 與 [llm_connector](../modules/llm-connector.md)。
+- 生成邏輯與 prompt 來源見 [server 模組 · greeting](../modules/server.md#greeting) 與
+  [agent 模組](../modules/agent.md)。本端點**不經過** `llm_connector`。
 
 ## 範例（curl）
 ```bash
@@ -35,4 +42,5 @@ curl -s http://localhost:8080/greeting \
 
 ## 相關
 - 預生成任務 → [server 模組](../modules/server.md)
-- prompt 載入（`greeting_system` / `greeting_user`）→ [專案主體 · 啟動與組裝](../index.md#4-啟動與組裝top-level-接線)
+- prompt 載入（`greeting_fetcher_system` / `greeting_analyst_system` / `greeting_user`）
+  → [專案主體 · 啟動與組裝](../index.md#4-啟動與組裝top-level-接線)
