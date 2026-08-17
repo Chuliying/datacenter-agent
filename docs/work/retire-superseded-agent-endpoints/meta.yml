@@ -12,8 +12,8 @@ stages:
   implement: { skill: implement, file: implement-report.md, status: done }
 handoff: >-
   Execution Mode refactor：PRD required、Spec optional（不產出，刪除範圍已於 FR-002
-  逐符號界定）、qa-plan absent。跨 repo：falcon-client (chat-bot 分支) 的 FR-004
-  需另外取得修改該 repo 的確認。
+  逐符號界定）、qa-plan absent。跨 repo 的 FR-004 已於 falcon-client (chat-bot 分支)
+  commit 8a20c46 完成。兩邊皆未 push。
 decisions:
   - stage: brainstorm
     decision: 否決「補 guardrail」三方案，改為刪除

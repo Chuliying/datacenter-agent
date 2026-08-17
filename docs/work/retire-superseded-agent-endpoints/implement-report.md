@@ -110,7 +110,35 @@ PRD FR-002 的清單沒有列到這個 DTO，屬實作階段發現的連帶死�
 
 ## FR-004 — falcon-client
 
-**本次未執行**，見下方待辦。
+**已完成**：commit `8a20c46`（falcon-client，branch `chat-bot`）。淨 -238 行（90 insertions /
+328 deletions，12 檔）。
+
+分支選擇：`chat-bot`（非 manifest 的 base `dev`）——統一串流那個 commit `6fb42cc` 只在
+`chat-bot` 上，`dev` 沒有，所以必須疊在 `chat-bot`。
+
+| 項目 | 變更 |
+|---|---|
+| `agent-client.ts` | 移除 `callAgent`、`AgentResponse` 型別；`agentUrl` 型別收斂為 `AgentStreamPath \| '/greeting'`。`agentRequestBody` / `usesAgentServerMemory` / `agentErrorInfo` 保留給串流 |
+| `nodes/route.ts` | 移除 `POST`，**保留 `GET`**（greeting，打 upstream `/greeting` 仍有效）；連帶移除只有 POST 用到的 8 個 import 與 helper |
+| `useChiefOfStaffStream.ts` | 移除 `useStreaming` flag、`submitRestRequest`、`CreateNodeResponse`；`submitRequest` 直接等於 `submitStreamRequest` |
+| `ChiefOfStaffPanel.tsx` | 停止按鈕條件 `isLoading && useStreaming` → `isLoading` |
+| `nodes/route.test.ts` | **刪除**（4 個測試全部測已移除的 POST；`GET` 本來就無覆蓋，故非覆蓋倒退） |
+| `agent-client.test.ts` | 測 `callAgent` 的那條**改寫**為 `openAgentStream`，保留原斷言意圖（base url 正規化 + session/option 轉發），並補驗 server-memory 關閉時 history 保留 |
+| 文件 6 份 | PRD v2.2.0→v2.3.0（含 changelog 列、§5.5 與 FR-004 標 Superseded、§5.6 對照表移除「後備」欄、feature flag 段改寫、§7 依賴清單）、input-pipeline guide、runtime-plan、consistency-audit（FR-007 的 ✅ → 🔴）、work item `chief-of-staff-sse-align` 標 superseded |
+
+Gate：type-check pass · `eslint --max-warnings 0` pass · chief-of-staff **15 檔 58 測試通過**
+（基線 16/62，差額正是刪掉的 4 個 POST 測試）· 專案 pre-commit hooks（type-check /
+lint-staged / console.log / secrets / 文件結構）全過。
+
+falcon 工作樹另有 155 個**無關**的未提交變更（skills submodule 同步、zip、flow-map 等），
+只 stage 了本次的 12 個檔案，未混入。
+
+### 全 repo 測試的 4 個既有失敗
+
+`src/__tests__/features/menu-access-control.test.ts` 有 4 個失敗，**與本變更無關**：
+那些測試只碰 `menuDevStatus` / `menuBetaStatus` / `menuPermissions` / `getMenuPermissions`，
+皆未被本次改動；且在同一 commit 的乾淨 worktree checkout 上 45/45 全過，
+故屬工作樹既有未提交 WIP 造成。未進一步追查（超出範圍）。
 
 ## AC 驗收
 
@@ -164,12 +192,10 @@ review 同時確認為正確的部分：刪除的每個符號都真的不可達�
 
 ## 待辦
 
-1. **FR-004 falcon-client** — `callAgent` / `submitRestRequest` / `nodes/route.ts` 的 POST /
-   `NEXT_PUBLIC_COS_STREAMING` flag，以及 7 處文件（清單見 PRD FR-004）。跨 repo，需另外確認。
-2. **AC-001 / AC-002 端到端實測** — 起本機服務確認舊路徑 404、保留端點正常。
-3. **`AppState::generation_config` 是零呼叫端的 pub 死碼**（`appstate.rs:281`，pre-existing）。
+1. **AC-001 / AC-002 端到端實測** — 起本機服務確認舊路徑 404、保留端點正常。
+2. **`AppState::generation_config` 是零呼叫端的 pub 死碼**（`appstate.rs:281`，pre-existing）。
    `clippy` 不會對 pub 項目發 `dead_code`，所以沒被 gate 抓到。
-4. 版本 bump 到 `0.4.0`（pre-1.0 破壞性變更 → minor）留給發布 commit，依 repo 慣例。
-5. FU-002 `insight_frames` / `INSIGHT_STREAM_BUFFER` 更名（本次刻意不做）。
-6. FU-003 `RUNTIME_ENABLED` flag 存廢（本次只修正文件敘述）。
-7. `docs/reference/` 的 `prd.md` 與 `spec/spec.md` 仍為 v1.3.0 視角（`spec.md` 還有 `POST /agent` 路由表與 2000 cap 列）。`qa-plan.md` 本次已修正被刪測試的引用。
+3. 版本 bump 到 `0.4.0`（pre-1.0 破壞性變更 → minor）留給發布 commit，依 repo 慣例。
+4. FU-002 `insight_frames` / `INSIGHT_STREAM_BUFFER` 更名（本次刻意不做）。
+5. FU-003 `RUNTIME_ENABLED` flag 存廢（本次只修正文件敘述）。
+6. `docs/reference/` 的 `prd.md` 與 `spec/spec.md` 仍為 v1.3.0 視角（`spec.md` 還有 `POST /agent` 路由表與 2000 cap 列）。`qa-plan.md` 本次已修正被刪測試的引用。
