@@ -1,0 +1,48 @@
+slug: retire-superseded-agent-endpoints
+title: 退役被 /agent/stream 取代的四條端點（/insight、/insight/stream、/report、/report/stream）
+created_at: 2026-08-17T14:20:00+08:00
+updated_at: 2026-08-17T14:20:00+08:00
+status: active
+type: refactor
+surface: server
+area: endpoints
+stages:
+  brainstorm: { skill: brainstorming, file: brainstorm.md, status: done }
+  prd: { skill: to-prd, file: prd.md, status: approved }
+  implement: { skill: implement, file: implement-report.md, status: done }
+handoff: >-
+  Execution Mode refactor：PRD required、Spec optional（不產出，刪除範圍已於 FR-002
+  逐符號界定）、qa-plan absent。跨 repo：falcon-client (chat-bot 分支) 的 FR-004
+  需另外取得修改該 repo 的確認。
+decisions:
+  - stage: brainstorm
+    decision: 否決「補 guardrail」三方案，改為刪除
+    by: user
+    at: 2026-08-17T14:10:00+08:00
+    evidence: >-
+      使用者選定「1 不留」。三項查證：(1) answer policy 的 off_scope 拒絕會讓四條端點
+      開始拒絕今天答得出來的問題（intents.toml 關鍵字包窄 + llm_normalizer disabled）；
+      (2) 四條端點查不到呼叫端；(3) commit 5ab1b7f 早已把兩條 pipeline 統一到
+      /agent/stream，四條屬殘留。換得的防護僅 injection.toml 的 3 條 placeholder regex。
+  - stage: prd
+    version: v1.0.0
+    decision: approved
+    by: user
+    at: 2026-08-17T14:25:00+08:00
+    evidence: >-
+      使用者於 PRD 呈現後指示「弄完請 sub agent fable review」，即核准 v1.0.0 並授權
+      進入 implement；review 於實作完成後以 fable subagent 執行。
+inputs:
+  - user:not-keeping-non-streaming-path-2026-08-17
+  - src/server/route.rs
+  - src/server/handler.rs
+  - config/runtime/intents.toml
+  - config/runtime/thresholds.toml
+  - config/runtime/injection.toml
+  - config/config.toml
+  - commit:5ab1b7f（統一端點整合）
+  - commit:ea2bcef（移除 POST /agent）
+  - commit:2d0a64b（reference 文件同步，本次要改回的對象）
+  - external:falcon-client/src/lib/chief-of-staff/agent-client.ts
+  - external:falcon-client/src/components/chief-of-staff/useChiefOfStaffStream.ts
+  - external:falcon-client/docs/prd/features/chief-of-staff.md

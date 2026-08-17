@@ -65,7 +65,7 @@ pub async fn require_bearer(State(state): State<AppState>, req: Request, next: N
 /// The token check is identical to [`require_bearer`] (same constant-time compare against
 /// `GLOBAL_TOKEN`), but a rejection is `401 Unauthorized` carrying the OpenAI error envelope —
 /// what an OpenAI client / agentgateway expects — instead of the host's `418` teapot. The shared
-/// [`require_bearer`] middleware (and its D6 `418` contract for the other seven endpoints) is
+/// [`require_bearer`] middleware (and its D6 `418` contract for the other standard endpoints) is
 /// deliberately left untouched.
 ///
 /// ## Note

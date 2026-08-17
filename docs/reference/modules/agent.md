@@ -13,11 +13,16 @@ sub-agent pipeline**。每個 stage 是「payload 的純 async function」，可
 這一層是三份 sibling contract（`agent_payload` / `tool` / `sub_agent`）的移植，一個 concern 一個
 submodule。
 
-> **重要：這一層與 runtime 是平行的兩套編排。**
-> `/insight`、`/report` 系列端點**直接**驅動本層，繞過 [runtime turn](./runtime-turn.md) 的
-> guardrails / intent / memory / audit。只有 [`/agent/stream`](../endpoints/agent-stream.md) 與
-> [`/v1/chat/completions`](../endpoints/chat-completions.md) 會先過 runtime prelude 再進本層。
-> 把 pipeline 收到 runtime `AgentPort` 之後是 plan §9 的工作，**目前尚未進行**。
+> **本層一律在 runtime prelude 之後執行。**
+> 兩個入口 [`/agent/stream`](../endpoints/agent-stream.md) 與
+> [`/v1/chat/completions`](../endpoints/chat-completions.md) 都先跑 `plan_stream_turn`
+> （guardrails / intent / answer policy / memory / audit），再驅動本層。
+>
+> 曾經存在「直接驅動本層、繞過 runtime」的端點（`/insight`、`/report` 系列），已於 work item
+> [`retire-superseded-agent-endpoints`](../../work/retire-superseded-agent-endpoints/prd.md) 移除。
+>
+> 但**本層本身仍不在 runtime 的 trait seam 之後**——handler 直接呼叫 `agent::wiring`，
+> 而非透過 `AgentPort`。把 pipeline 收到 `AgentPort` 之後是 plan §9 的工作，目前尚未進行。
 
 ## 子模組
 
@@ -32,7 +37,7 @@ submodule。
 | [`clock.rs`](../../../src/agent/clock.rs) | 時間作為注入式 capability（`Clock` / `SystemClock`）＋共用 `# Current Time` header |
 | [`chart.rs`](../../../src/agent/chart.rs) | **falcon-chart** 協定（`ChartBatch` / `FalconChart`）：`charter` 的 `emit_chart` sink 驗證、`finalizer` 渲染 |
 | [`report.rs`](../../../src/agent/report.rs) | **report data** 協定（`ReportData`）：`composer` 的 `emit_report` sink 驗證、`renderer` 注入模板 |
-| [`pipeline.rs`](../../../src/agent/pipeline.rs) | `/insight` 與 `/report` 兩條 pipeline 的組裝，含純邏輯的 `render_report` / `render_report_html` |
+| [`pipeline.rs`](../../../src/agent/pipeline.rs) | insight 與 report 兩條 pipeline 的組裝，含純邏輯的 `render_report` / `render_report_html` |
 | [`wiring.rs`](../../../src/agent/wiring.rs) | production 組裝：`build_insight_pipeline` / `build_report_pipeline` / `build_greeting_pipeline` |
 
 ## 核心抽象
@@ -94,7 +99,7 @@ async fn run(&self, input: AgentPayload) -> Result<AgentPayload, AgentError>
 `StageFinished` 帶 `outcome`（success / failure），`Failure` 後面**必定**跟一個終止性的
 `AgentEvent::Error`。
 
-事件如何映射成外部 SSE frame 見 [`/insight/stream`](../endpoints/insight-stream.md#sse-frame)。
+事件如何映射成外部 SSE frame 見 [`/agent/stream`](../endpoints/agent-stream.md#sse-frame)。
 
 ### `Clock` — 時間作為注入式 capability
 
@@ -107,7 +112,7 @@ LLM 沒有時鐘：拿到「結束於當前這個進行中月份」的營收，�
 
 ## 三條 pipeline
 
-### `/insight`（四階段）
+### insight pipeline（四階段）
 
 | Stage | Kind | 讀 | 產出 | Payload shape |
 |---|---|---|---|---|
@@ -116,7 +121,7 @@ LLM 沒有時鐘：拿到「結束於當前這個進行中月份」的營收，�
 | `charter` | `ConfiguredAgent` + `emit_chart` sink | analyst 的分析 | 驗證過的 `ChartBatch` | Intermediate |
 | `finalizer` | 純邏輯（`render_report`） | 以上全部 | 報告 + 內嵌 `falcon-chart` block | Final |
 
-### `/report`（四階段）
+### report pipeline（四階段）
 
 前兩段相同（analyst 換用 `report_analyst_system` prompt），後兩段改為：
 
@@ -146,7 +151,7 @@ tool grant **來自 config，不是 code**：`config/config.toml` 的 `[insight.
 | `fetcher` | fetcher 可用的資料 tool（MCP wire 名稱，或 `["*"]` 代表所有 boot 探索到的） |
 | `charter` | charter 可用的 tool（正常就是內建的 `emit_chart` sink） |
 
-`/report` 的 fetcher 重用同一份 `[insight.grants].fetcher`。改 grant **不需重新編譯**。
+report pipeline 的 fetcher 重用同一份 `[insight.grants].fetcher`。改 grant **不需重新編譯**。
 
 ## Boot-time 驗證
 
@@ -165,8 +170,9 @@ tool grant **來自 config，不是 code**：`config/config.toml` 的 `[insight.
 
 ## 已知邊界與後續
 
-- **繞過 runtime**：直接 pipeline 端點沒有 guardrails / intent / memory / audit，
-  `AgentResponse.intent` 硬寫 `"unknown"`。收到 `AgentPort` 後面是 plan §9。
+- **仍不在 trait seam 之後**：handler 直接呼叫 `agent::wiring`，不經 runtime `AgentPort`。
+  guardrails / intent / memory / audit 現在一律由 prelude 在進本層**之前**完成
+  （繞過 prelude 的那四條端點已退役），但把 pipeline 收到 `AgentPort` 之後仍是 plan §9 的待辦。
 - **async-openai 版本**：`llm.rs` 刻意鎖 **0.40**。contract 的參考 adapter 釘 0.41.1，
   但本 crate 與 production 迴圈都在 0.40，避免為此做 crate-wide bump。
 - **事件有損**：`ChannelSink` 用 `try_send`，buffer 滿了就丟；無損 channel 列為後續。

@@ -34,7 +34,7 @@ OpenRouter（OpenAI-compatible）LLM 連接 + MCP tool-calling 迴圈 —— age
 >
 > 過去 `generate` 服務 `POST /agent` 與 greeting，兩者都已不再使用它：`/agent` 路由已移除，
 > greeting 改走 [agent 層](./agent.md)的兩階段 pipeline（`build_greeting_pipeline`）。
-> `/insight`、`/report`、`/agent/stream`、`/v1/chat/completions` 全部用 [agent 層](./agent.md)
+> `/agent/stream` 與 `/v1/chat/completions` 都用 [agent 層](./agent.md)
 > 自己的 `OpenAiLlm` / `StreamingOpenAiLlm` adapter。
 >
 > **結論：本模組目前只剩 eval CLI 一個真實使用者。** 下面的 terminal semantics 仍是正確的

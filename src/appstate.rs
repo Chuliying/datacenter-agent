@@ -111,9 +111,9 @@ impl LlmDefaults {
 /// cost up to kilobytes!).
 #[derive(Debug)]
 pub struct PromptBank {
-    /// Legacy monolith analytics system prompt. The live `/insight` + `/insight/stream`
-    /// endpoints now drive the sub-agent pipeline (with its own per-stage prompts under
-    /// `config/prompt_guide/`); this prompt still backs the eval baseline runner.
+    /// Legacy monolith analytics system prompt. The live `/agent/stream` +
+    /// `/v1/chat/completions` endpoints drive the sub-agent pipeline (with its own per-stage
+    /// prompts under `config/prompt_guide/`); this prompt still backs the eval baseline runner.
     pub agent_system: String,
     /// Greeting pipeline — the data-fetch stage's system prompt.
     pub greeting_fetcher_system: String,

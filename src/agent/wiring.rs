@@ -42,7 +42,7 @@
 //!   [`OpenAiLlm`]; nothing is emitted. This backs `/insight`.
 //! - **streaming** (`sink = Some(_)`) — every LLM stage runs on a shared [`StreamingOpenAiLlm`], so
 //!   each one's tokens stream live, delimited by the orchestrator's `StageStarted` /
-//!   `StageFinished` events. This backs `/insight/stream`.
+//!   `StageFinished` events. This backs the SSE path of `/agent/stream`.
 //!
 //! The terminal [`Finalizer`] is pure logic and emits no tokens of its own — it assembles the
 //! analyst's report and the charter's charts into the final answer.

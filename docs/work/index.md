@@ -11,6 +11,7 @@
 |---|---|---|---|---|---|
 | [eval-evaluator-registry-fix](./eval-evaluator-registry-fix/prd.md) | feature | runtime | eval | PRD ready | `docs/work/eval-evaluator-registry-fix/meta.yml` |
 | [evidence-pack-skillpackage-finalllmport](./evidence-pack-skillpackage-finalllmport/prd.md) | feature | runtime | evidence | PRD ready | `docs/work/evidence-pack-skillpackage-finalllmport/meta.yml` |
+| [retire-superseded-agent-endpoints](./retire-superseded-agent-endpoints/prd.md) | refactor | server | endpoints | PRD awaiting-approval | `docs/work/retire-superseded-agent-endpoints/meta.yml` |
 
 ## Maintenance Rules
 

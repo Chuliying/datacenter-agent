@@ -12,27 +12,34 @@ greeting 背景任務。是 runtime 核心與 sub-agent 層對外的唯一接觸
 
 | 檔案 | 職責 | 關鍵項 |
 |---|---|---|
-| [`route.rs`](../../../src/server/route.rs) | 路由 + middleware 組裝 | `build_router`；**兩個 sub-router**（standard 8 條 / OpenAI 1 條）各帶自己的 timeout 與 auth，再 `merge`；共用 64 KiB body cap、very-permissive CORS、`TraceLayer`、`CompressionLayer`、nosniff/no-referrer header |
-| [`handler.rs`](../../../src/server/handler.rs) | 九個 handler | `health` / `ready` / `greeting` / `insight` / `insight_stream` / `report` / `report_stream` / `agent_stream` / `chat_completions` |
+| [`route.rs`](../../../src/server/route.rs) | 路由 + middleware 組裝 | `build_router`；**兩個 sub-router**（standard 4 條 / OpenAI 1 條）各帶自己的 timeout 與 auth，再 `merge`；共用 64 KiB body cap、very-permissive CORS、`TraceLayer`、`CompressionLayer`、nosniff/no-referrer header |
+| [`handler.rs`](../../../src/server/handler.rs) | 五個 handler | `health` / `ready` / `greeting` / `agent_stream` / `chat_completions` |
 | [`openai.rs`](../../../src/server/openai.rs) | OpenAI 相容 DTO 與映射 | `ChatCompletionRequest` / `StreamOptions` / `MapError` / `OpenAiErrorBody`；`map_request`、`error_type_for_status` |
-| [`dto.rs`](../../../src/server/dto.rs) | 請求／回應型別 | `AgentRequest` / `AgentResponse` / `StreamFrame`（9 種 variant）/ `StageData` / `ToolCallData` / `ToolArgsData` / `UsageData` / `IntentResolvedData` / `GreetingResponse` / `ReadyBody` / `ReadyChecks` |
+| [`dto.rs`](../../../src/server/dto.rs) | 請求／回應型別 | `AgentRequest` / `StreamFrame`（9 種 variant）/ `StageData` / `ToolCallData` / `ToolArgsData` / `UsageData` / `IntentResolvedData` / `GreetingResponse` / `ReadyBody` / `ReadyChecks`。`AgentResponse` 隨非串流端點退役一併移除 |
 | <a id="auth"></a>[`auth.rs`](../../../src/server/auth.rs) | bearer 認證 middleware | `require_bearer`（→ `418`）與 `require_bearer_openai`（→ `401` + OpenAI envelope）；皆用 constant-time 比對 |
 | [`error.rs`](../../../src/server/error.rs) | HTTP 錯誤型別 | `AppError` / `ErrorBody` |
 | <a id="greeting"></a>[`greeting.rs`](../../../src/server/greeting.rs) | 開機背景任務 | 跑 **兩階段 greeting pipeline**（fetcher → analyst）填 `AppState::greetings` |
 
-## 三種 agent 執行路徑
-
-handler 層現在承載三種編排層級，這是本模組最重要的結構事實：
+## 兩條 agent 執行路徑
 
 | 路徑 | Handler | 編排 |
 |---|---|---|
-| 直接 pipeline | `insight` / `insight_stream` / `report` / `report_stream` | 直接呼叫 [`agent::wiring`](./agent.md)，**繞過 runtime** |
-| Runtime 路由 | `agent_stream` | `plan_stream_turn` prelude → 依 resolved intent 選 pipeline |
+| 原生串流 | `agent_stream` | `plan_stream_turn` prelude → 依 resolved intent 選 pipeline → SSE |
 | OpenAI 相容 | `chat_completions` | 同 prelude → buffered / 偽串流封裝 |
 
-共用 helper：`insight_initial`（`AgentRequest` → `AgentPayload::Initial`）、
-`final_answer`、`insight_error_to_app_error`、`insight_frames`（`AgentEvent` → `StreamFrame`）、
-`validate_prompt`（2 000-char cap）、`fold_history_into_prompt`。
+**兩者都經過 prelude**，因此本模組不再有繞過 guardrails / audit 的 prompt 入口。
+過去的第三類「直接驅動 pipeline」handler（`insight` / `insight_stream` / `report` /
+`report_stream`）已於 work item
+[`retire-superseded-agent-endpoints`](../../work/retire-superseded-agent-endpoints/prd.md) 移除，
+連帶移除 `insight_initial`、`final_answer`、`insight_error_to_app_error`、
+handler 層的 `validate_prompt` 與 `USER_PROMPT_LENGTH_CAP`。
+
+共用 helper：`insight_frames`（`AgentEvent` → `StreamFrame`）、`wants_report_pipeline`、
+`status_to_app_error`、`fold_history_into_prompt`、`with_prefix`、`UnusedAgentPort`、
+`INSIGHT_STREAM_BUFFER`。
+
+> 命名註記：`insight_frames` 與 `INSIGHT_STREAM_BUFFER` 保留了 `insight` 字樣，
+> 但它們服務的是兩條 pipeline 共用的事件映射與 channel，與已退役的端點無關（work item FU-002）。
 
 ## 認證細節
 
@@ -57,13 +64,16 @@ Kubernetes probe 可配置 headers；實際相容性取決於 deployment profile
 
 `AppError`（`BadRequest 400` / `BadGateway 502` / `ServiceUnavailable 503`）為 HTTP 對外錯誤；
 runtime 內部的 `RuntimeError` 經 `runtime_error_to_app_error` 轉成 `AppError`。
-sub-agent 層的 `AgentError` 經 `insight_error_to_app_error` 轉換：`Capability`（LLM transport、
-MCP tool 失敗）→ 502，其餘（internal mismatch、missing artifact、unknown tool）→ 503。
+sub-agent 層的 `AgentError` 在 `/agent/stream` 由 `resolve_outcome` 收斂成 SSE `error` frame；
+在 `/v1/chat/completions` 收斂成 OpenAI envelope。原本把它映射成 HTTP status 的
+`insight_error_to_app_error`（`Capability` → 502、其餘 → 503）隨非串流端點一併移除。
 
 `JsonRejection` 的處理**兩端點群不同**：
 
-- standard 端點：一律轉 400，可能掩蓋 body-limit extractor status。
-- `/v1/chat/completions`：依 extractor 自己的 status 分流成 413 / 415 / 400。
+- `/agent/stream`：經 `impl From<JsonRejection> for AppError` 一律轉 **400**，
+  因此 >64 KiB body 也是 400 而非 413（掩蓋了 extractor 的原始 status）。
+- `/v1/chat/completions`：經 `json_rejection_status` 依 extractor 自己的 status
+  分流成 413 / 415 / 400。
 
 詳見 [runtime error](./runtime-error.md)。
 

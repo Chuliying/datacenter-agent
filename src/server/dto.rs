@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::History;
 
-// ──── /agent ────
+// ──── agent request ────
 
-/// Request body for `POST /agent`.
+/// Request body for `POST /agent/stream`.
+///
+/// `/v1/chat/completions` maps its OpenAI `messages` onto this same type
+/// (see [`crate::server::openai::map_request`]).
 ///
 /// `history` is optional (defaults to empty) so the very first turn of a
 /// conversation doesn't have to send `"history": []`.
@@ -35,19 +38,7 @@ pub struct AgentRequest {
     pub option_id: Option<String>,
 }
 
-/// A success response for `POST /agent`.
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentResponse {
-    pub user_prompt: String,
-    pub model_response: String,
-    /// Intent selected by the runtime input pipeline.
-    ///
-    /// `"unknown"` when the runtime is disabled (legacy loop) or the turn was
-    /// refused/aborted before an intent could be resolved.
-    pub intent: String,
-}
-
-/// One frame on the `POST /insight/stream` (and legacy `/report/stream`) SSE wire.
+/// One frame on the `POST /agent/stream` SSE wire.
 ///
 /// Every frame is a JSON object inside a single `data:` line, with `event`
 /// as the discriminator.
@@ -57,7 +48,7 @@ pub struct AgentResponse {
 /// - `done`: Carries no payload, used to indicate the end of the stream.
 /// - `clear`: Carries no payload, used to suggest down stream reset current accumulated tokens.
 /// - `stage`: The `data` field names the sub-agent now running (the pipeline streams
-///   `/insight/stream` + `/report/stream`).
+///   drive it).
 /// - `tool_call`: The `data` field names a tool call the model proposed (pipeline streams).
 /// - `tool_args`: The `data` field carries a fragment of a tool call's streamed arguments — live
 ///   progress while the model composes a call (pipeline streams).
@@ -76,8 +67,7 @@ pub enum StreamFrame {
     Clear,
     /// Sub-agent stage transition. `data` carries the sub-agent id and its lifecycle phase
     /// (`started`, then `success` / `failure` on completion) — enough for a client to show a
-    /// per-stage progress indicator that turns green or red. Emitted by the pipeline streams
-    /// (`/insight/stream`, `/report/stream`).
+    /// per-stage progress indicator that turns green or red. Emitted on `/agent/stream`.
     Stage { data: StageData },
     /// A tool call the model proposed (its arguments are assembled). `data` carries the call id and
     /// the tool name, so a client can label the call whose arguments it was streaming. Emitted by
@@ -114,7 +104,8 @@ pub struct IntentResolvedData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StageData {
     /// The sub-agent this transition is about (e.g. `fetcher` / `analyst` / `charter` /
-    /// `finalizer` for `/insight`; `fetcher` / `analyst` / `composer` / `renderer` for `/report`).
+    /// `finalizer` for the insight pipeline; `fetcher` / `analyst` / `composer` / `renderer` for
+    /// the report pipeline).
     pub agent: String,
     /// Whether the sub-agent just started, or finished with success / failure.
     pub phase: StagePhase,

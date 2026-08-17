@@ -32,7 +32,7 @@ src/
 ### Sub-agent 層（[`src/agent/`](../../../src/agent/mod.rs)）
 | 模組 | 職責 | 子頁 |
 |---|---|---|
-| `agent` | payload / tool / sub-agent 三份 contract 的移植；`/insight`、`/report`、greeting 三條 pipeline 的組裝與 production wiring | [agent](./agent.md) |
+| `agent` | payload / tool / sub-agent 三份 contract 的移植；insight、report、greeting 三條 pipeline 的組裝與 production wiring | [agent](./agent.md) |
 
 ### Runtime 核心（[`src/runtime/`](../../../src/runtime/mod.rs)，與 HTTP 解耦）
 | 模組 | 職責 | 子頁 |
@@ -57,24 +57,25 @@ src/
 
 ## 依賴流向（高層）
 
-目前有**兩套平行的編排層**，差別在有沒有經過 runtime turn。
+**單一 request 路徑**：兩個 prompt 入口都先過 prelude，再進 sub-agent 層。
 
 ```
-                       ┌─ /insight, /insight/stream ─┐
-                       │  /report,  /report/stream   │   直接驅動，繞過 runtime
-server ────────────────┴─────────────────────────────┴──▶ agent::wiring
-   │                                                          │
-   │                                                          ├─▶ agent::engine (Orchestrator)
-   │                                                          ├─▶ agent::pipeline (4 stages)
-   │                                                          ├─▶ agent::tools ─▶ mcp_client
-   │                                                          └─▶ agent::llm ─▶ OpenRouter
-   │
-   │  /agent/stream, /v1/chat/completions           經過 runtime prelude
-   └──▶ runtime::turn::plan_stream_turn ──┬─▶ input ─▶ llm_normalizer(可選)
-                │                          ├─▶ guardrails
-                │                          ├─▶ memory
-                │                          └─▶ audit
-                └── 依 resolved intent 選 pipeline ──▶ agent::wiring（同上）
+/agent/stream ─┐
+               ├──▶ runtime::turn::plan_stream_turn ──┬─▶ input ─▶ llm_normalizer(可選)
+/v1/chat/…  ───┘        （guardrails/intent/policy）   ├─▶ guardrails
+                                    │                  ├─▶ memory
+                                    │                  └─▶ audit
+                                    │
+                     依 resolved intent 選 pipeline
+                                    │
+                                    ▼
+                              agent::wiring
+                                    ├─▶ agent::engine (Orchestrator)
+                                    ├─▶ agent::pipeline (4 stages)
+                                    ├─▶ agent::tools ─▶ mcp_client
+                                    └─▶ agent::llm ─▶ OpenRouter
+
+server::greeting（啟動背景 task）──▶ agent::wiring::build_greeting_pipeline（2 stages）
 
 runtime::eval::runner ──▶ llm_connector::generate ──▶ agent_stream ──▶ mcp_client
                           （eval CLI，本模組唯一真實使用者；generate 是 agent_stream 的 wrapper）
@@ -88,8 +89,10 @@ InsightGrants、report_template、optional AppRuntime
 
 重點：
 
-1. **直接 pipeline 端點完全不碰 runtime**——沒有 guardrails、intent、memory、audit。
-2. `/agent/stream` 與 `/v1/chat/completions` 用 runtime prelude 做前處理，**再**進 sub-agent 層；
+1. **不再有繞過 runtime 的 prompt 入口。** `/insight`、`/report` 系列（直接驅動 pipeline、
+   無 guardrails / audit）已於 work item
+   [`retire-superseded-agent-endpoints`](../../work/retire-superseded-agent-endpoints/prd.md) 移除。
+2. `/agent/stream` 與 `/v1/chat/completions` 用 prelude 做前處理，**再**進 sub-agent 層；
    它們不使用 `run_agent_turn` 的完整 AgentPort 路徑。
 3. `llm_connector` 已退出所有 HTTP request path，只剩 eval runner 一個使用者。
    `agent_stream` 的**直接**呼叫點 `LlmAgentPort` 從未被建構，但 `generate` 是它的 wrapper，

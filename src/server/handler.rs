@@ -30,8 +30,8 @@ use rand::seq::SliceRandom;
 use futures::StreamExt;
 
 use super::dto::{
-    AgentRequest, AgentResponse, GreetingResponse, IntentResolvedData, ReadyBody, ReadyChecks,
-    StageData, StagePhase, StreamFrame, ToolArgsData, ToolCallData, UsageData,
+    AgentRequest, GreetingResponse, IntentResolvedData, ReadyBody, ReadyChecks, StageData,
+    StagePhase, StreamFrame, ToolArgsData, ToolCallData, UsageData,
 };
 use super::error::AppError;
 use super::openai;
@@ -49,9 +49,6 @@ use crate::runtime::turn::{
     append_memory_turn_if_enabled, plan_stream_turn, AgentPort, AgentTurnDeps, StreamPlan,
     TurnEvent,
 };
-
-/// Upper bound on the user prompt, in UTF-8 characters.
-pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
 
 /// SSE keep-alive interval.
 ///
@@ -116,285 +113,15 @@ pub async fn greeting(State(state): State<AppState>) -> Result<Json<GreetingResp
     }
 }
 
-// ──── /insight ───
-
-/// Non-streaming analytics handler: runs the four-stage `/insight` pipeline (fetcher → analyst →
-/// charter → finalizer) and returns the finalizer's complete answer — the analyst's report with
-/// any charts embedded as `falcon-chart` fenced blocks.
-///
-/// This drives the sub-agent pipeline **directly**: it does not pass through the runtime turn
-/// (guardrails / intent / memory / audit). Routing the pipeline behind the runtime `AgentPort` is
-/// the plan's §9 step, deferred until the pipeline is proven by hand.
-pub async fn insight(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AgentResponse>, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "insight",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-        session_id = req.session_id.as_deref().unwrap_or(""),
-        option_id = req.option_id.as_deref().unwrap_or(""),
-    );
-    async move {
-        validate_prompt(&req.prompt)?;
-        let user_prompt = req.prompt.clone();
-
-        // Assemble the pipeline buffered (no sink) and thread the payload through it.
-        let resolved = state.llm.resolved();
-        let orchestrator = build_insight_pipeline(
-            state.mcp.clone(),
-            &state.tools,
-            state.instructions.as_deref(),
-            &state.prompts.fetcher_system,
-            &state.prompts.analyst_system,
-            &state.prompts.charter_system,
-            &state.insight_grants.fetcher,
-            &state.insight_grants.charter,
-            &resolved,
-            None,
-        )
-        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-        let outcome = orchestrator
-            .run(&agent_pipeline_id(), insight_initial(req))
-            .await
-            .map_err(insight_error_to_app_error)?;
-
-        Ok(Json(AgentResponse {
-            user_prompt,
-            model_response: final_answer(outcome)?,
-            intent: "unknown".into(),
-        }))
-    }
-    .instrument(span)
-    .await
-}
-
-// ──── /report ───
-
-/// HTML report handler: runs the four-stage `/report` pipeline (fetcher → analyst → composer →
-/// renderer) and returns the renderer's self-contained HTML report, wrapped in a `falcon-report`
-/// fenced block.
-///
-/// The economy over the old monolith: the `composer` emits only the small structured
-/// [`ReportData`](crate::agent::report::ReportData) via its `emit_report` sink, and the pure-logic
-/// renderer injects it into the boot-loaded template — **no LLM ever writes HTML**, so the report
-/// is faster, cheaper, and design-stable per turn.
-///
-/// Drives the pipeline directly (no runtime turn), like [`insight`].
-pub async fn report(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AgentResponse>, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "report",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-    );
-    async move {
-        validate_prompt(&req.prompt)?;
-        let user_prompt = req.prompt.clone();
-
-        // Assemble the pipeline buffered (no sink) and thread the payload through it.
-        let resolved = state.llm.resolved();
-        let orchestrator = build_report_pipeline(
-            state.mcp.clone(),
-            &state.tools,
-            state.instructions.as_deref(),
-            &state.prompts.fetcher_system,
-            &state.prompts.report_analyst_system,
-            &state.prompts.report_composer_system,
-            &state.insight_grants.fetcher,
-            &resolved,
-            state.report_template.clone(),
-            None,
-        )
-        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-        let outcome = orchestrator
-            .run(&report_pipeline_id(), insight_initial(req))
-            .await
-            .map_err(insight_error_to_app_error)?;
-
-        Ok(Json(AgentResponse {
-            user_prompt,
-            model_response: final_answer(outcome)?,
-            intent: "unknown".into(),
-        }))
-    }
-    .instrument(span)
-    .await
-}
-
-// ──── /report/stream ───
-
-/// Server-Sent Events variant of [`report`].
-///
-/// Same wire contract as [`insight_stream`] — `stage` frames (progress dots) plus a terminal
-/// `clear` + full-answer `token` + `done`. The `composer` emits a tool call rather than streamable
-/// prose, so the live signal is the per-stage progress; the finished HTML arrives on the terminal
-/// frame.
-pub async fn report_stream(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "report-stream",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-    );
-    let _enter = span.enter();
-
-    validate_prompt(&req.prompt)?;
-
-    // One shared per-turn sink drives the stream (plan §8.5, mechanism A): the streaming LLM stages
-    // emit content deltas onto it, and the orchestrator emits stage transitions.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
-    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
-
-    let resolved = state.llm.resolved();
-    let orchestrator = build_report_pipeline(
-        state.mcp.clone(),
-        &state.tools,
-        state.instructions.as_deref(),
-        &state.prompts.fetcher_system,
-        &state.prompts.report_analyst_system,
-        &state.prompts.report_composer_system,
-        &state.insight_grants.fetcher,
-        &resolved,
-        state.report_template.clone(),
-        Some(sink.clone()),
-    )
-    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-    let initial = insight_initial(req);
-    // The task owns the orchestrator + sink, so when the run finishes every sink clone drops and
-    // the channel closes — the drain loop below ends naturally on close.
-    let run = tokio::spawn(async move {
-        orchestrator
-            .run_emitting(&report_pipeline_id(), initial, &*sink)
-            .await
-    });
-
-    let sse_stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            for frame in insight_frames(event) {
-                yield Ok::<_, Infallible>(sse_event(frame));
-            }
-        }
-        // Channel closed → the run finished. A stage failure already surfaced as an `error` frame
-        // during draining; only a task panic needs a fallback terminal frame here.
-        if let Err(join) = run.await {
-            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                data: format!("report task failed: {join}"),
-            }));
-        }
-    };
-
-    Ok(Sse::new(sse_stream)
-        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-        .into_response())
-}
-
-// ──── /insight/stream ───
-
-/// Server-Sent Events variant of [`insight`].
-///
-/// Runs the same four-stage pipeline, streaming its progress live onto one shared per-turn sink
-/// (plan §8.5, mechanism A). Each frame is a single SSE `data:` line carrying a JSON envelope:
-/// - `{"event":"stage","data":{"agent":"<id>","phase":"started"}}`: the sub-agent started; on
-///   completion a matching `{"phase":"success"}` / `{"phase":"failure"}` follows (a green/red dot).
-/// - `{"event":"token","data":"<text fragment>"}`: a fragment of the current stage's output.
-/// - `{"event":"clear"}` then `{"event":"token","data":"<full answer>"}`: on completion, the
-///   streamed previews are cleared and the **complete** finalizer answer (report + charts) is
-///   re-sent, so a consumer always ends with the correct full answer.
-/// - `{"event":"done"}`: finished cleanly; close the connection.
-/// - `{"event":"error","data":"<message>"}`: terminal error; close the connection.
-///
-/// Like [`insight`], this drives the pipeline directly (no runtime turn).
-pub async fn insight_stream(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "insight-stream",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-        session_id = req.session_id.as_deref().unwrap_or(""),
-        option_id = req.option_id.as_deref().unwrap_or(""),
-    );
-    let _enter = span.enter();
-
-    validate_prompt(&req.prompt)?;
-
-    // One shared per-turn sink drives the stream: the streaming analyst LLM emits content deltas
-    // onto it, and the orchestrator emits stage transitions (both from outside `SubAgent::run`).
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
-    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
-
-    let resolved = state.llm.resolved();
-    let orchestrator = build_insight_pipeline(
-        state.mcp.clone(),
-        &state.tools,
-        state.instructions.as_deref(),
-        &state.prompts.fetcher_system,
-        &state.prompts.analyst_system,
-        &state.prompts.charter_system,
-        &state.insight_grants.fetcher,
-        &state.insight_grants.charter,
-        &resolved,
-        Some(sink.clone()),
-    )
-    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-    let initial = insight_initial(req);
-    // The task owns the orchestrator + sink, so when the run finishes every sink clone drops and
-    // the channel closes — the drain loop below ends naturally on close.
-    let run = tokio::spawn(async move {
-        orchestrator
-            .run_emitting(&agent_pipeline_id(), initial, &*sink)
-            .await
-    });
-
-    let sse_stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            for frame in insight_frames(event) {
-                yield Ok::<_, Infallible>(sse_event(frame));
-            }
-        }
-        // Channel closed → the run finished. A stage failure already surfaced as an `error` frame
-        // during draining (the orchestrator emits it before returning `Err`); only a task panic
-        // needs a fallback terminal frame here.
-        if let Err(join) = run.await {
-            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                data: format!("insight task failed: {join}"),
-            }));
-        }
-    };
-
-    Ok(Sse::new(sse_stream)
-        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-        .into_response())
-}
-
 // ──── /agent/stream ───
 
-/// Intent id that routes a turn to the `/report` pipeline (defined in
+/// Intent id that routes a turn to the report pipeline (defined in
 /// `config/runtime/intents.toml`).
 const REPORT_INTENT: &str = "report";
 
-/// Route to the `/report` pipeline when the user asked for a report — the `report`
+/// Route to the report pipeline when the user asked for a report — the `report`
 /// intent was *mentioned* (the resolved top intent, or present among the
-/// candidates). Otherwise the `/insight` pipeline.
+/// candidates). Otherwise the insight pipeline.
 ///
 /// Keying off "mentioned" rather than strict top-1 means a topic-plus-report
 /// prompt like `營收報告` still routes to the report while its topic intent
@@ -435,8 +162,8 @@ impl AgentPort for UnusedAgentPort {
 
 /// Server-Sent Events analytics front door that runs the **full runtime turn**
 /// (guardrails → intent → memory → audit) and then routes to the sub-agent
-/// pipeline the resolved intent selects: the `/report` pipeline when a report was
-/// asked for (see [`wants_report_pipeline`]), else `/insight`.
+/// pipeline the resolved intent selects: the report pipeline when a report was
+/// asked for (see [`wants_report_pipeline`]), else the insight pipeline.
 ///
 /// Unlike [`insight_stream`] / [`report_stream`] — which drive one fixed pipeline
 /// directly, bypassing the runtime — this is the routed production path. It reuses
@@ -447,8 +174,10 @@ impl AgentPort for UnusedAgentPort {
 /// (`ResponseCompleted` / `ResponseFailed` audit + session-memory append).
 ///
 /// Requires the runtime to be enabled (`RUNTIME_ENABLED`, default on); rolled back,
-/// this returns `503` and callers should use the direct `/insight/stream` or
-/// `/report/stream` pipelines.
+/// this returns `503`. There is no alternative path: the forced-pipeline endpoints that used to
+/// serve as a rollback target were retired (they were also the only prompt entry points that
+/// bypassed the prelude), so a rolled-back runtime leaves only `/health`, `/ready` and
+/// `/greeting` available.
 pub async fn agent_stream(
     State(state): State<AppState>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
@@ -461,7 +190,7 @@ pub async fn agent_stream(
         .filter(|rt| rt.enabled)
         .ok_or_else(|| {
             AppError::ServiceUnavailable(
-                "runtime disabled (RUNTIME_ENABLED=false); use /insight/stream or /report/stream"
+                "runtime disabled (RUNTIME_ENABLED=false); /agent/stream requires the runtime"
                     .into(),
             )
         })?;
@@ -794,7 +523,8 @@ fn resolve_outcome(outcome: Result<AgentPayload, AgentError>) -> Result<String, 
 }
 
 /// Build the intent-selected sub-agent pipeline for the OpenAI endpoint (spec Data Flow): the
-/// `/report` pipeline when a report was asked for (see [`wants_report_pipeline`]), else `/insight`.
+/// report pipeline when a report was asked for (see [`wants_report_pipeline`]), else the insight
+/// pipeline.
 /// `sink = Some(_)` selects the streaming shape; `None` is buffered (spec D1/D2).
 fn build_openai_pipeline(
     state: &AppState,
@@ -1361,78 +1091,14 @@ async fn openai_stream_response(
         .into_response()
 }
 
-// ──── shared prelude ───
+// ──── sub-agent pipeline shared helpers ───
 
-/// Validate the current prompt contract.
-fn validate_prompt(prompt: &str) -> Result<(), AppError> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::BadRequest("prompt must not be empty".into()));
-    }
-    let char_count = prompt.chars().count();
-    if char_count > USER_PROMPT_LENGTH_CAP {
-        return Err(AppError::BadRequest(format!(
-            "prompt exceeds {USER_PROMPT_LENGTH_CAP} chars (got {char_count})"
-        )));
-    }
-
-    Ok(())
-}
-
-// ──── /insight shared helpers ───
-
-/// Bounded buffer for the `/insight/stream` event channel.
+/// Bounded buffer for the sub-agent pipeline event channel.
 ///
 /// Large enough that a normal turn's events (stage transitions plus the analyst's streamed
 /// report) are never dropped by [`ChannelSink`]'s `try_send`; a lossless channel is a later
 /// refinement (plan §8.2).
 const INSIGHT_STREAM_BUFFER: usize = 8192;
-
-/// Build the pipeline's `Initial` payload, stamping the turn's `now` once at this boundary
-/// (plan §12.1) and carrying prior turns forward as [`Exchange`]es.
-///
-/// (The pipeline does not yet thread `history` into each stage's prompt — a known limitation of
-/// this first cut; the payload carries it for when it does.)
-fn insight_initial(req: AgentRequest) -> AgentPayload {
-    let history = req
-        .history
-        .into_iter()
-        .map(|turn| Exchange {
-            user: turn.user_prompt,
-            assistant: turn.model_response,
-        })
-        .collect();
-    AgentPayload::Initial(InitialPrompt {
-        prompt: req.prompt,
-        history,
-        now: SystemClock::default().now(),
-    })
-}
-
-/// Extract the user-facing answer from the pipeline's terminal payload.
-///
-/// The `/insight` pipeline always ends in a `Final` (the finalizer); anything else is an internal
-/// wiring fault surfaced as a host error rather than a panic.
-fn final_answer(outcome: AgentPayload) -> Result<String, AppError> {
-    match outcome {
-        AgentPayload::Final(result) => Ok(result.assistant),
-        other => Err(AppError::ServiceUnavailable(format!(
-            "insight pipeline did not produce a final result (got {:?})",
-            other.kind()
-        ))),
-    }
-}
-
-/// Map a pipeline [`AgentError`] onto the external HTTP error contract.
-///
-/// A capability failure (LLM transport, MCP tool) is an upstream `502`; an internal mismatch /
-/// missing-artifact / unknown-tool is a wiring fault surfaced as `503`.
-fn insight_error_to_app_error(err: AgentError) -> AppError {
-    match err {
-        AgentError::Capability(msg) => AppError::BadGateway(msg),
-        other => AppError::ServiceUnavailable(other.to_string()),
-    }
-}
 
 /// Map one sub-agent [`AgentEvent`] onto the external SSE frames it surfaces (0 or more).
 ///
@@ -1509,31 +1175,6 @@ fn stage_phase(outcome: StageOutcome) -> StagePhase {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prompt_validation_rejects_empty_prompt() {
-        let err = validate_prompt(" \n\t").expect_err("empty prompt should be rejected");
-        match err {
-            AppError::BadRequest(msg) => assert_eq!(msg, "prompt must not be empty"),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn prompt_validation_preserves_existing_2000_char_cap() {
-        let at_cap = "x".repeat(USER_PROMPT_LENGTH_CAP);
-        assert!(validate_prompt(&at_cap).is_ok());
-
-        let over_cap = "x".repeat(USER_PROMPT_LENGTH_CAP + 1);
-        let err = validate_prompt(&over_cap).expect_err("prompt over cap should be rejected");
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("prompt exceeds 2000 chars"));
-                assert!(msg.contains("got 2001"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
 
     #[test]
     fn insight_frames_stream_stages_tokens_and_a_clean_terminal() {

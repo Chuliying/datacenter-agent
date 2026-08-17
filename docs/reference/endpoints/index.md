@@ -5,29 +5,31 @@
 
 ## 路由表
 
-Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth layer。
+Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth layer。**共 5 條。**
 
-### Standard group（8 條，120 s timeout，`require_bearer` → 418）
+### Standard group（4 條，120 s timeout，`require_bearer` → 418）
 
-| Method | Path | Handler | Runtime turn | Detail |
+| Method | Path | Handler | Runtime prelude | Detail |
 |---|---|---|---|---|
 | GET | `/health` | `health` | — | [health](./health.md) |
 | GET | `/ready` | `ready` | — | [ready](./ready.md) |
 | GET | `/greeting` | `greeting` | — | [greeting](./greeting.md) |
-| POST | `/insight` | `insight` | 繞過 | [insight](./insight.md) |
-| POST | `/insight/stream` | `insight_stream` | 繞過 | [insight-stream](./insight-stream.md) |
-| POST | `/report` | `report` | 繞過 | [report](./report.md) |
-| POST | `/report/stream` | `report_stream` | 繞過 | [report-stream](./report-stream.md) |
-| POST | `/agent/stream` | `agent_stream` | **經過** | [agent-stream](./agent-stream.md) |
+| POST | `/agent/stream` | `agent_stream` | ✅ | [agent-stream](./agent-stream.md) |
 
 ### OpenAI group（1 條，600 s timeout，`require_bearer_openai` → 401）
 
-| Method | Path | Handler | Runtime turn | Detail |
+| Method | Path | Handler | Runtime prelude | Detail |
 |---|---|---|---|---|
-| POST | `/v1/chat/completions` | `chat_completions` | **經過**（prelude） | [chat-completions](./chat-completions.md) |
+| POST | `/v1/chat/completions` | `chat_completions` | ✅ | [chat-completions](./chat-completions.md) |
 
-> **沒有 `POST /agent`。** 該路由已被 `/insight` 取代（commit `ea2bcef`）。舊的 `agent.md`
-> 已移除；歷史契約見 git 歷史。
+> **已退役的端點**：`POST /agent`（`ea2bcef`）、`POST /insight`、`POST /insight/stream`、
+> `POST /report`、`POST /report/stream`（work item
+> [`retire-superseded-agent-endpoints`](../../work/retire-superseded-agent-endpoints/prd.md)）。
+> 這些路徑現在回 `404`，且 fallback 在 auth layer **之前**，因此不會因 token 正確與否而不同，
+> 不洩漏 token 有效性。
+>
+> 遷移路徑：串流用 `/agent/stream`（依 intent 自動路由 insight / report pipeline）；
+> 非串流用 `/v1/chat/completions`。
 
 兩個 group 的 auth layer 都套在各自 sub-router 上，因此 scope 是明確的。在 `merge` 之後、
 於外層新增 route 會**同時繞過兩個 auth layer**；新增端點時必須有 Router-level auth test。
@@ -38,11 +40,11 @@ Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth
 
 | Group | Middleware | 失敗 status | 失敗 body |
 |---|---|---|---|
-| Standard（8 條） | `require_bearer` | `418 I'm a teapot` | 專案 JSON error body |
+| Standard（4 條） | `require_bearer` | `418 I'm a teapot` | 專案 JSON error body |
 | `/v1/chat/completions` | `require_bearer_openai` | `401 Unauthorized` | OpenAI error envelope `{"error":{"message","type"}}` |
 
 `/v1` 走 401 是為了讓 agentgateway 這類 OpenAI-compatible client 能正確辨識認證失敗；
-其餘 8 條維持既有的 418 契約（見 agentgateway spec D6）。
+standard group 維持既有的 418 契約（見 agentgateway spec D6）。
 
 共通行為：
 
@@ -61,7 +63,7 @@ Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth
 | `CorsLayer::very_permissive()` | mirror request origin/method/headers 並允許 credentials | 沒有 origin allowlist |
 | `CompressionLayer` | response compression | SSE 是否實際壓縮依 body/header semantics |
 | `SetResponseHeaderLayer` | `nosniff`、`no-referrer` | 全 responses through layer |
-| `DefaultBodyLimit` | max 64 KiB | oversized JSON 的最終 status 沒有 Router test；`JsonRejection` 目前統一轉 400 |
+| `DefaultBodyLimit` | max 64 KiB | oversized JSON 的最終 status 沒有 Router test |
 
 ### 分組 timeout
 
@@ -77,31 +79,31 @@ timeout 砍掉。
 兩個 group 各自帶 timeout 而非共用，是因為 `merge` 會保留各 sub-router 自己的 layer；
 `route.rs` 有 `per_group_timeout_layers_survive_a_merge` test 固定這個行為。
 
-## 三種 agent 執行路徑
+## 兩條 agent 執行路徑
 
-這是目前最容易誤解的地方——**三條路徑的編排層級不同**：
+兩者都經過 runtime prelude（`plan_stream_turn`：guardrails → intent → answer policy → memory
+→ audit），差別只在對外形狀與 pipeline 選擇方式：
 
-| 路徑 | 端點 | 編排 | guardrails / intent / memory / audit |
+| 路徑 | 端點 | Pipeline 選擇 | 對外形狀 |
 |---|---|---|---|
-| 直接 pipeline | `/insight`、`/insight/stream`、`/report`、`/report/stream` | `build_insight_pipeline` / `build_report_pipeline` 直接跑 `Orchestrator` | **全部繞過** |
-| Runtime 路由 | `/agent/stream` | `plan_stream_turn` prelude → 依 resolved intent 選 insight 或 report pipeline | 經過 |
-| OpenAI 相容 | `/v1/chat/completions` | 同 prelude，再走 buffered / 偽串流封裝 | 經過 |
+| 原生串流 | `/agent/stream` | 依 resolved intent 路由（`wants_report_pipeline`） | 專案 SSE frame（含 `stage` / `usage` / `intent.resolved`） |
+| OpenAI 相容 | `/v1/chat/completions` | 同上 | `chat.completion` 或偽串流 `chat.completion.chunk` |
 
-直接 pipeline 端點把 `AgentResponse.intent` 硬寫成 `"unknown"`（沒有 intent 分類可用）。
-把 pipeline 收到 runtime `AgentPort` 之後是 plan §9 的工作，目前**尚未**進行。
+> 過去存在第三類「直接驅動 pipeline、繞過 runtime」的端點（`/insight`、`/report` 系列），
+> 已於本次退役。**現在所有接受 user prompt 的端點都經過 prelude**，不存在無防護入口。
 
-`/agent/stream` 需要 runtime 啟用（`RUNTIME_ENABLED`，預設 on）；rollback 時回 `503`，
-呼叫端應改用 `/insight/stream` 或 `/report/stream`。
+兩者都需要 runtime 啟用（`RUNTIME_ENABLED`，預設 on）；rollback 時回 `503`。
+`RUNTIME_ENABLED=false` 下只有 `/health`、`/ready`、`/greeting` 可用——該 flag 已不具備
+「切換到無 runtime 的替代路徑」的意義，存廢見 work item 的 FU-003。
 
 ## Prompt cap 現況
 
-| 路徑 | Cap | 位置 |
-|---|---|---|
-| `/insight`、`/report` 及其 stream | 2 000 chars | handler `validate_prompt`（`USER_PROMPT_LENGTH_CAP`） |
-| Runtime prelude（`/agent/stream`、`/v1`） | config `thresholds.input.max_prompt_chars`，目前 4 000 | runtime prelude |
+單一來源：runtime config `thresholds.input.max_prompt_chars`，目前 **4 000** chars，
+由 prelude 的 `runtime::guardrails::input_guard::validate_prompt` 執行。
+handler 層過去的 2 000-char cap（`USER_PROMPT_LENGTH_CAP`）已隨退役端點一併移除。
 
-`/v1/chat/completions` 會先把 `messages` 的 history 折入 prompt **再**過 prelude，因此折入後的
-長度一併受 4 000 cap 約束（見 [chat-completions](./chat-completions.md)）。
+`/v1/chat/completions` 會先把 `messages` 的 history 折入 prompt **再**過 prelude，
+因此折入後的長度一併受 4 000 cap 約束（見 [chat-completions](./chat-completions.md)）。
 
 ## Probe 現況
 
@@ -113,9 +115,9 @@ Target policy 與決策狀態見 [PRD FR-011](../prd.md)。
 
 目前沒有 Router oneshot suite 固定下列外部契約：
 
-- 8 條 standard route 的 auth scope、418 body/header，以及 `/v1` 的 401 envelope。
+- 4 條 standard route 的 auth scope、418 body/header，以及 `/v1` 的 401 envelope。
+- 已退役路徑回 404（本次以移除註冊點 + `cargo test`/`clippy` 佐證，無 route-level 斷言）。
 - malformed/missing JSON 與 >64 KiB status。
-- 直接 pipeline 端點與 runtime 路徑的 prompt boundary 差異（2 000 vs 4 000）。
 - timeout 與 SSE body lifetime（120 s / 600 s 兩組）。
 - CORS allowlist/credential behavior。
 

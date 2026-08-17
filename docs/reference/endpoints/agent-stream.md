@@ -3,40 +3,42 @@
 > ← [Endpoints](./index.md)  
 > **Source**：[`src/server/handler.rs`](../../../src/server/handler.rs) `agent_stream` / `wants_report_pipeline` / `insight_frames` / `status_to_app_error`；[`src/runtime/turn.rs`](../../../src/runtime/turn.rs) `plan_stream_turn` / `append_memory_turn_if_enabled`；[`src/server/dto.rs`](../../../src/server/dto.rs) `StreamFrame`
 
-**production 路由路徑**：跑完整 runtime turn（guardrails → intent → answer policy → memory → audit），
-再依 resolved intent 挑選 sub-agent pipeline 串流。
+**唯一的原生串流前門**：跑 runtime prelude（guardrails → intent → answer policy → memory
+→ audit），再依 resolved intent 挑選 sub-agent pipeline 串流。
 
-## 與直接 pipeline 端點的差別
-
-[`/insight/stream`](./insight-stream.md) 與 [`/report/stream`](./report-stream.md) 各自固定驅動
-**一條** pipeline 並繞過 runtime。本端點是**被路由的**那一條：它原樣重用 runtime 的
-`plan_stream_turn` prelude（沒有複製任何 guardrail / intent 邏輯），然後把選中的 pipeline
-透過**同一個** `insight_frames` 映射串出去——所以 stage-aware SSE 契約三者完全一致。
-
-### Pipeline 選擇規則
+## Pipeline 選擇規則
 
 `wants_report_pipeline`：只要 `report` intent **被提及**——是 resolved top intent，或出現在
-candidate intents 之中——就走 `/report` pipeline，否則走 `/insight`。
+candidate intents 之中——就走 **report pipeline**（`fetcher → analyst → composer → renderer`），
+否則走 **insight pipeline**（`fetcher → analyst → charter → finalizer`）。
 
 用「被提及」而非嚴格 top-1 的理由：像「營收報告」這種 topic + report 的 prompt 仍會路由到
 report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer policy 與 memory。
 
+兩條 pipeline 的階段組成見 [agent 模組](../modules/agent.md)。
+
+> **曾經存在的強制 pipeline 端點已退役。** `/insight/stream` 與 `/report/stream` 各自固定驅動
+> 一條 pipeline 且繞過 runtime；本端點以 intent 路由涵蓋兩者，功能為嚴格超集，因此那兩條
+> 於 work item [`retire-superseded-agent-endpoints`](../../work/retire-superseded-agent-endpoints/prd.md)
+> 移除。它們也是當時唯一沒有 guardrail 與 audit 的 prompt 入口。
+
 ### Runtime 必要
 
-需要 runtime 啟用（`RUNTIME_ENABLED`，預設 on）。rollback 時回 `503`，
-呼叫端應改用 `/insight/stream` 或 `/report/stream`。
+需要 runtime 啟用（`RUNTIME_ENABLED`，預設 on）。rollback 時回 `503`。
+
+`RUNTIME_ENABLED=false` 下**沒有替代路徑**——只剩 `/health`、`/ready`、`/greeting` 可用。
+該 flag 因此已不具備 rollback 意義，存廢見 work item 的 FU-003。
 
 > 舊的 legacy 路徑（`llm_connector::agent_stream` 直呼）**已不存在於本端點**。
-> `llm_connector` 現在只在 runtime turn 的 `LlmAgentPort` 與 eval runner 上，
-> 見 [llm_connector](../modules/llm-connector.md)。
+> `llm_connector` 現在只剩 eval CLI 使用，見 [llm_connector](../modules/llm-connector.md)。
 
 ## Request / response
 
-- Request body 為 `AgentRequest`，與 [`/insight`](./insight.md) 同形。
+- Request body 為 `AgentRequest`（`{prompt, history?, session_id?, option_id?}`）。
 - Bearer required（失敗 418）。
 - 成功建立 stream 後為 `text/event-stream`，keep-alive interval 15 秒。
 - prompt cap 為 runtime config `thresholds.input.max_prompt_chars`（目前 4 000），
-  非直接 pipeline 端點的 2 000。
+  由 prelude 執行。這是全服務唯一的 prompt cap。
 
 ## Prelude 的三種結果
 
@@ -53,21 +55,38 @@ report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer po
 
 ## SSE frame
 
-與 [`/insight/stream`](./insight-stream.md#sse-frame) 相同的 `StreamFrame` 集合
-（`stage` / `token` / `tool_call` / `tool_args` / `usage` / `clear` / `done` / `error`），
-另加本端點獨有的一種：
+每個 SSE `data:` 是一個 JSON object，discriminator 為 `event`。`StreamFrame` 共 **9 種** variant：
 
-| Event | JSON payload | 時機 |
+| Event | JSON payload | 意義 |
 |---|---|---|
 | `intent.resolved` | `{"event":"intent.resolved","data":{"intent":"revenue","candidateIntents":["revenue"]}}` | **僅 `Proceed` 路徑**：任何 token 之前，送一次 |
+| `stage` | `{"event":"stage","data":{"agent":"fetcher","phase":"started"}}` | 某個 sub-agent 開始；完成時再送一筆 `success` / `failure` |
+| `token` | `{"event":"token","data":"<片段>"}` | 目前 stage 輸出的片段 |
+| `tool_call` | `{"event":"tool_call","data":{...}}` | 模型組完一次 tool call（帶 call id 與 tool 名） |
+| `tool_args` | `{"event":"tool_args","data":{...}}` | tool call 的 JSON 參數片段（組裝中的即時進度） |
+| `usage` | `{"event":"usage","data":{"prompt":N,"completion":N,"reasoning":N,"total":N}}` | 一次 LLM turn 的 token 用量；一個 stage 可能報多次 |
+| `clear` | `{"event":"clear"}` | 清掉先前串流的預覽 |
+| `done` | `{"event":"done"}` | 乾淨結束，關連線 |
+| `error` | `{"event":"error","data":"<message>"}` | 終止性錯誤，關連線 |
+
+`phase` 值為 `started` / `success` / `failure`（`rename_all = "lowercase"`），足以驅動
+「轉圈 → 變綠/變紅」的每階段指示燈。`usage` 的 `reasoning` 是 `completion` 的子集，
+模型沒回報時整個欄位省略（`skip_serializing_if`）。`IntentResolvedData` 的 `candidate_intents`
+透過 `rename_all = "camelCase"` 序列化為 `candidateIntents`，對齊前端事件形狀。
 
 > `Refused` 路徑**不送** `intent.resolved`——它直接 yield refusal copy 的 `token` 再 `done`。
 > 消費端不可假設每次 200 回應都以 `intent.resolved` 開頭。
 
-`IntentResolvedData` 的 `candidate_intents` 透過 `rename_all = "camelCase"` 序列化為
-`candidateIntents`，對齊前端事件形狀。
+### 終局協定：clear 後重送完整答案
 
-終局協定同樣是 `clear` → `token`（完整答案）→ `done`。
+結束時的順序固定是 **`clear` → `token`（完整答案）→ `done`**（`insight_frames` 對終局
+`Finished` 事件的映射）。中間串流的是各 stage 的預覽片段，可能不是最終內容；`clear` 之後
+重送的那一筆 `token` 才是完整答案（insight pipeline 的報告 + charts，或 report pipeline 的
+`falcon-report` HTML）。消費端只要遵守這個協定，**永遠會以正確的完整答案收尾**。
+
+### 未外送的事件
+
+`ToolStarted`、`ToolProduced`、`ReasoningDelta`、`StageProduced` 目前留在內部，不映射成 SSE frame。
 
 ## Post-stream 副作用
 
