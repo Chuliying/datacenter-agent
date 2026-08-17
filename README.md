@@ -11,11 +11,15 @@ LLM against live data with the power of MCP server.
 
 ## Endpoints
 
-- `/agent`: one-shot answer
-- `/agent/stream`: SSE token stream
+- `/agent/stream`: SSE stream — the native front door. Runs the runtime prelude, then routes
+  to the insight or report sub-agent pipeline by resolved intent.
+- `/v1/chat/completions`: OpenAI-compatible (agentgateway Path C), streaming and non-streaming.
 - `/greeting`: a random pre-generated, data-aware welcome message
 - `/health`: liveness probe
 - `/ready`: readiness probe
+
+`POST /agent`, `/insight`, `/insight/stream`, `/report` and `/report/stream` have been retired;
+they return `404`. Use `/agent/stream` (streaming) or `/v1/chat/completions` (non-streaming).
 
 All routes, including `/health` and `/ready`, currently require a bearer token. See [the endpoint contract](docs/reference/endpoints/index.md) for middleware and probe caveats.
 
@@ -27,7 +31,7 @@ The current failure response is `418 I'm a teapot`. The target authentication/CO
 
 ## Runtime status
 
-The config-driven runtime is the default streaming authority (cutover); set `RUNTIME_ENABLED=false` (or `0`) to roll a request back to the legacy direct path. Request-path injection detection, config-driven answer thresholds, and regression exit gating are wired, while configurable stage dispatch, reliable SSE cancellation, and evaluator implementations still have gaps. The [system reference](docs/reference/index.md) is the current implementation truth; the [PRD](docs/reference/prd.md) describes the completed target and marks unfinished requirements.
+The config-driven runtime is the request authority for both prompt endpoints. `RUNTIME_ENABLED=false` (or `0`) no longer selects an alternative serving path — it leaves only `/health`, `/ready` and `/greeting` serviceable, since `/agent/stream` and `/v1/chat/completions` both return `503` without the runtime. Request-path injection detection, config-driven answer thresholds, and regression exit gating are wired, while configurable stage dispatch, reliable SSE cancellation, and evaluator implementations still have gaps. The [system reference](docs/reference/index.md) is the current implementation truth; the [PRD](docs/reference/prd.md) describes the completed target and marks unfinished requirements.
 
 ## Config & modularized system prompts
 

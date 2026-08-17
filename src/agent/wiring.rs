@@ -39,7 +39,7 @@
 //! Two shapes from one builder, selected by the `sink` argument:
 //!
 //! - **buffered** (`sink = None`) — every stage runs on one shared buffered
-//!   [`OpenAiLlm`]; nothing is emitted. This backs `/insight`.
+//!   [`OpenAiLlm`]; nothing is emitted. This backs the non-streaming `/v1/chat/completions`.
 //! - **streaming** (`sink = Some(_)`) — every LLM stage runs on a shared [`StreamingOpenAiLlm`], so
 //!   each one's tokens stream live, delimited by the orchestrator's `StageStarted` /
 //!   `StageFinished` events. This backs the SSE path of `/agent/stream`.

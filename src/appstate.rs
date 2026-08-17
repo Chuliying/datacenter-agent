@@ -187,10 +187,11 @@ pub struct AppState {
     ///
     /// `GET /greeting` picks one at random.
     pub greetings: Arc<Mutex<Vec<String>>>,
-    /// Runtime wiring. Active by default (cutover); `RUNTIME_ENABLED=false`
-    /// rolls a request back to the legacy direct path.
+    /// Runtime wiring. Active by default (cutover). `RUNTIME_ENABLED=false` leaves only
+    /// `/health`, `/ready` and `/greeting` serviceable — both prompt endpoints require the
+    /// runtime and return `503` — so the flag no longer selects an alternative path.
     pub runtime: Option<Arc<AppRuntime>>,
-    /// Resolved `/insight` pipeline tool grants (from `[insight.grants]`), validated against the
+    /// Resolved insight-pipeline tool grants (from `[insight.grants]`), validated against the
     /// discovered MCP tool set at boot.
     pub insight_grants: crate::config::InsightGrants,
     /// The `/report` HTML template body (from `[report].template`), shared read-only. Its

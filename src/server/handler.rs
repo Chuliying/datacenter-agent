@@ -165,12 +165,12 @@ impl AgentPort for UnusedAgentPort {
 /// pipeline the resolved intent selects: the report pipeline when a report was
 /// asked for (see [`wants_report_pipeline`]), else the insight pipeline.
 ///
-/// Unlike [`insight_stream`] / [`report_stream`] — which drive one fixed pipeline
-/// directly, bypassing the runtime — this is the routed production path. It reuses
-/// the runtime's [`plan_stream_turn`] prelude verbatim (no duplicated
-/// guardrail/intent logic), then streams the chosen pipeline's rich stage frames
-/// through the same [`insight_frames`] mapping — so the stage-aware SSE contract is
-/// identical — and replicates the runtime turn's two post-stream side effects
+/// This is the only native streaming front door. The retired `insight_stream` /
+/// `report_stream` handlers drove one fixed pipeline directly and bypassed the
+/// runtime; this one reuses the runtime's [`plan_stream_turn`] prelude verbatim (no
+/// duplicated guardrail/intent logic), then streams the chosen pipeline's rich stage
+/// frames through the `insight_frames` mapping — and replicates the runtime turn's
+/// two post-stream side effects
 /// (`ResponseCompleted` / `ResponseFailed` audit + session-memory append).
 ///
 /// Requires the runtime to be enabled (`RUNTIME_ENABLED`, default on); rolled back,

@@ -11,8 +11,29 @@
 | Gate | 結果 |
 |---|---|
 | `cargo fmt --check` | clean |
-| `cargo clippy --all-targets -- -D warnings` | 通過（無 dead_code 警告） |
+| `cargo clippy --all-targets -- -D warnings` | 通過 |
 | `cargo test` | **215 passed / 0 failed / 6 ignored** |
+| `cargo doc --no-deps` | **10 warnings**（parent 為 11）；本次造成的 2 個已修掉 |
+| `bash -n scripts/staging-smoke.sh` | 語法 OK |
+
+### rustdoc 警告的三個時點（`cargo clean --doc` 後實測）
+
+| 時點 | 警告數 | 差異 |
+|---|---|---|
+| parent `2613ef2^` | 11 | 基線 |
+| `2613ef2`（初次提交） | 13 | **+2**：刪掉 `insight_stream` / `report_stream` 後，`agent_stream` doc 裡指向它們的 intra-doc link 斷裂 |
+| review 修正後 | **10** | −3：修掉上述 2 個，另順手拆掉一個既有的 `agent_stream` → private `insight_frames` 連結 |
+
+剩下的 10 個全部 pre-existing：`agent/pipeline.rs` 7（`ConfiguredAgent` ×6、`SchemaTool` ×1）、
+`agent/wiring.rs` 1（`ReportData`）、`server/openai.rs` 1（`map_request` → private
+`is_ignored_role`）、`server/handler.rs` 1（`agent_stream` → private `wants_report_pipeline`）。
+
+> **Gate 教訓（兩個）**
+>
+> 1. 初次提交只跑 fmt / clippy / test，漏了 `cargo doc`——而 fmt / clippy / test
+>    **結構上抓不到 rustdoc lint**。刪除公開項目時必須跑 `cargo doc`。
+> 2. `clippy` 對 `pub` 項目不會發 `dead_code`，所以它不能證明「沒有 pub 死碼」——
+>    AC-003 的證據強度僅限於私有項目。`AppState::generation_config` 就是漏網的例子。
 
 6 個 ignored 全部是既有的 live-network 測試（`--ignored` 才跑，需真 MCP + OpenRouter），
 非本次造成。
@@ -103,20 +124,52 @@ PRD FR-002 的清單沒有列到這個 DTO，屬實作階段發現的連帶死�
 
 ### AC-001 / AC-002 為何只有部分證據
 
-repo 目前**沒有** Router-level oneshot 測試套件——`build_router` 需要完整 `AppState`
-（含 `McpHandle`），這是既有的 coverage gap，已記錄在
-[`endpoints/index.md`](../../reference/endpoints/index.md) 的 Coverage gaps 一節，
-非本次造成。因此「打舊路徑得到 404」與「保留端點行為完全不變」目前靠**移除註冊點 + 型別檢查
-+ 未觸碰保留路徑**佐證，而不是可執行的斷言。
+**更正**：初版報告寫「repo 沒有 Router-level oneshot 測試套件」，這是錯的。
+`src/server/route.rs` 已有兩個用 `tower::ServiceExt::oneshot` 的 Router 測試
+（`per_group_timeout_layers_survive_a_merge`、`openai_timeout_returns_openai_error_envelope`），
+只是它們建的是**合成 router**，不是 `build_router(state)`。
 
-要補齊需啟動本機服務實測（`source ./env` + MCP on :8088，見 memory `local-integration-env`）。
-本次未做，列為待辦。
+真正的阻礙只有一個：`AppState.mcp: McpHandle` 包住私有的 `Peer<RoleClient>`
+（`src/mcp_client.rs`），全 repo 只能透過 live `McpClient::connect_http` 取得——四個使用者
+都是 `--ignored` 的 live 測試。
+
+可行路徑（review 指出，約 50 行、中等成本）：rmcp 0.17 支援 in-memory transport，
+在 process 內起一個 trivial `ServerHandler` 跑在 `tokio::io::duplex` 上、handshake 後取
+`client.handle()`，`AppState` 其餘欄位填 plain data（`runtime: None` 即可——404 fallback
+在任何 handler 與 auth 之前就命中）。本次未做。
+
+因此「打舊路徑得到 404」與「保留端點行為完全不變」目前靠**移除註冊點 + 型別檢查 + 未觸碰保留
+路徑的程式碼**佐證，而不是可執行的斷言。另一條補齊路徑是啟動本機服務實測
+（`source ./env` + MCP on :8088，見 memory `local-integration-env`）。
+
+## Review 修正（Fable subagent，2026-08-17）
+
+review 對 `2613ef2` 提出 7 項，全部驗證屬實並修正：
+
+| # | 問題 | 處置 |
+|---|---|---|
+| 1 | 破壞性變更沒進 release artifact（`CHANGELOG.md` 的 `[Unreleased]` 是空的），而 repo 有 Keep-a-Changelog 慣例（見 `ba3fa5c`、`03136c9`） | 補 `[Unreleased]` 的 `### Removed` / `### Changed`。**版本未 bump**——本 repo 的慣例是獨立的 bump commit，留給發布時處理 |
+| 2 | **我新增了兩個壞掉的 rustdoc 連結**：`handler.rs` 的 `agent_stream` doc 仍以現在式寫 `Unlike [insight_stream] / [report_stream]`，刪掉函式後連結斷裂 | 改寫成過去式、去掉連結括號。實測 13 → 10 warnings（見上方三時點對照） |
+| 3 | src 註解仍斷言存在繞過 prelude 的入口——正是本 commit 聲稱消除的風險：`agent/mod.rs:61,63`、`wiring.rs:42`（我只改了 `:45` 的串流那條，漏了 buffered 那條）、`appstate.rs:190`（`RUNTIME_ENABLED=false` 回退到 legacy path） | 四處全部改寫 |
+| 4 | `scripts/staging-smoke.sh` 已死且無人標記：curl `POST /agent`（404，`-fsS` 會直接中止）、斷言已刪的 `AgentResponse` 形狀（**這就是那個 serde 消費端**）、SSE 白名單只允許 5 種 event 而實際有 9 種 | 改寫：非串流改打 `/v1/chat/completions` 並驗 `chat.completion` envelope、event 白名單補齊 9 種、加 `done` 終局檢查 |
+| 5 | canonical `docs/reference/tests/qa-plan.md` 仍引用本次刪掉的兩個測試（TC-U01 / TC-U02-L）與 2000 cap 當作 evidence | 相關列改為刪除線並註明原因 |
+| 6 | `README.md` 端點清單過期（列 `/agent`、缺 `/v1/chat/completions`），且 Runtime 段仍說 `RUNTIME_ENABLED=false` 回退 legacy path | 更新端點清單 + 加退役說明 + 改寫 Runtime 段 |
+| 7 | `AppState::generation_config`（`appstate.rs:281`）零呼叫端，doc 卻說「retained for the monolith loop's remaining callers」 | **未刪**（pre-existing 死碼，超出本次範圍）；列為待辦 |
+
+review 同時確認為正確的部分：刪除的每個符號都真的不可達（含 `tests/`、`src/bin/eval.rs`）、
+保留的每個符號都真的還在用（含 `InsightGrants.charter`、`report_template`、`PromptBank.agent_system`
+由 eval runner 使用）、`/agent/stream` 除 import 與 503 字串外無任何非註解變更、report pipeline
+從兩個保留端點都仍可達、`agent-stream.md` 的 9 種 frame 表與 `dto.rs` 逐項相符、
+404-before-auth 成立、`plan_stream_turn` 恰好兩個呼叫點。
 
 ## 待辦
 
 1. **FR-004 falcon-client** — `callAgent` / `submitRestRequest` / `nodes/route.ts` 的 POST /
    `NEXT_PUBLIC_COS_STREAMING` flag，以及 7 處文件（清單見 PRD FR-004）。跨 repo，需另外確認。
 2. **AC-001 / AC-002 端到端實測** — 起本機服務確認舊路徑 404、保留端點正常。
-3. FU-002 `insight_frames` / `INSIGHT_STREAM_BUFFER` 更名（本次刻意不做）。
-4. FU-003 `RUNTIME_ENABLED` flag 存廢（本次只修正文件敘述）。
-5. `docs/reference/` 的 `prd.md` / `spec/spec.md` / `tests/qa-plan.md` 仍為 v1.3.0 視角。
+3. **`AppState::generation_config` 是零呼叫端的 pub 死碼**（`appstate.rs:281`，pre-existing）。
+   `clippy` 不會對 pub 項目發 `dead_code`，所以沒被 gate 抓到。
+4. 版本 bump 到 `0.4.0`（pre-1.0 破壞性變更 → minor）留給發布 commit，依 repo 慣例。
+5. FU-002 `insight_frames` / `INSIGHT_STREAM_BUFFER` 更名（本次刻意不做）。
+6. FU-003 `RUNTIME_ENABLED` flag 存廢（本次只修正文件敘述）。
+7. `docs/reference/` 的 `prd.md` 與 `spec/spec.md` 仍為 v1.3.0 視角（`spec.md` 還有 `POST /agent` 路由表與 2000 cap 列）。`qa-plan.md` 本次已修正被刪測試的引用。
