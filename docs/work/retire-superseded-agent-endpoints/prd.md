@@ -293,3 +293,15 @@ UI: N/A（`has_ui=false`）。falcon 端 FR-004 移除的是非預設的 code pa
 | Non-blocking | 刪除後 `RUNTIME_ENABLED=false` 只剩 `/health`、`/ready`、`/greeting` 可用，該 flag 實質失去 rollback 意義。 |
 | 選項 | A: 本次只修正文件敘述，保留 flag／ B: 一併移除 flag 與 legacy 組裝路徑 |
 | 決定 | **A**。移除 flag 會動到 `AppState` 組裝與啟動路徑，超出本次範圍（已列 Out of scope）。Owner: Runtime；與 plan §9 同批處理。 |
+
+## Delivery
+
+| 項目 | 內容 |
+|---|---|
+| Candidate | PR [#11](https://github.com/h-alice/datacenter-agent/pull/11)，branch `codex/retire-superseded-agent-endpoints` |
+| Release | 2026-08-19 merge 進 `main`，merge commit `7aa2af1d364fd0cf45f1c04cc5d67f1087551cd5`（by h-alice） |
+| PRD 偏離 | **無**。FR-001～FR-004 全數依 PRD 執行；FU-002 / FU-003 依附件的決定刻意不做，屬 PRD 已載明的 Out of scope。 |
+| 提升為長期資產 | `docs/reference/endpoints/`、`docs/reference/spec/spec.md`、`docs/reference/prd.md` 已同步退役後的現況（`spec.md` 與 `prd.md` 的 v1.3.0 殘留以刪除線標記）。 |
+| 最終證據 | [`implement-report.md`](./implement-report.md) — `cargo fmt` clean · `clippy -D warnings` 通過 · `cargo test` 215 passed / 0 failed · CI `rust` job pass |
+| 遺留 gate | **AC-001 / AC-002 沒有 route-level 404 斷言**。`build_router` 需要完整 `AppState`（含只能經 live connect 取得的 `McpHandle`），可行解法是 rmcp in-memory transport + `tokio::io::duplex`（約 50 行），本次未做。這是缺一個測試，不是交付未完成。 |
+| 下游 | falcon-client `8a20c46` 已 push 為 `origin/refactor/retire-nonstreaming-rest`，PR 待開。與本次無上線順序依賴——falcon 打的 `POST /agent` 自 `ea2bcef` 起已 404 五週。 |

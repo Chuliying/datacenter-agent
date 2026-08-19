@@ -13,7 +13,12 @@
 |---|---|---|---|---|---|---|
 | [eval-evaluator-registry-fix](./eval-evaluator-registry-fix/prd.md) | feature | runtime | eval | team-feature | PRD ready | — |
 | [evidence-pack-skillpackage-finalllmport](./evidence-pack-skillpackage-finalllmport/prd.md) | feature | runtime | evidence | team-feature | PRD ready | — |
-| [retire-superseded-agent-endpoints](./retire-superseded-agent-endpoints/prd.md) | refactor | server | endpoints | refactor | implement done | [PR #11](https://github.com/h-alice/datacenter-agent/pull/11) open；AC-001/AC-002 端到端實測未做 |
+
+## Completed（保留在原地，尚未 archive）
+
+| Work item | Type | Surface | Area | Delivery | 遺留 gate |
+|---|---|---|---|---|---|
+| [retire-superseded-agent-endpoints](./retire-superseded-agent-endpoints/prd.md) | refactor | server | endpoints | [PR #11](https://github.com/h-alice/datacenter-agent/pull/11) merged `7aa2af1` | AC-001/AC-002 缺 route-level 404 斷言（見 prd.md `## Delivery`） |
 
 ## Archive
 
