@@ -160,7 +160,7 @@ client 端死碼，沒有跨 repo 的發布順序依賴。
 
 | AC | 狀態 | 證據 |
 |---|---|---|
-| AC-001 四條端點不再存在 | **部分** | route 註冊點已移除（`route.rs` 僅 5 條）、handler 已刪、編譯通過。**但無 route-level 404 斷言** |
+| AC-001 四條端點不再存在 | **部分** | route 註冊點已移除（`route.rs` 僅 5 條）、handler 已刪、編譯通過。2026-08-19 補 [`tests/route_contract.rs`](../../../tests/route_contract.rs)：四條退役路徑不得重新註冊、存活路徑恰為五條。**仍無 HTTP 層 404 斷言** |
 | AC-002 保留端點行為不變 | **部分** | 未觸碰 `agent_stream` / `chat_completions` / `greeting` / `health` / `ready` 的任何程式碼；215 tests 全過（含 `wants_report_pipeline`、`insight_frames`、openai mapping 等既有斷言）。**無端到端驗證** |
 | AC-003 沒有殘留死碼 | **PASS** | `clippy --all-targets -- -D warnings` 通過、`cargo test` 全過 |
 | AC-004 guardrail 覆蓋率完整 | **PASS** | route 表僅 `/agent/stream` 與 `/v1/chat/completions` 吃 prompt，兩者都呼叫 `plan_stream_turn`（`handler.rs` 內僅此兩處建立 `AuditWriter`） |
@@ -208,10 +208,12 @@ review 同時確認為正確的部分：刪除的每個符號都真的不可達�
 
 ## 待辦
 
-1. **AC-001 / AC-002 端到端實測** — 起本機服務確認舊路徑 404、保留端點正常。
+1. **AC-001 部分完成** — `tests/route_contract.rs` 已釘住 route 表（四條退役路徑不得重新註冊、
+   存活路徑恰為五條）。仍缺 HTTP 層的 404 斷言與 AC-002 的 SSE 序列比對，兩者都需要 live 服務
+   或為 rmcp `server` feature 加 dev-dependency，見 prd.md `## Delivery` 的遺留 gate 欄。
 2. **`AppState::generation_config` 是零呼叫端的 pub 死碼**（`appstate.rs:281`，pre-existing）。
    `clippy` 不會對 pub 項目發 `dead_code`，所以沒被 gate 抓到。
-3. 版本 bump 到 `0.4.0`（pre-1.0 破壞性變更 → minor）留給發布 commit，依 repo 慣例。
+3. ~~版本 bump 到 `0.4.0`~~ **已完成**：Cargo.toml / Cargo.lock、CHANGELOG 切出 `[0.4.0] - 2026-08-19`、`docs/reference/index.md` 的 crate 版本列同步。
 4. FU-002 `insight_frames` / `INSIGHT_STREAM_BUFFER` 更名（本次刻意不做）。
 5. FU-003 `RUNTIME_ENABLED` flag 存廢（本次只修正文件敘述）。
 6. `docs/reference/` 的 `prd.md` 與 `spec/spec.md` 仍為 v1.3.0 視角（`spec.md` 還有 `POST /agent` 路由表與 2000 cap 列）。`qa-plan.md` 本次已修正被刪測試的引用。

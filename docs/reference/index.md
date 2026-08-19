@@ -27,7 +27,7 @@
 
 | 項目 | 現況 |
 |---|---|
-| crate / 版本 | `datacenter-agent` `0.3.0` |
+| crate / 版本 | `datacenter-agent` `0.4.0` |
 | HTTP / async | axum 0.8 · tokio 1 |
 | MCP / LLM | rmcp 0.17 client · async-openai 0.40 · OpenRouter |
 | 對外端點 | 5 條（4 條 standard + OpenAI 相容 `/v1/chat/completions`） |
