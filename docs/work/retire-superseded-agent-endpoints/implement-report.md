@@ -133,6 +133,12 @@ lint-staged / console.log / secrets / 文件結構）全過。
 falcon 工作樹另有 155 個**無關**的未提交變更（skills submodule 同步、zip、flow-map 等），
 只 stage 了本次的 12 個檔案，未混入。
 
+**交付狀態（2026-08-19 查證）**：`8a20c46` **仍未 push**，只存在於本機 `chat-bot`
+（`git branch -r --contains 8a20c46` 為空；`chat-bot` 相對 `origin/dev` 是 ahead 1 /
+behind 173）。falcon 端沒有對應 PR。本 repo 這側已在 PR #11 上。也就是說 FR-004 的
+程式碼已完成但尚未進入 falcon 的交付流程，兩邊的上線順序仍待處理——upstream 端點消失
+會讓還在用舊 REST 路徑的 falcon 版本壞掉，若 falcon 落後於本 repo 發布即成事故。
+
 ### 全 repo 測試的 4 個既有失敗
 
 `src/__tests__/features/menu-access-control.test.ts` 有 4 個失敗，**與本變更無關**：
