@@ -38,7 +38,7 @@
 
 | AC | Current contract | Automated evidence | Coverage verdict |
 |---|---|---|---|
-| AC-001 | legacy cap 2000；runtime cap 4000；runtime SSE error frame | legacy helper test + runtime input_guard 4000/4001/2001 tests | **partial**：沒有 Router-level REST/SSE status test |
+| AC-001 | 單一 cap 4000（runtime prelude） | runtime input_guard 4000/4001 tests | **partial**：沒有 Router-level status test。~~legacy cap 2000~~ 已隨 `/insight`/`/report` 端點退役移除 |
 | AC-002 | runtime intent.resolved → token → done | `orchestrator::streams_intent_resolved_then_tokens_then_done` | **partial**：fake AgentPort；真 provider transport test仍缺 |
 | AC-003 | runtime 預設 on；false/0 rollback 且壞 config 不阻擋 legacy | `appstate::runtime_enabled_env_defaults_on_with_explicit_rollback`、`explicit_rollback_skips_invalid_runtime_config` | **covered at component level** |
 | AC-004 | config 可調部分領域資料/元件，但不是任意 stage dispatch | config/registry tests | **partial**：builder existence 不等於 production request wiring |
@@ -60,8 +60,8 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 | TC | Source | Evidence boundary |
 |---|---|---|
-| TC-U01 | `handler::prompt_validation_rejects_empty_prompt` | legacy validation helper |
-| TC-U02-L | `handler::prompt_validation_preserves_existing_2000_char_cap` | legacy 2000/2001 |
+| ~~TC-U01~~ | ~~`handler::prompt_validation_rejects_empty_prompt`~~ | **已刪除**：handler 版 `validate_prompt` 隨端點退役移除；空 prompt 現由 prelude 的 `input_guard` 擋 |
+| ~~TC-U02-L~~ | ~~`handler::prompt_validation_preserves_existing_2000_char_cap`~~ | **已刪除**：2000-char cap 不再存在 |
 | TC-U02-R1 | `input_guard::accepts_prompt_at_runtime_limit` | runtime config limit 4000 |
 | TC-U02-R2 | `input_guard::rejects_prompt_over_runtime_limit` | runtime 4001 rejects |
 | TC-U02-R3 | `input_guard::accepts_approved_2001_char_parity_diff` | runtime 明確接受 2001 |
@@ -158,8 +158,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 | Boundary | Current expected behavior | Automated evidence | Status |
 |---|---|---|---|
-| legacy 2000 | accepted | legacy helper test | covered at unit level |
-| legacy 2001 | HTTP helper error | legacy helper test | no Router test |
+| ~~legacy 2000/2001~~ | — | — | **已移除**：cap 收斂為 runtime 單一來源 4000 |
 | runtime 4000 | accepted | input_guard test | no handler test |
 | runtime 4001 | runtime error | input_guard test | no REST/SSE status test |
 | runtime 2001 | accepted | explicit parity-diff test | covered |

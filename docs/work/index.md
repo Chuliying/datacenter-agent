@@ -1,19 +1,31 @@
 # Work Items
 
 本目錄放單一變更的 durable workflow artifacts。每個 work item 使用同一個
-`<slug>/` 目錄保存 PRD、spec、QA、實作報告與驗收報告；分類透過
-`meta.yml` 的 `type`、`surface`、`area` 欄位提供，不把同一個 work item
+`<slug>/` 目錄保存 PRD、spec、QA、實作報告與驗收報告，不把同一個 work item
 拆散到 `prd/`、`spec/`、`qa/` 等不同目錄。
+
+`meta.yml` 自 `work-item/v3` 起只收 schema 定義的欄位，`type` / `surface` / `area`
+這類分類欄位已不再由 `meta.yml` 承載，改由本索引的表格提供。
 
 ## Active
 
-| Work item | Type | Surface | Area | Current stage | Source |
-|---|---|---|---|---|---|
-| [eval-evaluator-registry-fix](./eval-evaluator-registry-fix/prd.md) | feature | runtime | eval | PRD ready | `docs/work/eval-evaluator-registry-fix/meta.yml` |
-| [evidence-pack-skillpackage-finalllmport](./evidence-pack-skillpackage-finalllmport/prd.md) | feature | runtime | evidence | PRD ready | `docs/work/evidence-pack-skillpackage-finalllmport/meta.yml` |
+| Work item | Type | Surface | Area | Execution mode | Current stage | Delivery |
+|---|---|---|---|---|---|---|
+| [eval-evaluator-registry-fix](./eval-evaluator-registry-fix/prd.md) | feature | runtime | eval | team-feature | PRD ready | — |
+| [evidence-pack-skillpackage-finalllmport](./evidence-pack-skillpackage-finalllmport/prd.md) | feature | runtime | evidence | team-feature | PRD ready | — |
+| [retire-superseded-agent-endpoints](./retire-superseded-agent-endpoints/prd.md) | refactor | server | endpoints | refactor | implement done | [PR #11](https://github.com/h-alice/datacenter-agent/pull/11) open；AC-001/AC-002 端到端實測未做 |
+
+## Archive
+
+`_archive/` 保存已交付、不再變動的 work item（整份搬入，不拆檔）。
+
+| Work item | Type | Surface | Area | Delivery |
+|---|---|---|---|---|
+| [agentgateway-openai-endpoint](./_archive/agentgateway-openai-endpoint/prd.md) | feature | server | endpoints | [PR #9](https://github.com/h-alice/datacenter-agent/pull/9) merged（v0.3.0） |
 
 ## Maintenance Rules
 
-- `docs/work/<slug>/meta.yml` is the owner for status and stage state.
+- `docs/work/<slug>/meta.yml` is the owner for work status, delivery status and stage state.
+- Validate with `bash .agent/skills/_shared/scripts/work-items.sh check`.
 - Promote long-lived facts to `docs/reference/`; keep work-specific history here.
-- New work items follow `.agent/skills/_shared/ARTIFACTS.md` v2.
+- New work items follow `.agent/skills/_shared/ARTIFACTS.md` and declare `schema_version: work-item/v3`.

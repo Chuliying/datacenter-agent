@@ -38,8 +38,13 @@ startup 由 `main.rs` 載入 top-level config、連 MCP、建立 AppState、啟�
 | GET | `/health` | `health` | required | 64 KiB layer | 120s |
 | GET | `/ready` | `ready` | required | 64 KiB layer | 120s |
 | GET | `/greeting` | `greeting` | required | 64 KiB layer | 120s |
-| POST | `/agent` | `agent` | required | 64 KiB | 120s |
+| ~~POST~~ | ~~`/agent`~~ | ~~`agent`~~ | — | — | **已移除**（`ea2bcef`） |
 | POST | `/agent/stream` | `agent_stream` | required | 64 KiB | 只限制建立 Response 前的 handler future |
+| POST | `/v1/chat/completions` | `chat_completions` | required | 64 KiB | 同 `/agent/stream` |
+
+> 本表是 v1.3.0 視角的殘留。**現況路由表以 [`../endpoints/index.md`](../endpoints/index.md)
+> 為準**（退役 `/insight`、`/insight/stream`、`/report`、`/report/stream` 後共 5 條，
+> 見 `src/server/route.rs:107-125`）。
 
 middleware 另含 trace、`CorsLayer::very_permissive()`、compression、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`。Bearer 失敗回 418 JSON，不使用 401 challenge。
 
@@ -105,8 +110,8 @@ data: {"event":"error","data":"..."}
 
 | Path | Limit source | Current cap | 空／超長的外部行為 |
 |---|---|---:|---|
-| legacy `/agent` | `USER_PROMPT_LENGTH_CAP` | 2000 | HTTP 400 |
-| legacy `/agent/stream` | same helper | 2000 | HTTP 400 before SSE |
+| ~~legacy `/agent`~~ | ~~`USER_PROMPT_LENGTH_CAP`~~ | ~~2000~~ | **已移除**：cap 收斂為 runtime 單一來源 4000 |
+| ~~legacy `/agent/stream`~~ | ~~same helper~~ | ~~2000~~ | **已移除**：同上 |
 | runtime `/agent` | `thresholds.input.max_prompt_chars` | 4000 | `AgentTurnOutcome::Error{status:400}` → HTTP 400 |
 | runtime `/agent/stream` | same runtime guard | 4000 | handler 已回 SSE Response；送 `error` frame，HTTP 200 |
 

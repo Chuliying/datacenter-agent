@@ -65,7 +65,8 @@ async fn handle_openai_middleware_error(err: BoxError) -> Response {
         .into_response()
 }
 
-/// 64 KiB. Defense-in-depth above the per-field 2 000-char prompt cap.
+/// 64 KiB. Defense-in-depth above the runtime prelude's per-field prompt cap
+/// (`thresholds.input.max_prompt_chars`).
 const REQUEST_BODY_LIMIT: usize = 64 * 1024;
 
 /// 120 s. The slow path is the LLM round-trip.
@@ -94,16 +95,18 @@ pub fn build_router(state: AppState) -> Router {
             HeaderValue::from_static("no-referrer"),
         ));
 
-    // The seven original endpoints: standard 120 s timeout, `require_bearer` (D6, `418` on a bad
+    // The four standard endpoints: standard 120 s timeout, `require_bearer` (D6, `418` on a bad
     // token). Auth + timeout are applied to this sub-router so they stay scoped to these routes.
+    //
+    // `/insight`, `/insight/stream`, `/report` and `/report/stream` were retired: `/agent/stream`
+    // reaches both sub-agent pipelines through intent routing (see `wants_report_pipeline`), so the
+    // forced-pipeline variants were redundant — and they were the only prompt entry points that
+    // bypassed the runtime prelude (no guardrails, no audit). Callers use `/agent/stream`
+    // (streaming) or `/v1/chat/completions` (non-streaming).
     let standard = Router::new()
         .route("/health", get(handler::health))
         .route("/ready", get(handler::ready))
         .route("/greeting", get(handler::greeting))
-        .route("/insight", post(handler::insight))
-        .route("/insight/stream", post(handler::insight_stream))
-        .route("/report", post(handler::report))
-        .route("/report/stream", post(handler::report_stream))
         .route("/agent/stream", post(handler::agent_stream))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
@@ -117,7 +120,7 @@ pub fn build_router(state: AppState) -> Router {
     // OpenAI-compatible endpoint (agentgateway Path C): longer timeout for the full-pipeline
     // non-streaming path (finding #1), and a dedicated bearer gate that rejects with `401` + the
     // OpenAI error envelope rather than `418` (finding #6). The shared `require_bearer` (and its
-    // D6 contract for the seven endpoints above) is left untouched.
+    // D6 contract for the standard endpoints above) is left untouched.
     let openai = Router::new()
         .route("/v1/chat/completions", post(handler::chat_completions))
         // `HandleErrorLayer` (outer) catches the `tower::timeout` layer's `Elapsed` error and turns

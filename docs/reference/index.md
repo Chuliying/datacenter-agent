@@ -1,8 +1,15 @@
 # datacenter-agent 現況參考（Documentation Source of Truth）
 
 > **文件類型**：documentation source of truth。PRD 定義完成後的 target state 並逐項標建置狀態；Spec、QA、endpoint 與 module 頁描述目前 worktree。  
-> **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
+> **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/agent/`](../../src/agent/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
 > **對應版本**：PRD v1.3.0 · Spec v1.3.0 · QA v1.3.0（2026-06-30）
+>
+> **⚠ 同步狀態**：endpoints/、modules/ 已於 2026-08-17 依實際程式碼校正兩次——先補上 sub-agent
+> 層與 `/v1/chat/completions`，再依 work item
+> [`retire-superseded-agent-endpoints`](../work/retire-superseded-agent-endpoints/prd.md)
+> 移除已退役的 `/insight`、`/insight/stream`、`/report`、`/report/stream`（以及更早移除的
+> `POST /agent`）。
+> `prd.md`、`spec/spec.md`、`tests/qa-plan.md` **尚未**同步，仍停在 v1.3.0 的視角。
 
 ## 1. 文件權威與邊界
 
@@ -20,11 +27,13 @@
 
 | 項目 | 現況 |
 |---|---|
-| crate / 版本 | `datacenter-agent` `0.1.1` |
-| HTTP / async | axum 0.8.9 · tokio 1.52.3 |
-| MCP / LLM | rmcp 0.17.0 client · async-openai 0.40.3 · OpenRouter |
-| 預設請求路徑 | runtime `run_agent_turn`；只有明確 `RUNTIME_ENABLED=false/0` 才 rollback 到 legacy |
-| runtime 現況 | partial；orchestrator、memory、audit、injection、answer policy 已接線，stage dispatch 與 evaluator semantics 等仍不完整 |
+| crate / 版本 | `datacenter-agent` `0.3.0` |
+| HTTP / async | axum 0.8 · tokio 1 |
+| MCP / LLM | rmcp 0.17 client · async-openai 0.40 · OpenRouter |
+| 對外端點 | 5 條（4 條 standard + OpenAI 相容 `/v1/chat/completions`） |
+| 主要編排 | [sub-agent pipeline](./modules/agent.md)（fetcher → analyst → charter/composer → finalizer/renderer） |
+| prompt 入口 | `/agent/stream`、`/v1/chat/completions`，**兩者都經過 prelude**——不存在無 guardrail 入口 |
+| runtime 現況 | partial；prelude（guardrails、intent、answer policy、memory、audit）已接線並覆蓋全部 prompt 入口。完整的 `run_agent_turn` 連同 `AgentPort` 仍 dormant，production 只走同步前段 `plan_stream_turn` |
 
 ## 3. 導覽
 
@@ -43,8 +52,10 @@
 ## 4. 啟動與組裝（top-level 接線）
 
 - [`src/main.rs`](../../src/main.rs)：讀 CLI/env/config、連 MCP、建立 AppState/Router、啟動 server。
-- [`src/appstate.rs`](../../src/appstate.rs)：持有 MCP handle、tools、LLM defaults、prompts、auth token、greetings 與 optional `AppRuntime`。
-- [`src/config.rs`](../../src/config.rs)：解析 top-level config 與相對檔案路徑。
+- [`src/appstate.rs`](../../src/appstate.rs)：持有 MCP handle、tools、LLM defaults、`PromptBank`、
+  auth token、greetings、`InsightGrants`、boot 載入的 `report_template`，與 optional `AppRuntime`。
+- [`src/config.rs`](../../src/config.rs)：解析 top-level config 與相對檔案路徑；含
+  `[insight.grants]` → `InsightGrants`（改 tool grant 不需重新編譯）。
 - `AppState::new` 先解析 `RUNTIME_ENABLED`；明確 `false/0` 時跳過 runtime config/build，其他值（含未設）必須有 `[runtime]` 並組裝 `AppRuntime`，缺失則 fail-fast。
 
 ## 5. 維護規則

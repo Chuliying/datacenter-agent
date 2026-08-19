@@ -125,7 +125,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 
 完成樣貌：
 
-- legacy compatibility cap 保持 2000 Unicode chars。
+- ~~legacy compatibility cap 保持 2000 Unicode chars。~~ **已移除**：`USER_PROMPT_LENGTH_CAP` 隨 `/insight`、`/report` 端點退役一併刪除，cap 收斂為 runtime 單一來源。
 - runtime cap 由 capability config 決定，EV pack 預設 4000 chars。
 - 同一路徑的 REST/SSE 使用相同 cap，且結構錯誤都在 streaming 前回 400。
 - body >64 KiB 保留 extractor/middleware 的 413，不被統一轉成 400。

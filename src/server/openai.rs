@@ -18,7 +18,7 @@
 //! (OpenAI-compatible LLM backend) while `/agent/stream` and its rich SSE
 //! events stay unchanged. The wire shape here is standard OpenAI; internally we
 //! map onto the existing [`AgentRequest`] and drive the same runtime prelude +
-//! sub-agent pipeline. See `docs/work/agentgateway-openai-endpoint/spec.md`.
+//! sub-agent pipeline. See `docs/work/_archive/agentgateway-openai-endpoint/spec.md`.
 
 use serde::{Deserialize, Deserializer, Serialize};
 

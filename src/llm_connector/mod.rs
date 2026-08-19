@@ -16,9 +16,11 @@
 //!
 //! The single entry point is the agentic loop, exposed as two functions:
 //! - [`agent_stream`]: drive the tool-calling loop, streaming the final answer
-//!   token-by-token (used by the legacy `/report/stream` path and the runtime turn).
-//! - [`generate`]: run the same loop and await the whole Markdown reply (used
-//!   by the legacy `/report` path and the greeting generator).
+//!   token-by-token. No production caller: its only direct reference is the runtime turn's
+//!   `LlmAgentPort`, which is never constructed — but [`generate`] wraps it, so the loop still
+//!   runs under eval.
+//! - [`generate`]: run the same loop and await the whole Markdown reply. Used only by the eval
+//!   runner; the HTTP endpoints and the greeting generator moved to the sub-agent layer.
 
 mod agent;
 mod client;

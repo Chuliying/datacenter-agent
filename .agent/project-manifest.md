@@ -8,7 +8,19 @@
 
 - submodule_path: .agent/skills/_shared
 - platforms: claude-code, codex
-- profile: team-sprint optional
+- delivery_mode: team-sprint
+- capability_packs: optional
+
+版本由 submodule gitlink 釘住（`git submodule status` 會印出 `git describe` 結果，目前為
+`v0.9.0-1-g643253b`，即 v0.9.0 之後一個未發版 commit），不另存版本號欄位以免與 gitlink 兩處不一致。
+首次 clone 後、或 gitlink 變更後執行：
+
+```bash
+git submodule update --init .agent/skills/_shared
+bash .agent/skills/_shared/bootstrap/onboard.sh
+```
+
+`CLAUDE.md`、`AGENTS.md`、`.claude/` 與 `.codex/skills/` 皆由 `onboard.sh` 產生，不入版控。
 
 ## Skill Roots
 

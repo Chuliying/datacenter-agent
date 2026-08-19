@@ -58,10 +58,12 @@
 //! - [`wiring`] — the production assembly ([`build_insight_pipeline`](wiring::build_insight_pipeline),
 //!   [`build_report_pipeline`](wiring::build_report_pipeline)) that turns the boot-discovered MCP
 //!   tools + the LLM defaults into a runnable [`Orchestrator`](engine::Orchestrator) behind the
-//!   `/insight` + `/report` handlers.
+//!   `/agent/stream` + `/v1/chat/completions` handlers.
 //!
-//! The `/insight` endpoints drive [`wiring`] directly (bypassing the runtime turn); routing the
-//! pipeline *behind* the runtime `AgentPort` is the plan's §9 step.
+//! Both handlers run the runtime prelude (guardrails / intent / answer policy / memory / audit)
+//! *before* driving [`wiring`], so no prompt reaches this layer unguarded. But they still call
+//! [`wiring`] directly rather than through the runtime `AgentPort`; routing the pipeline *behind*
+//! that port is the plan's §9 step.
 //!
 //! # References
 //!
