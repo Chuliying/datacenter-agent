@@ -2,7 +2,7 @@
 
 **Slug**: `retire-superseded-agent-endpoints`
 **版本**: v1.0.0
-**狀態**: awaiting-approval
+**狀態**: approved（v1.0.0 由使用者於 2026-08-17 核准並授權進入 implement）
 **Execution Mode**: `refactor`（PRD required · Spec optional → 不產出 · qa-plan absent）
 
 ## 0. Context

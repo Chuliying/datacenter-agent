@@ -2,7 +2,7 @@
 
 > ← [Endpoints](./index.md)  
 > **Source**：[`src/server/openai.rs`](../../../src/server/openai.rs)（DTO + mapping）、[`src/server/handler.rs`](../../../src/server/handler.rs) `chat_completions` / `openai_buffered_response` / `openai_stream_response` / `fold_history_into_prompt`、[`src/server/auth.rs`](../../../src/server/auth.rs) `require_bearer_openai`、[`src/server/route.rs`](../../../src/server/route.rs)  
-> **交付紀錄**：[`docs/work/agentgateway-openai-endpoint/`](../../work/agentgateway-openai-endpoint/spec.md)（spec D1–D9、qa-report findings）
+> **交付紀錄**：[`docs/work/_archive/agentgateway-openai-endpoint/`](../../work/_archive/agentgateway-openai-endpoint/spec.md)（spec D1–D9、qa-report findings）
 
 OpenAI 相容端點，讓本服務能被註冊成 **agentgateway Path C**（OpenAI-compatible LLM backend），
 同時 [`/agent/stream`](./agent-stream.md) 及其豐富 SSE 事件維持不變。
