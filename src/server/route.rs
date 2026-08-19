@@ -138,12 +138,30 @@ pub fn build_router(state: AppState) -> Router {
 
     // The body limit + shared middleware wrap both groups; each group already carries its own
     // timeout and auth from above.
+    //
+    // `.fallback` is set on the **outer** router, after both merges, on purpose. `Router::merge`
+    // carries a sub-router's fallback across with it, so without this the merged fallback was the
+    // OpenAI group's — wrapped in that group's `require_bearer_openai`. Unmatched paths were
+    // therefore auth-checked before being rejected, and answered `401` without a token but `404`
+    // with a valid one: any path became an oracle for "is this token valid?", and the retired
+    // paths' response depended on the `Authorization` header (AC-001 forbids exactly that). Set
+    // here, the fallback sits outside both groups' auth layers, so every unmatched path answers a
+    // uniform `404`.
     Router::new()
         .merge(standard)
         .merge(openai)
+        .fallback(unmatched_path)
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .layer(shared)
         .with_state(state)
+}
+
+/// Uniform `404` for every unmatched path, independent of the `Authorization` header.
+///
+/// Deliberately body-less: a body here would be the only response shape not owned by either
+/// endpoint group, and it would have to pick between the plain and the OpenAI error envelope.
+async fn unmatched_path() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 #[cfg(test)]
@@ -239,5 +257,127 @@ mod tests {
             v["error"]["message"].is_string(),
             "envelope must carry a message string, got {v}"
         );
+    }
+
+    /// The four retired paths, and the header states AC-001 requires to be indistinguishable.
+    const RETIRED_PATHS: [&str; 4] = ["/insight", "/insight/stream", "/report", "/report/stream"];
+
+    /// AC-001: `POST` to a retired path answers `404`, and the answer does not depend on the
+    /// `Authorization` header.
+    ///
+    /// The second half is the part that matters for disclosure: auth is layered onto the
+    /// sub-routers, so a path that matches no route never reaches it. If a future change hangs auth
+    /// off the outer router instead, an unauthenticated probe would start seeing `418` while an
+    /// authenticated one saw `404` — that difference tells an attacker whether a token is valid.
+    /// Asserting both header states pins the ordering, not just the status code.
+    #[tokio::test]
+    async fn retired_paths_return_404_regardless_of_authorization() {
+        let (state, _mcp) = crate::test_support::app_state().await;
+        let app = build_router(state);
+
+        for path in RETIRED_PATHS {
+            for authorization in [
+                None,
+                Some(format!("Bearer {}", crate::test_support::TEST_TOKEN)),
+                Some("Bearer definitely-not-the-token".to_string()),
+            ] {
+                let mut request = Request::builder().method("POST").uri(path);
+                if let Some(value) = &authorization {
+                    request = request.header("authorization", value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{path} was retired, so it must answer 404 \
+                     (authorization: {authorization:?})"
+                );
+            }
+        }
+    }
+
+    /// The surviving paths must not be caught by the same `404` — otherwise the test above would
+    /// still pass on a router that lost every route.
+    #[tokio::test]
+    async fn surviving_paths_are_still_routed() {
+        let (state, _mcp) = crate::test_support::app_state().await;
+        let app = build_router(state);
+
+        // `/health` is unauthenticated in intent but sits behind the standard group's bearer gate,
+        // so a valid token is sent. The assertion is deliberately only "not 404": this test pins
+        // routing, and the handlers' own behaviour is covered elsewhere.
+        for (method, path) in [
+            ("GET", "/health"),
+            ("GET", "/ready"),
+            ("GET", "/greeting"),
+            ("POST", "/agent/stream"),
+            ("POST", "/v1/chat/completions"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(
+                            "authorization",
+                            format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                        )
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} survived the retirement and must still be routed"
+            );
+        }
+    }
+
+    /// The same uniformity, generalised past the four retired paths.
+    ///
+    /// The fallback fix is not specific to them: before it, *any* unmatched path answered `401`
+    /// unauthenticated and `404` with a valid token, which let an unauthenticated caller test a
+    /// token's validity without touching a real endpoint. This pins the general property so the
+    /// oracle cannot come back through a path nobody thought to enumerate.
+    #[tokio::test]
+    async fn unmatched_paths_do_not_leak_token_validity() {
+        let (state, _mcp) = crate::test_support::app_state().await;
+        let app = build_router(state);
+
+        for path in ["/", "/v1/models", "/nope", "/agent", "/agent/stream/extra"] {
+            let mut statuses = Vec::new();
+            for authorization in [
+                None,
+                Some(format!("Bearer {}", crate::test_support::TEST_TOKEN)),
+                Some("Bearer definitely-not-the-token".to_string()),
+            ] {
+                let mut request = Request::builder().method("POST").uri(path);
+                if let Some(value) = &authorization {
+                    request = request.header("authorization", value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::from("{}")).unwrap())
+                    .await
+                    .unwrap();
+                statuses.push(response.status());
+            }
+
+            assert!(
+                statuses.iter().all(|status| *status == statuses[0]),
+                "{path} answered differently depending on the Authorization header \
+                 ({statuses:?}), which leaks whether a token is valid"
+            );
+        }
     }
 }

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - 2026-08-19
 
+### Fixed
+
+- Unmatched paths no longer reveal whether a bearer token is valid. `Router::merge` carries a
+  sub-router's fallback with it, so the merged fallback was the OpenAI group's — wrapped in that
+  group's auth layer. Any unmatched path therefore answered `401` without a token and `404` with a
+  valid one, which made every path an oracle for token validity and made the retired paths' response
+  depend on the `Authorization` header. An explicit outer `fallback` now answers a uniform `404`.
+  Found by the first router-level test to reach the assembled router (see below).
+
+### Added
+
+- `src/test_support.rs`: test-only fixtures that stand a stub MCP server up over
+  `tokio::io::duplex`, so tests can build a real `AppState` and serve `build_router` without a live
+  MCP server. Behind `[dev-dependencies]`; the shipped binary still depends on rmcp as an HTTP
+  client only.
+
 ### Removed
 
 - **BREAKING**: Retired `POST /insight`, `POST /insight/stream`, `POST /report` and

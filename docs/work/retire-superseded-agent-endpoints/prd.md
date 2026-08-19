@@ -98,6 +98,10 @@
 
 - 刪除後對四條舊路徑的請求回 `404`（axum 預設 fallback），且**不經過** auth layer——
   因此不會洩漏「token 是否正確」的資訊。
+  > **實作註（2026-08-19）**：「axum 預設 fallback」這個假設是錯的，也正是本需求一度未被滿足的
+  > 原因。`Router::merge` 會把 sub-router 的 fallback 一併帶過來，所以外層拿到的是 OpenAI group
+  > 的 fallback——連同它的 auth layer。未命中路徑因此不帶 token 回 `401`、帶正確 token 回 `404`。
+  > 已改為在外層設顯式 `fallback`（`route.rs` 的 `unmatched_path`）並加 Router 層測試。
 - `route.rs:97` 的註解「The seven original endpoints」本已過期（實際 8 條），須一併修正為實際數字。
 
 ### FR-002: 移除連帶死碼
@@ -303,5 +307,5 @@ UI: N/A（`has_ui=false`）。falcon 端 FR-004 移除的是非預設的 code pa
 | PRD 偏離 | **無**。FR-001～FR-004 全數依 PRD 執行；FU-002 / FU-003 依附件的決定刻意不做，屬 PRD 已載明的 Out of scope。 |
 | 提升為長期資產 | `docs/reference/endpoints/`、`docs/reference/spec/spec.md`、`docs/reference/prd.md` 已同步退役後的現況（`spec.md` 與 `prd.md` 的 v1.3.0 殘留以刪除線標記）。 |
 | 最終證據 | [`implement-report.md`](./implement-report.md) — `cargo fmt` clean · `clippy -D warnings` 通過 · `cargo test` 215 passed / 0 failed · CI `rust` job pass |
-| 遺留 gate | **AC-001 只有部分證據**。[`tests/route_contract.rs`](../../../tests/route_contract.rs) 已釘住 `build_router` 的 route 表：四條退役路徑不得再註冊、存活路徑必須恰好是那五條——這擋住「被無聲重新引入」這個實際會發生的迴歸。**仍缺 HTTP 層斷言**（status code、以及 404 fallback 是否仍在 auth layer 之前）：那需要一個被 serve 的 router，而 serve 需要完整 `AppState`，其 `mcp` 欄位的 `McpHandle` 包私有 `Peer<RoleClient>`，只有 `McpClient::connect_http` 生得出來。本 crate 只依賴 rmcp 的 client 端，所以要嘛跑 live MCP server，要嘛為 rmcp 的 `server` feature 加 dev-dependency 再用 in-memory transport——後者實際成本遠高於先前估的 50 行（AppState 有 11 個欄位要備齊）。AC-002 的「SSE frame 序列完全一致」本質上需要 live 服務與 LLM。 |
+| 遺留 gate | **AC-001 已於 2026-08-19 補齊並 PASS**（HTTP 層、三種 Authorization 狀態）。補測試時抓到一個真缺陷：`Router::merge` 會把 sub-router 的 fallback 一併帶過來，未命中路徑因此落在 OpenAI group 的 auth layer 之後——不帶 token 回 `401`、帶正確 token 回 `404`。AC-001 的第二句（不因 Authorization 而異）當時並未成立，PR #11 描述與 reference 文件都寫成已成立。已以外層顯式 `fallback` 修正，並加測試釘住（含泛化到任意未命中路徑）。**AC-002 仍只有部分證據**：狀態碼層級已可測，但「SSE frame 序列完全一致」需要 live 服務與 LLM。 |
 | 下游 | falcon-client `8a20c46` 已 push 為 `origin/refactor/retire-nonstreaming-rest`，PR 待開。與本次無上線順序依賴——falcon 打的 `POST /agent` 自 `ea2bcef` 起已 404 五週。 |

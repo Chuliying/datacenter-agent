@@ -22,3 +22,7 @@ pub mod mcp_client;
 pub mod model;
 pub mod runtime;
 pub mod server;
+
+/// Fixtures for tests that need a served router. Test-only; see the module docs.
+#[cfg(test)]
+pub(crate) mod test_support;

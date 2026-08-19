@@ -25,14 +25,22 @@ Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth
 > **已退役的端點**：`POST /agent`（`ea2bcef`）、`POST /insight`、`POST /insight/stream`、
 > `POST /report`、`POST /report/stream`（work item
 > [`retire-superseded-agent-endpoints`](../../work/retire-superseded-agent-endpoints/prd.md)）。
-> 這些路徑現在回 `404`，且 fallback 在 auth layer **之前**，因此不會因 token 正確與否而不同，
-> 不洩漏 token 有效性。
+> 這些路徑現在回 `404`，且不因 `Authorization` 正確與否而不同，不洩漏 token 有效性。
+>
+> **這由外層的顯式 fallback（`route.rs` 的 `unmatched_path`）保證，2026-08-19 才補上。** 在那之前
+> 這句敘述是錯的：`Router::merge` 會把 sub-router 的 fallback 一併帶過來，於是未命中路徑落在
+> OpenAI group 的 `require_bearer_openai` **之後**——不帶 token 回 `401`、帶正確 token 回 `404`，
+> 任何路徑都成了「這個 token 有效嗎」的探測器。現由
+> `route.rs` 的 `retired_paths_return_404_regardless_of_authorization` 與
+> `unmatched_paths_do_not_leak_token_validity` 兩個 Router 層測試釘住。
 >
 > 遷移路徑：串流用 `/agent/stream`（依 intent 自動路由 insight / report pipeline）；
 > 非串流用 `/v1/chat/completions`。
 
 兩個 group 的 auth layer 都套在各自 sub-router 上，因此 scope 是明確的。在 `merge` 之後、
 於外層新增 route 會**同時繞過兩個 auth layer**；新增端點時必須有 Router-level auth test。
+（外層的 `fallback` 是刻意的例外——它必須在 auth 之外，未命中路徑才不會先被認證擋下而洩漏
+token 有效性；它不服務任何真實端點。）
 
 ## 認證
 
@@ -113,10 +121,10 @@ Target policy 與決策狀態見 [PRD FR-011](../prd.md)。
 
 ## Coverage gaps
 
-目前沒有 Router oneshot suite 固定下列外部契約：
+2026-08-19 起 `src/test_support.rs` 提供 Router 層 fixture（記憶體內 stub MCP server，`AppState`
+不再需要 live 連線），已用它固定「未命中路徑一律 404 且不因 Authorization 而異」。仍未固定：
 
 - 4 條 standard route 的 auth scope、418 body/header，以及 `/v1` 的 401 envelope。
-- 已退役路徑回 404（本次以移除註冊點 + `cargo test`/`clippy` 佐證，無 route-level 斷言）。
 - malformed/missing JSON 與 >64 KiB status。
 - timeout 與 SSE body lifetime（120 s / 600 s 兩組）。
 - CORS allowlist/credential behavior。

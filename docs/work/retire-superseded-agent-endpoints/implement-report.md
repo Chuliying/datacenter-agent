@@ -160,7 +160,7 @@ client 端死碼，沒有跨 repo 的發布順序依賴。
 
 | AC | 狀態 | 證據 |
 |---|---|---|
-| AC-001 四條端點不再存在 | **部分** | route 註冊點已移除（`route.rs` 僅 5 條）、handler 已刪、編譯通過。2026-08-19 補 [`tests/route_contract.rs`](../../../tests/route_contract.rs)：四條退役路徑不得重新註冊、存活路徑恰為五條。**仍無 HTTP 層 404 斷言** |
+| AC-001 四條端點不再存在 | **PASS**（2026-08-19） | `tests/route_contract.rs` 釘住 route 表；`route.rs` 的 `retired_paths_return_404_regardless_of_authorization` 以 HTTP 層驗證四條路徑在「不帶 / 正確 / 錯誤」三種 Authorization 下一律 `404`。補測試過程發現並修正 fallback 落在 auth layer 之後的缺陷（見下） |
 | AC-002 保留端點行為不變 | **部分** | 未觸碰 `agent_stream` / `chat_completions` / `greeting` / `health` / `ready` 的任何程式碼；215 tests 全過（含 `wants_report_pipeline`、`insight_frames`、openai mapping 等既有斷言）。**無端到端驗證** |
 | AC-003 沒有殘留死碼 | **PASS** | `clippy --all-targets -- -D warnings` 通過、`cargo test` 全過 |
 | AC-004 guardrail 覆蓋率完整 | **PASS** | route 表僅 `/agent/stream` 與 `/v1/chat/completions` 吃 prompt，兩者都呼叫 `plan_stream_turn`（`handler.rs` 內僅此兩處建立 `AuditWriter`） |
@@ -208,9 +208,10 @@ review 同時確認為正確的部分：刪除的每個符號都真的不可達�
 
 ## 待辦
 
-1. **AC-001 部分完成** — `tests/route_contract.rs` 已釘住 route 表（四條退役路徑不得重新註冊、
-   存活路徑恰為五條）。仍缺 HTTP 層的 404 斷言與 AC-002 的 SSE 序列比對，兩者都需要 live 服務
-   或為 rmcp `server` feature 加 dev-dependency，見 prd.md `## Delivery` 的遺留 gate 欄。
+1. ~~**AC-001**~~ **已完成**（2026-08-19）— 為 rmcp `server` feature 加了 dev-dependency，
+   `src/test_support.rs` 用 `tokio::io::duplex` 架起記憶體內 stub MCP server，`AppState` 因此
+   不再需要 live 連線，Router 層測試得以成立。第一次跑就抓到 fallback 落在 auth layer 之後的
+   缺陷（`401`/`404` 因 token 而異），已修。**AC-002 的 SSE 序列比對仍需 live 服務**。
 2. **`AppState::generation_config` 是零呼叫端的 pub 死碼**（`appstate.rs:281`，pre-existing）。
    `clippy` 不會對 pub 項目發 `dead_code`，所以沒被 gate 抓到。
 3. ~~版本 bump 到 `0.4.0`~~ **已完成**：Cargo.toml / Cargo.lock、CHANGELOG 切出 `[0.4.0] - 2026-08-19`、`docs/reference/index.md` 的 crate 版本列同步。
