@@ -133,11 +133,21 @@ lint-staged / console.log / secrets / 文件結構）全過。
 falcon 工作樹另有 155 個**無關**的未提交變更（skills submodule 同步、zip、flow-map 等），
 只 stage 了本次的 12 個檔案，未混入。
 
-**交付狀態（2026-08-19 查證）**：`8a20c46` **仍未 push**，只存在於本機 `chat-bot`
-（`git branch -r --contains 8a20c46` 為空；`chat-bot` 相對 `origin/dev` 是 ahead 1 /
-behind 173）。falcon 端沒有對應 PR。本 repo 這側已在 PR #11 上。也就是說 FR-004 的
-程式碼已完成但尚未進入 falcon 的交付流程，兩邊的上線順序仍待處理——upstream 端點消失
-會讓還在用舊 REST 路徑的 falcon 版本壞掉，若 falcon 落後於本 repo 發布即成事故。
+**交付狀態（2026-08-19）**：`8a20c46` 已 push 為 `origin/refactor/retire-nonstreaming-rest`
+（`8a20c460071a3c3e054d2420c12695d2a58e3839`）；`dev` 與 `chat-bot` 未動。falcon 端 PR 尚未
+建立——`gh` 無法解析 `HDRenewables/falcon-client`（研判 SAML SSO 未授權）。
+
+合併模擬：`git merge-tree --write-tree origin/dev 8a20c46` exit 0、零衝突；合併後的樹中
+`submitRestRequest` 與 `AgentResponse` 殘留 0 處，`callAgent` 僅剩 `agent-client.test.ts`
+的一處說明註解。該 commit 疊在落後 `origin/dev` 177 個 commit 的分支上，但未造成衝突面。
+
+**這不是上線順序風險。** 先前記錄曾稱「upstream 端點消失會讓 falcon 壞掉」，該判斷有誤：
+falcon 的非串流路徑打的是 `POST /agent`（`agent-client.ts:73`），而該端點早於本次變更即由
+`ea2bcef` 移除，所以它今天就已經是死路；且 `useChiefOfStaffStream.ts:18` 的
+`useStreaming = process.env.NEXT_PUBLIC_COS_STREAMING !== 'false'` 預設走串流，該路徑預設
+不可達。falcon 實際使用的 `/agent/stream` 與 `/greeting` 都在本次退役後保留
+（`src/server/route.rs:107-125`，退役後共 5 條）。FR-004 因此是清理指向已消失端點的
+client 端死碼，沒有跨 repo 的發布順序依賴。
 
 ### 全 repo 測試的 4 個既有失敗
 
