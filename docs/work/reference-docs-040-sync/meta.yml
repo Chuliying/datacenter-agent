@@ -1,0 +1,20 @@
+schema_version: work-item/v3
+slug: reference-docs-040-sync
+title: docs/reference 的 PRD／Spec／QA 同步到 crate 0.4.0 現況
+created_at: 2026-08-20T14:48:00+08:00
+updated_at: 2026-08-20T14:48:00+08:00
+execution_mode: refactor
+work_status: active
+delivery_status: not_requested
+documentation_impact: doc:docs/reference/index.md
+stages:
+  prd: { skill: to-prd, file: prd.md, status: ready }
+inputs:
+  - docs/reference/index.md
+  - docs/reference/prd.md
+  - docs/reference/spec/spec.md
+  - docs/reference/tests/qa-plan.md
+  - src/server/route.rs
+  - src/test_support.rs
+  - commit:2762be7
+  - commit:18c1d5c
