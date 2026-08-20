@@ -19,6 +19,7 @@
 | Version | Updated at | Change | Impact | PRD version | Author |
 |---|---|---|---|---|---|
 | v1.0.0 | 2026-08-13 15:55 | 初版:兩個 POC slices(SQLite repositories;ingress admission + audit) | 新模組 + opt-in middleware,預設行為不變 | PRD v0.5.0 | Claude (Fable 5) |
+| v1.0.1 | 2026-08-20 18:50 | review 後文字對齊:expensive routes 只剩兩條(退役註記)、TTL 邊界改 `<=`;實作偏差記錄見 implement-report | 無行為變更(文件同步) | PRD v0.5.0 | Claude (Fable 5) |
 
 ## Files
 
@@ -85,7 +86,7 @@ PRAGMA(開檔即設):`foreign_keys=ON`、`journal_mode=WAL`、`synchronous=FULL`
 
 | Operation | Request | Success response | Error response | Auth / permission |
 |---|---|---|---|---|
-| 既有 expensive routes(`/agent/stream`, `/insight*`, `/report*`) | 不變 | 不變 | 新增:`429` + `Retry-After: <整數秒>` + `Cache-Control: no-store` + body `{"error": "rate limited: retry after <n>s"}`(沿用 `src/server/error.rs` 的 `ErrorBody`) | bearer 先於 limiter;401/418 不耗 bucket |
+| 既有 expensive routes(`/agent/stream`;`/insight*` 與 `/report*` 已於 0.4.0 退役,不復存在) | 不變 | 不變 | 新增:`429` + `Retry-After: <整數秒>` + `Cache-Control: no-store` + body `{"error": "rate limited: retry after <n>s"}`(沿用 `src/server/error.rs` 的 `ErrorBody`) | bearer 先於 limiter;401/418 不耗 bucket |
 | `POST /v1/chat/completions` | 不變 | 不變 | 新增:`429` + 同上 headers + body `{"error": {"message": "rate limited: retry after <n>s", "type": "rate_limit_error"}}`(沿用 `src/server/openai.rs` 的 `OpenAiErrorBody`,新增常數 `ERR_RATE_LIMIT = "rate_limit_error"`) | OpenAI bearer gate(401)先於 limiter |
 | `/health`, `/ready`, `/greeting` | 不變 | 不變 | 不套用 limiter(AC-009;guardrails 禁改 probe shape) | 既有 contract 不變 |
 
@@ -128,7 +129,7 @@ Slice 1(repository-only,不接 request path):
 | ERR-006 known overage | settle 權威金額 > 保留額 | 同交易記實際 spent、關 reservation、回報 overage;overdrawn 期間 reserve 全拒 | 下個月自動恢復或人工對帳 |
 | Boundary: 月界 | `2026-08-31T16:00:00Z` | month_key `2026-09`;reset `2026-09-30T16:00:00Z`(固定 +08:00) | N/A |
 | Boundary: 結構性無效 ID | 空/超長 actor key 或 session ID | `StoreError::InvalidIdentifier`;summary 內容永不觸發 | caller 修正輸入 |
-| Boundary: 過期/清除 | last_append + 30d < now;或 explicit clear | 對所有 actor 不可見;ID 可被任何 actor 重新宣告(單交易刪 session+turns) | N/A |
+| Boundary: 過期/清除 | last_append + 30d <= now(恰滿 30 天即過期,對齊 PRD「expires 30 days after」);或 explicit clear | 對所有 actor 不可見;ID 可被任何 actor 重新宣告(單交易刪 session+turns) | N/A |
 
 ## Decisions
 

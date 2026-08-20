@@ -79,7 +79,24 @@ slug: runtime-user-session-rate-limit
 3. qa-plan 所列 `tests/rate_limit_ingress.rs` 改為 in-crate router 測試
    (`src/server/rate_limit.rs`),原因見 implement-report 偏差 #1。
 
+## Code review findings 處理(2026-08-20,fresh-context fable review)
+
+Review 範圍:實作兩 commit,對 spec/PRD/qa-plan 的對抗式審查。verdict:MERGEABLE。
+6 筆 findings(1 Important、5 Minor)處置如下:
+
+| # | 嚴重度 | Finding | 處置 |
+|---|---|---|---|
+| 1 | Important | 已結算 reservation 重放 reserve 回 `Reserved` 但零額度持有(spend 可長期漏記) | **已修**:`reservation_identity` 納入 `state`;settled 重放回 `ReservationMismatch`,pending/reconcile 維持冪等。RED→GREEN:`reserving_a_settled_reservation_id_is_rejected` |
+| 2 | Minor | `load_recent` 在存量 > 當前 `max_turns` 時回最舊而非最新 | **已修**:改 `ORDER BY seq DESC LIMIT n` 取尾再升冪。測試 `load_recent_returns_newest_turns_under_a_smaller_cap` |
+| 3 | Minor | spec TTL 邊界文字(`<`)與程式(`<=`)漂移 | **已修文件**:spec v1.0.1 改 `<=`,對齊 PRD「expires 30 days after」 |
+| 4 | Minor | redaction 缺 IPv6 pattern | **已修**:新增壓縮形 IPv6 regex(偏過度遮蔽方向)。測試 `redacts_ipv6` |
+| 5 | Minor | spec API 表仍列 0.4.0 已退役的 `/insight*` `/report*` | **已修文件**:spec v1.0.1 加退役註記 |
+| 6 | Minor | 測試品質:ac009 只斷言非 429、TC-B08 未涵蓋 OpenAI 路由、同連線 race 測試無鑑別力 | **6a/6b 已修**(ac009 與無 limiter baseline 逐一比對 status;disabled 測試涵蓋兩 family)。6c 記錄接受:同連線測試保留為文件性質,真正防護是跨連線變體(單發 race,機率性;`BEGIN IMMEDIATE` 正確性另由交易結構保證) |
+
+修正後 fresh evidence:`cargo test` 全綠、clippy `-D warnings` 乾淨(見下)。
+
 ## 驗收結論
 
-**PASS** — 15/15 AC、6/6 ERR、8/8 boundary 全數通過;lint/typecheck/eval gates 乾淨;
-可進入 release gate(PR #10 review)。
+**PASS** — 15/15 AC、6/6 ERR、8/8 boundary 全數通過;review 1 Important + 4 Minor
+已修、1 Minor 記錄接受;lint/typecheck/eval gates 乾淨;可進入 release gate
+(PR #10 review)。

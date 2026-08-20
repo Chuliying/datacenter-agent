@@ -226,9 +226,12 @@ mod tests {
         assert!(body["error"].is_string(), "standard envelope, got {body}");
     }
 
-    /// AC-009: probes and greeting stay outside the exhausted bucket.
+    /// AC-009: probes and greeting stay outside the exhausted bucket, with the
+    /// same status a limiter-free router answers (TC-009 baseline comparison).
     #[tokio::test]
     async fn ac009_probe_and_greeting_routes_are_not_limited() {
+        let (baseline_state, _baseline_mcp) = crate::test_support::app_state().await;
+        let baseline = build_router(baseline_state);
         let app = limited_app(1).await;
         let _ = app.clone().oneshot(authed("/agent/stream")).await.unwrap();
         let blocked = app.clone().oneshot(authed("/agent/stream")).await.unwrap();
@@ -239,25 +242,23 @@ mod tests {
         );
 
         for path in ["/health", "/ready", "/greeting"] {
-            let resp = app
-                .clone()
-                .oneshot(
-                    HttpRequest::builder()
-                        .method("GET")
-                        .uri(path)
-                        .header(
-                            "authorization",
-                            format!("Bearer {}", crate::test_support::TEST_TOKEN),
-                        )
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_ne!(
-                resp.status(),
-                StatusCode::TOO_MANY_REQUESTS,
-                "{path} must bypass the limiter"
+            let probe = || {
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let limited = app.clone().oneshot(probe()).await.unwrap();
+            let unlimited = baseline.clone().oneshot(probe()).await.unwrap();
+            assert_eq!(
+                limited.status(),
+                unlimited.status(),
+                "{path} must answer exactly as it does without a limiter"
             );
         }
     }
@@ -423,7 +424,7 @@ mod tests {
         );
     }
 
-    /// Disabled config leaves every route unlimited (opt-in default).
+    /// Disabled config leaves both route families unlimited (opt-in default).
     #[tokio::test]
     async fn disabled_config_attaches_no_limiter() {
         let (state, _mcp) = crate::test_support::app_state().await;
@@ -432,9 +433,11 @@ mod tests {
             "fixture default must be disabled"
         );
         let app = build_router(state);
-        for _ in 0..3 {
-            let resp = app.clone().oneshot(authed("/agent/stream")).await.unwrap();
-            assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        for path in ["/agent/stream", "/v1/chat/completions"] {
+            for _ in 0..3 {
+                let resp = app.clone().oneshot(authed(path)).await.unwrap();
+                assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+            }
         }
     }
 }

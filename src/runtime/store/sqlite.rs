@@ -201,8 +201,9 @@ impl SqliteRuntimeStore {
             let mut stmt = tx
                 .prepare(
                     "SELECT seq, turn_id, user_summary, answer_summary, intent, metric, \
-                     asset, time_range_label, option_id, created_at_ms \
-                     FROM session_turns WHERE session_id = ?1 ORDER BY seq ASC LIMIT ?2",
+                     asset, time_range_label, option_id, created_at_ms FROM \
+                     (SELECT * FROM session_turns WHERE session_id = ?1 \
+                      ORDER BY seq DESC LIMIT ?2) ORDER BY seq ASC",
                 )
                 .map_err(unavailable)?;
             let turns = stmt
@@ -300,8 +301,16 @@ impl SqliteRuntimeStore {
             let next_reset_utc = month::next_reset_utc(now);
             let tx = immediate(conn)?;
 
-            if let Some((owner, month, amount)) = reservation_identity(&tx, &reservation_id)? {
-                if owner == actor_key && month == month_key && amount == amount_micro {
+            if let Some((owner, month, amount, state)) = reservation_identity(&tx, &reservation_id)?
+            {
+                // Idempotent replay only while the reservation still holds
+                // capacity (pending/reconcile). A settled ID answers a typed
+                // mismatch: "Reserved" must always mean "capacity held".
+                if state != "settled"
+                    && owner == actor_key
+                    && month == month_key
+                    && amount == amount_micro
+                {
                     let snapshot = snapshot_tx(&tx, &actor_key, &month_key, next_reset_utc)?;
                     tx.commit().map_err(unavailable)?;
                     return Ok(ReserveOutcome::Reserved { snapshot });
@@ -655,13 +664,13 @@ fn ensure_session_tx(
     })
 }
 
-/// `(actor_key, month_key, reserved_micro)` for one reservation, if present.
+/// `(actor_key, month_key, reserved_micro, state)` for one reservation, if present.
 fn reservation_identity(
     tx: &Transaction<'_>,
     reservation_id: &str,
-) -> Result<Option<(String, String, i64)>, StoreError> {
+) -> Result<Option<(String, String, i64, String)>, StoreError> {
     tx.query_row(
-        "SELECT actor_key, month_key, reserved_micro FROM budget_reservations \
+        "SELECT actor_key, month_key, reserved_micro, state FROM budget_reservations \
          WHERE reservation_id = ?1",
         params![reservation_id],
         |row| {
@@ -669,6 +678,7 @@ fn reservation_identity(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         },
     )

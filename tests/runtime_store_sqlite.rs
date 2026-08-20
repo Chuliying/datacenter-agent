@@ -553,3 +553,68 @@ async fn err001_corrupt_file_is_unavailable() {
     let result = SqliteRuntimeStore::open(StoreConfig::new(path)).await;
     assert!(matches!(result, Err(StoreError::Unavailable(_))));
 }
+
+/// Review finding 1: replaying reserve for an already-settled reservation ID
+/// must not answer `Reserved` — the ledger holds no capacity for it.
+#[tokio::test]
+async fn reserving_a_settled_reservation_id_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let now = t0();
+    let store = open_store(&dir).await;
+    store
+        .reserve("actor-a", "g1", 1_000_000, now)
+        .await
+        .unwrap();
+    store.settle("g1", Some(1_000_000), now).await.unwrap();
+
+    let replay = store.reserve("actor-a", "g1", 1_000_000, now).await;
+    assert!(
+        matches!(replay, Err(StoreError::ReservationMismatch)),
+        "a settled reservation holds no capacity; replay must be a typed \
+         mismatch, got {replay:?}"
+    );
+
+    // A reconcile-state reservation still holds capacity, so its replay stays
+    // idempotent.
+    store
+        .reserve("actor-a", "g2", 2_000_000, now)
+        .await
+        .unwrap();
+    store.settle("g2", None, now).await.unwrap();
+    let replay = store
+        .reserve("actor-a", "g2", 2_000_000, now)
+        .await
+        .unwrap();
+    assert!(matches!(replay, ReserveOutcome::Reserved { .. }));
+    let snapshot = store.ledger_snapshot("actor-a", now).await.unwrap();
+    assert_eq!(snapshot.reserved_micro, 2_000_000, "no double count");
+}
+
+/// Review finding 2: when stored turns exceed the configured cap (e.g. the
+/// file was written under a larger `max_turns`), `load_recent` returns the
+/// *newest* rows, not the head of the table.
+#[tokio::test]
+async fn load_recent_returns_newest_turns_under_a_smaller_cap() {
+    let dir = TempDir::new().unwrap();
+    let now = t0();
+    {
+        let store = open_store(&dir).await;
+        for i in 1..=5 {
+            store
+                .append_turn("actor-a", "s1", turn(&format!("t{i}")), now)
+                .await
+                .unwrap();
+        }
+    }
+
+    let mut config = StoreConfig::new(dir.path().join("store.db"));
+    config.max_turns = 3;
+    let store = SqliteRuntimeStore::open(config).await.unwrap();
+    let turns = store.load_recent("actor-a", "s1", now).await.unwrap();
+    let ids: Vec<&str> = turns.iter().map(|t| t.turn_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["turn-t3", "turn-t4", "turn-t5"],
+        "must be the newest three in chronological order"
+    );
+}

@@ -18,6 +18,10 @@ pub fn default_redact_patterns() -> Vec<Regex> {
         r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}",
         // IPv4
         r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+        // IPv6, compressed forms included ({0,4} admits the empty "::" group).
+        // Biased toward over-redaction: a colon-separated hex run like
+        // "14:30:05" also matches, which is the safe direction for this field.
+        r"(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{1,4}\b",
         // bearer token
         r"(?i)bearer\s+[a-z0-9._~+/=-]+",
         // cookie header with its pairs
@@ -59,6 +63,16 @@ mod tests {
         let out = sanitize("peer was 203.0.113.9 today");
         assert!(!out.contains("203.0.113.9"), "got: {out}");
         assert!(out.contains(REDACTED));
+    }
+
+    /// Review finding 4: PRD says "IP", not "IPv4" — compressed IPv6 included.
+    #[test]
+    fn redacts_ipv6() {
+        let out = sanitize("peer was 2001:db8::9 today");
+        assert!(!out.contains("2001:db8::9"), "got: {out}");
+        assert!(out.contains(REDACTED));
+        // An ordinary clock time must survive.
+        assert_eq!(sanitize("meeting at 12:30 today"), "meeting at 12:30 today");
     }
 
     #[test]
