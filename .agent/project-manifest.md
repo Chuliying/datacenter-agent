@@ -12,7 +12,7 @@
 - capability_packs: optional
 
 版本由 submodule gitlink 釘住（`git submodule status` 會印出 `git describe` 結果，目前為
-`v0.9.0-1-g643253b`，即 v0.9.0 之後一個未發版 commit），不另存版本號欄位以免與 gitlink 兩處不一致。
+`v0.10.0`），不另存版本號欄位以免與 gitlink 兩處不一致。
 首次 clone 後、或 gitlink 變更後執行：
 
 ```bash
