@@ -1,9 +1,9 @@
 # datacenter-agent 現況技術規格
 
-**Spec 版本**：v1.3.0
-**對應 Target PRD**：[`../prd.md`](../prd.md) v1.3.0
+**Spec 版本**：v1.4.0（對應 crate 0.4.0，2026-08-20 同步）
+**對應 Target PRD**：[`../prd.md`](../prd.md) v1.4.0
 **狀態**：Current-state contract  
-**Source**：[`src/server/dto.rs`](../../../src/server/dto.rs)、[`src/server/route.rs`](../../../src/server/route.rs)、[`src/server/handler.rs`](../../../src/server/handler.rs)、[`src/runtime/turn.rs`](../../../src/runtime/turn.rs)、[`src/runtime/config.rs`](../../../src/runtime/config.rs)
+**Source**：[`src/server/dto.rs`](../../../src/server/dto.rs)、[`src/server/route.rs`](../../../src/server/route.rs)、[`src/server/handler.rs`](../../../src/server/handler.rs)、[`src/test_support.rs`](../../../src/test_support.rs)、[`src/runtime/turn.rs`](../../../src/runtime/turn.rs)、[`src/runtime/config.rs`](../../../src/runtime/config.rs)
 
 > 本規格只記錄目前程式。未落地的修正與目標設計在 [程式修改計劃](../../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)。
 
@@ -16,37 +16,42 @@
 | v1.2.0 | 2026-06-29 | 對照 target Capability/Evidence architecture，記錄現況直接 LLM→MCP gap | v1.2.0 |
 | v1.3.0 | 2026-06-30 | 同步 runtime default cutover、rollback-before-config、injection/memory、provider terminal 與 eval process gate | v1.3.0 |
 | v1.3.1 | 2026-07-01 | 全文逐條對照程式碼複核，內容確認與現況一致，無需修正；容器化封裝（`Dockerfile`／`chore(docker)` commit）屬部署範疇，不在本 spec（HTTP/runtime contract）涵蓋範圍內 | v1.3.0 |
+| v1.4.0 | 2026-08-20 | 同步 crate 0.4.0：路由表收斂為 5 條＋outer fallback 統一 404（`Router::merge` 帶走 sub-router fallback 的成因）；`AgentResponse` DTO 與 legacy serving path 移除；SSE validation error 改回 HTTP status；channel bounded；`run_agent_turn` 記為 dormant | v1.4.0 |
 
 ## 1. 系統邊界
 
 ```text
 HTTP client
-  → axum Router / bearer / middleware
+  → axum Router / per-group bearer + timeout / shared middleware
   → handler
-      ├─ legacy: llm_connector → OpenRouter → MCP
-      └─ runtime: run_agent_turn → LlmAgentPort → llm_connector → OpenRouter → MCP
+      → runtime prelude（plan_stream_turn：audit → guardrails → intent → answer policy → memory）
+      → sub-agent pipeline（agent::wiring：fetcher → analyst → charter/composer → …）
+      → OpenRouter LLM ⇄ MCP tools
 ```
 
 startup 由 `main.rs` 載入 top-level config、連 MCP、建立 AppState、啟動 Router。`AppState::new` 預設組裝 runtime；明確 `RUNTIME_ENABLED=false/0` 時在讀 capability config 前跳過 runtime build。
+
+0.4.0 起**沒有 legacy serving path**：兩個 prompt 端點（`/agent/stream`、`/v1/chat/completions`）都要求 runtime，rollback 時回 503，僅剩 `/health`、`/ready`、`/greeting` 可用。`run_agent_turn` 與 `AgentPort` trait 仍存在但 **dormant**——production 只呼叫其前段 `plan_stream_turn`，streaming 由 handler 直接驅動 sub-agent pipeline。
 
 ## 2. HTTP contract
 
 ### 2.1 Routes 與 middleware
 
-| Method | Path | Handler | Bearer | Body cap | Handler timeout |
+| Method | Path | Handler | Auth 失敗 | Body cap | Group timeout |
 |---|---|---|---|---|---|
-| GET | `/health` | `health` | required | 64 KiB layer | 120s |
-| GET | `/ready` | `ready` | required | 64 KiB layer | 120s |
-| GET | `/greeting` | `greeting` | required | 64 KiB layer | 120s |
-| ~~POST~~ | ~~`/agent`~~ | ~~`agent`~~ | — | — | **已移除**（`ea2bcef`） |
-| POST | `/agent/stream` | `agent_stream` | required | 64 KiB | 只限制建立 Response 前的 handler future |
-| POST | `/v1/chat/completions` | `chat_completions` | required | 64 KiB | 同 `/agent/stream` |
+| GET | `/health` | `health` | 418 JSON | 64 KiB | 120 s |
+| GET | `/ready` | `ready` | 418 JSON | 64 KiB | 120 s |
+| GET | `/greeting` | `greeting` | 418 JSON | 64 KiB | 120 s |
+| POST | `/agent/stream` | `agent_stream` | 418 JSON | 64 KiB | 120 s（只限建立 Response 前的 handler future） |
+| POST | `/v1/chat/completions` | `chat_completions` | **401 + OpenAI error envelope** | 64 KiB | **600 s**，逾時回 504 + envelope |
 
-> 本表是 v1.3.0 視角的殘留。**現況路由表以 [`../endpoints/index.md`](../endpoints/index.md)
-> 為準**（退役 `/insight`、`/insight/stream`、`/report`、`/report/stream` 後共 5 條，
-> 見 `src/server/route.rs:107-125`）。
+Router 由兩個 sub-router merge 而成：standard 群（前四條，`require_bearer`、120 s `TimeoutLayer`）與 OpenAI 群（`require_bearer_openai`、600 s tower timeout + `HandleErrorLayer` 產生 envelope）。auth 與 timeout 都 layer 在各自群上，不在外層。
 
-middleware 另含 trace、`CorsLayer::very_permissive()`、compression、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`。Bearer 失敗回 418 JSON，不使用 401 challenge。
+**未匹配路徑**：外層 router 在兩次 merge 之後設明確 `fallback`，對所有未匹配路徑回統一 `404`（body 刻意為空——任一群的 error envelope 都不該擁有它），**與 `Authorization` header 無關**。這是路由層行為，不是 auth 行為。成因：`Router::merge` 會把 sub-router 的 fallback 一起帶走，0.4.0 之前 merged fallback 是 OpenAI 群的、包在該群 auth layer 內，導致任何未匹配路徑無 token 回 401、有效 token 回 404——每條路徑都成為 token 有效性的 oracle。router-level 迴歸測試：`retired_paths_return_404_regardless_of_authorization`、`unmatched_paths_do_not_leak_token_validity`、`surviving_paths_are_still_routed`（[`src/server/route.rs`](../../../src/server/route.rs)）。
+
+退役路徑 `/insight`、`/insight/stream`、`/report`、`/report/stream` 與更早的 `POST /agent` 都由上述 fallback 回 404。
+
+shared middleware（包住兩群）：trace、`CorsLayer::very_permissive()`、compression、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、64 KiB `DefaultBodyLimit`。standard 群 bearer 失敗回 418 JSON，不使用 401 challenge；OpenAI 群失敗回 401 + envelope（該群的 wire 相容需求）。
 
 ### 2.2 Request DTO
 
@@ -66,25 +71,9 @@ pub struct AgentRequest {
 
 JSON 使用 snake_case 欄位；只有 `prompt` 必填。所有 `JsonRejection` 目前被 `From<JsonRejection>` 映射為 HTTP 400。
 
-### 2.3 REST response
+### 2.3 非串流 response
 
-```rust
-pub struct AgentResponse {
-    pub user_prompt: String,
-    pub model_response: String,
-    pub intent: String,
-}
-```
-
-```json
-{
-  "user_prompt": "本月充電量？",
-  "model_response": "...",
-  "intent": "charging"
-}
-```
-
-legacy path 的 `intent` 固定為 `"unknown"`。runtime `Final` 使用 normalized intent；`Refused`、`Aborted` 回 `"unknown"`。
+`AgentResponse` DTO（`{user_prompt, model_response, intent}`）已於 0.4.0 **移除**——它只服務已退役的非串流端點。現況唯一的非串流 prompt 回應是 `/v1/chat/completions` 的標準 OpenAI `chat.completion` envelope；wire 細節見 [`../endpoints/chat-completions.md`](../endpoints/chat-completions.md)。
 
 ### 2.4 SSE wire
 
@@ -100,26 +89,26 @@ data: {"event":"error","data":"..."}
 
 `intent.resolved` 只由 runtime path 產生。`ToolCalled`/`ToolResult` 不映射到外部 SSE。
 
-## 3. 雙路徑差異
+## 3. Serving path 與 rollback
 
-### 3.1 Route selection
+### 3.1 Runtime 必要性
 
-`runtime_enabled_from_env` 只有 trim 後 case-insensitive `false` 或字串 `0` 視為 rollback；其他值與未設均啟用 runtime。rollback 時 `AppRuntime` 為 None，handler 走 legacy；runtime enabled 但 top-level `[runtime]` 缺失則 startup fail，不靜默降級。
+`runtime_enabled_from_env` 只有 trim 後 case-insensitive `false` 或字串 `0` 視為 rollback；其他值與未設均啟用 runtime。0.4.0 起 rollback **不再選擇替代 serving path**：兩個 prompt 端點都回 503（`runtime disabled (RUNTIME_ENABLED=false)` 訊息；OpenAI 端點以 envelope 包裝），僅剩 `/health`、`/ready`、`/greeting` 可用。rollback 時 `AppRuntime` 為 None 且在讀 capability config 前跳過 runtime build，壞 config 不阻擋 startup（`explicit_rollback_skips_invalid_runtime_config`）；runtime enabled 但 top-level `[runtime]` 缺失則 startup fail，不靜默降級。
 
 ### 3.2 Prompt validation
 
-| Path | Limit source | Current cap | 空／超長的外部行為 |
-|---|---|---:|---|
-| ~~legacy `/agent`~~ | ~~`USER_PROMPT_LENGTH_CAP`~~ | ~~2000~~ | **已移除**：cap 收斂為 runtime 單一來源 4000 |
-| ~~legacy `/agent/stream`~~ | ~~same helper~~ | ~~2000~~ | **已移除**：同上 |
-| runtime `/agent` | `thresholds.input.max_prompt_chars` | 4000 | `AgentTurnOutcome::Error{status:400}` → HTTP 400 |
-| runtime `/agent/stream` | same runtime guard | 4000 | handler 已回 SSE Response；送 `error` frame，HTTP 200 |
+兩端點共用 runtime prelude 的 `input_guard`，cap 單一來源 `thresholds.input.max_prompt_chars`（4000）。
 
-64 KiB body limit 位於 Router；目前沒有 route-level test 固定 oversized JSON 的最終 status。因 `JsonRejection` 統一轉 `AppError::BadRequest`，不可只靠 middleware 宣稱一定是 413。
+| Path | 空／超長的外部行為 |
+|---|---|
+| `/agent/stream` | prelude 在建立 SSE Response **之前**執行；`StreamPlan::Error` 經 `status_to_app_error` 映射為對應 HTTP status（如 400），**不是** 200 + error frame |
+| `/v1/chat/completions` | 同一 prelude；`StreamPlan::Error` 映射為對應 status + OpenAI error envelope |
+
+v1.3.x 記錄的「SSE 已回 Response 才驗證、錯誤是 HTTP 200 + error frame」已不成立。64 KiB body limit 位於 Router；目前沒有 route-level test 固定 oversized JSON 的最終 status。因 `JsonRejection` 統一轉 `AppError::BadRequest`，不可只靠 middleware 宣稱一定是 413。
 
 ### 3.3 Timeout
 
-`TimeoutLayer` 包住 handler future。REST slow request 可在 120 秒回 504；SSE handler 建立 Response 後的 body/producer 不受這個 timeout 保證。若 turn 需全程 deadline，現況沒有獨立的 body timeout/cancellation contract。
+timeout 以 sub-router 群為單位：standard 群 120 s（`TimeoutLayer::with_status_code` → 504 空 body），OpenAI 群 600 s（tower timeout + `HandleErrorLayer` → 504 + envelope；非串流路徑要等整條 pipeline 跑完，600 s 是必要的）。兩群的 layer 在 merge 後各自存活（`per_group_timeout_layers_survive_a_merge`）；envelope 行為由 `openai_timeout_returns_openai_error_envelope` 固定。SSE handler 建立 Response 後的 body/producer 不受 handler timeout 保證；若 turn 需全程 deadline，現況沒有獨立的 body timeout/cancellation contract。
 
 ## 4. Runtime contracts
 
@@ -152,9 +141,11 @@ pub enum TurnEvent {
 
 ### 4.2 Shared orchestration
 
-REST 與 runtime SSE 都呼叫 `run_agent_turn`：REST 使用 no-op emit 並讀 outcome；SSE 將 emit 寫入 channel。prelude 順序為 audit request → prompt validation → input pipeline → optional LLM normalizer → answer policy → optional memory context。
+兩個 prompt 端點都呼叫 **`plan_stream_turn`**（runtime prelude：audit request → prompt validation → input pipeline → optional LLM normalizer → answer policy → optional memory context），拿到 `StreamPlan` 後由 **handler 自己**驅動 intent-selected sub-agent pipeline（`agent::wiring`）並做 streaming／envelope 組裝。
 
-SSE adapter 現況使用 `tokio::sync::mpsc::unbounded_channel` 與 spawned producer。send failure 被忽略；client disconnect 時沒有明確 abort/cancellation，因此不存在 backpressure 與「斷線即停止上游成本」保證。
+`run_agent_turn` 與 `AgentPort` trait 仍在 [`src/runtime/turn.rs`](../../../src/runtime/turn.rs) 但 **dormant**——沒有 production caller；handler 傳入的 `UnusedAgentPort` + no-op emit 不會被 prelude 執行。把 pipeline 收回 `AgentPort` seam 之後是計劃工作，不是現況。
+
+SSE streaming 現況：**bounded** `tokio::sync::mpsc::channel(8192)` + spawned orchestrator task；handler 在 stream 收尾時 `run.await` 觀察 JoinError 並寫 memory／terminal audit。client disconnect 的明確 abort/cancellation contract 與 slow-consumer 行為仍未以測試固定。
 
 ### 4.3 Input pipeline
 
@@ -237,8 +228,10 @@ GenerationConfig + discovered MCP tool schemas
 | `AppError::BadRequest` | 400 + `{ "error": ... }` |
 | `AppError::BadGateway` | 502 + error body |
 | `AppError::ServiceUnavailable` | 503 + error body |
-| auth rejection | 418 + error body，繞過 `AppError` |
-| timeout before Response | 504 |
+| auth rejection（standard 群） | 418 + error body，繞過 `AppError` |
+| auth rejection（OpenAI 群） | 401 + OpenAI error envelope（`require_bearer_openai`） |
+| 未匹配路徑 | 404、空 body、與 Authorization 無關（outer fallback，見 §2.1） |
+| timeout before Response | 504（standard 空 body；OpenAI + envelope） |
 | runtime `InputRequired/InputTooLong` | 400 |
 | runtime `Upstream` | 502 |
 | other runtime errors | 503 |
@@ -268,13 +261,15 @@ GenerationConfig + discovered MCP tool schemas
 
 ## 10. Verification evidence and gaps
 
-2026-06-30 fresh `cargo test` 為 92 passed、2 ignored、0 failed。這不等於所有 HTTP/async failure mode 已被覆蓋。
+2026-08-20 fresh `cargo test` 為 **214 passed、0 failed、3 ignored**（lib 208 + integration 6；ignored 為 live LLM/MCP test 與 doc tests）。`cargo fmt --check` 通過；`eval --pipeline-only` passed=3。這不等於所有 HTTP/async failure mode 已被覆蓋。
+
+0.4.0 **已補上**的覆蓋：router-level 路由表迴歸（退役路徑 404、存活路徑仍被路由）、未匹配路徑對 Authorization 的一致性、per-group timeout 在 merge 後存活、OpenAI timeout envelope（`src/server/route.rs` 五個測試，依 `src/test_support.rs` 的 stub MCP fixture 組出真 `AppState`）。
 
 主要 coverage gaps：
 
-- Router-level auth、body cap、timeout、JSON rejection。
-- runtime SSE validation 的 HTTP status/frame contract。
-- slow consumer、client disconnect、producer cancellation、JoinError。
+- Router-level auth **envelope**（418/401 body 本身）、body cap、JSON rejection 的最終 status。
+- runtime SSE 的 frame contract（validation 已改 pre-stream HTTP status，frame 序列仍無 route-level test）。
+- slow consumer、client disconnect、producer cancellation 的外部契約。
 - 真 provider transport 的 EOF/truncation integration（finish-state unit contract 已有）。
 - MCP `is_error` 到 audit `ok` 的語意。
 - eval evaluator quality semantics（process exit gate 已有）。

@@ -8,17 +8,12 @@
 封裝整個 HTTP 介面：路由組裝、middleware、認證、handler、DTO、錯誤映射、OpenAI 相容層、
 greeting 背景任務。是 runtime 核心與 sub-agent 層對外的唯一接觸面。
 
-## 子檔案
+## 結構
 
-| 檔案 | 職責 | 關鍵項 |
-|---|---|---|
-| [`route.rs`](../../../src/server/route.rs) | 路由 + middleware 組裝 | `build_router`；**兩個 sub-router**（standard 4 條 / OpenAI 1 條）各帶自己的 timeout 與 auth，再 `merge`；共用 64 KiB body cap、very-permissive CORS、`TraceLayer`、`CompressionLayer`、nosniff/no-referrer header |
-| [`handler.rs`](../../../src/server/handler.rs) | 五個 handler | `health` / `ready` / `greeting` / `agent_stream` / `chat_completions` |
-| [`openai.rs`](../../../src/server/openai.rs) | OpenAI 相容 DTO 與映射 | `ChatCompletionRequest` / `StreamOptions` / `MapError` / `OpenAiErrorBody`；`map_request`、`error_type_for_status` |
-| [`dto.rs`](../../../src/server/dto.rs) | 請求／回應型別 | `AgentRequest` / `StreamFrame`（9 種 variant）/ `StageData` / `ToolCallData` / `ToolArgsData` / `UsageData` / `IntentResolvedData` / `GreetingResponse` / `ReadyBody` / `ReadyChecks`。`AgentResponse` 隨非串流端點退役一併移除 |
-| <a id="auth"></a>[`auth.rs`](../../../src/server/auth.rs) | bearer 認證 middleware | `require_bearer`（→ `418`）與 `require_bearer_openai`（→ `401` + OpenAI envelope）；皆用 constant-time 比對 |
-| [`error.rs`](../../../src/server/error.rs) | HTTP 錯誤型別 | `AppError` / `ErrorBody` |
-| <a id="greeting"></a>[`greeting.rs`](../../../src/server/greeting.rs) | 開機背景任務 | 跑 **兩階段 greeting pipeline**（fetcher → analyst）填 `AppState::greetings` |
+子檔案分工見 [`src/server/mod.rs`](../../../src/server/mod.rs) 的 `//!`（route／handler／openai／dto／auth／error／greeting 七個子模組）。本頁只記 doc comment 沒說的部分：
+
+- `dto.rs` 的 `AgentResponse` 隨非串流端點退役一併**移除**（0.4.0 breaking）。
+- <a id="auth"></a><a id="greeting"></a>greeting 由開機背景 task 跑兩階段 pipeline（fetcher → analyst）填 `AppState::greetings`。
 
 ## 兩條 agent 執行路徑
 
@@ -47,11 +42,11 @@ handler 層的 `validate_prompt` 與 `USER_PROMPT_LENGTH_CAP`。
 
 | Middleware | 套用範圍 | 失敗 status | 失敗 body |
 |---|---|---|---|
-| `require_bearer` | standard sub-router（8 條，含 `/health`、`/ready`） | `418 I'm a teapot` | 茶壺訊息 |
+| `require_bearer` | standard sub-router（4 條，含 `/health`、`/ready`） | `418 I'm a teapot` | 茶壺訊息 |
 | `require_bearer_openai` | `/v1/chat/completions` | `401 Unauthorized` | OpenAI envelope `{"error":{"message","type"}}` |
 
 `/v1` 走 401 是為了讓 agentgateway 這類 OpenAI-compatible client 正確辨識認證失敗；
-其餘 8 條維持既有 418 契約。
+其餘 4 條維持既有 418 契約。
 
 共通：scheme 名稱大小寫不敏感（RFC 6750）、token 用 `constant_time_eq` 比對（防 timing attack）。
 

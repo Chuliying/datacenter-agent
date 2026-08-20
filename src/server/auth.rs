@@ -14,8 +14,10 @@
 
 //! Bearer-token gate.
 //!
-//! Every request must carry `Authorization: Bearer <GLOBAL_TOKEN>`.
-//! Anything else would be rejected with `418 I'm a teapot` message.
+//! Every request must carry `Authorization: Bearer <GLOBAL_TOKEN>`. Two middlewares share the
+//! same constant-time check but reject differently: [`require_bearer`] (the standard routes)
+//! answers `418 I'm a teapot`, while [`require_bearer_openai`] (`/v1/chat/completions`) answers
+//! `401` with the OpenAI error envelope so OpenAI-compatible clients recognise the failure.
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};

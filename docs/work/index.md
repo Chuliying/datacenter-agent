@@ -17,7 +17,7 @@ skill-commons v0.10.0 起，`work_status: completed` 的 v3 work item 必須宣�
 |---|---|---|---|---|---|---|
 | [eval-evaluator-registry-fix](./eval-evaluator-registry-fix/prd.md) | feature | runtime | eval | team-feature | PRD ready | — |
 | [evidence-pack-skillpackage-finalllmport](./evidence-pack-skillpackage-finalllmport/prd.md) | feature | runtime | evidence | team-feature | PRD ready | — |
-| [reference-docs-040-sync](./reference-docs-040-sync/prd.md) | docs | reference | docs | refactor | PRD ready | — |
+| [reference-docs-040-sync](./reference-docs-040-sync/prd.md) | docs | reference | docs | refactor | Implement done（AC-001~005 PASS） | PR pending |
 
 ## Completed（保留在原地，尚未 archive）
 

@@ -1,27 +1,25 @@
 # datacenter-agent 現況測試與 Coverage
 
-**QA 版本**：v1.3.0
-**對應 Target PRD**：[`../prd.md`](../prd.md) v1.3.0
-**對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.3.0
+**QA 版本**：v1.4.0（對應 crate 0.4.0，2026-08-20 同步）
+**對應 Target PRD**：[`../prd.md`](../prd.md) v1.4.0
+**對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.4.0
 **狀態**：Current test inventory；不是未實作測試的完成聲明  
-**Source**：[`src/**` module tests](../../../src/lib.rs)、[`tests/runtime_contract.rs`](../../../tests/runtime_contract.rs)、[`tests/llm_connector.rs`](../../../tests/llm_connector.rs)、[`.github/workflows/runtime.yml`](../../../.github/workflows/runtime.yml)
+**Source**：[`src/**` module tests](../../../src/lib.rs)、[`tests/runtime_contract.rs`](../../../tests/runtime_contract.rs)、[`tests/llm_connector.rs`](../../../tests/llm_connector.rs)、[`src/test_support.rs`](../../../src/test_support.rs)、[`.github/workflows/runtime.yml`](../../../.github/workflows/runtime.yml)
 
 > 本頁區分「test fn 存在」、「test 被一般 CI 執行」與「test 真正證明某個 production contract」。未覆蓋項目明確列為 gap，不以讀碼或 middleware 名稱冒充測試。
 
-## 1. 2026-06-30 可重現快照
+## 1. 2026-08-20 可重現快照
 
 | Command | Result |
 |---|---|
 | `cargo fmt --all -- --check` | exit 0 |
-| `cargo check` | exit 0 |
-| `cargo clippy -- -D warnings` | exit 0 |
-| `cargo test` | 92 passed、0 failed、2 ignored |
+| `cargo clippy --all-targets --all-features -- -D warnings` | exit 0 |
+| `cargo test` | **214 passed、0 failed、3 ignored** |
 | `cargo run --bin eval -- --pipeline-only` | reported passed=3、failed=0；exit 0 |
-| response replay smoke | reported passed=2、failed=0；exit 0 |
-| synthetic failing replay | `tests/eval_cli.rs` 驗證 reported failed=1 時 process exit nonzero |
-| `docker build -t datacenter-agent:blocker-fix .` + config presence check | exit 0；final image 含 top-level、prompt、runtime config |
+| `cargo run --bin eval -- --response --replay config/runtime/evals/replay-smoke.json` | reported passed=2、failed=0；exit 0 |
+| synthetic failing replay | `tests/eval_cli.rs` 驗證 reported failed=1 時 process exit nonzero（隨 `cargo test` 執行） |
 
-兩個 ignored 項目：外部 LLM/MCP live test，以及一個 doc test。一般 `cargo test` 不執行 live test。
+三個 ignored 項目：外部 LLM/MCP live test 與 doc tests。一般 `cargo test` 不執行 live test。docker build 證據停在 v1.3.x（0.3.x image），未隨本次重驗。
 
 ## 2. 測試層級定義
 
@@ -38,8 +36,8 @@
 
 | AC | Current contract | Automated evidence | Coverage verdict |
 |---|---|---|---|
-| AC-001 | 單一 cap 4000（runtime prelude） | runtime input_guard 4000/4001 tests | **partial**：沒有 Router-level status test。~~legacy cap 2000~~ 已隨 `/insight`/`/report` 端點退役移除 |
-| AC-002 | runtime intent.resolved → token → done | `orchestrator::streams_intent_resolved_then_tokens_then_done` | **partial**：fake AgentPort；真 provider transport test仍缺 |
+| AC-001 | 單一 cap 4000（runtime prelude） | runtime input_guard 4000/4001 tests | **partial**：cap 的 Router-level status test 仍缺（0.4.0 起 validation error 已是 pre-stream HTTP status，見 spec §3.2）。~~legacy cap 2000~~ 已隨 `/insight`/`/report` 端點退役移除 |
+| AC-002 | runtime intent.resolved → token → done | `turn::streams_intent_resolved_then_tokens_then_done` | **partial**：fake AgentPort；真 provider transport test仍缺 |
 | AC-003 | runtime 預設 on；false/0 rollback 且壞 config 不阻擋 legacy | `appstate::runtime_enabled_env_defaults_on_with_explicit_rollback`、`explicit_rollback_skips_invalid_runtime_config` | **covered at component level** |
 | AC-004 | config 可調部分領域資料/元件，但不是任意 stage dispatch | config/registry tests | **partial**：builder existence 不等於 production request wiring |
 | AC-005 | config 真正 dispatch stages/guardrails/extractors/evaluators | builder/config unit tests | **missing/partial**：stage order ignored、evaluators noop |
@@ -47,7 +45,7 @@
 | AC-007 | trusted actor memory scope與正確summary/budget contract | memory store/context unit tests | **missing/partial**：production actor None、full text、無tenant E2E |
 | AC-008 | central audit redaction與所有terminal audit | audit helper/failure-policy tests | **missing/partial**：redaction無production caller、cancel/aborted terminal缺 |
 | AC-009 | eval failure使process/CI nonzero | `tests/eval_cli.rs::reported_regression_exits_nonzero` | **covered** |
-| AC-010 | decided auth/CORS/probe contract | code inspection only | **decision/test gap**：418、very-permissive、無deployment profile |
+| AC-010 | decided auth/CORS/probe contract | `route::unmatched_paths_do_not_leak_token_validity`、`retired_paths_return_404_regardless_of_authorization`、`per_group_timeout_layers_survive_a_merge`、`openai_timeout_returns_openai_error_envelope` | **partial + decision gap**：路由層 404 一致性與 per-group timeout/envelope 已有 router-level tests；418/401 auth **envelope 本身**仍只有讀碼，418 migration、CORS very-permissive 與 deployment profile 仍待決策 |
 | AC-011 | runtime disabled隔離invalid runtime config | `appstate::explicit_rollback_skips_invalid_runtime_config` | **covered** |
 | AC-012 | 每個完成claim有contract test與truthful docs | test inventory/doc link review | **partial**：沒有CI-enforcedclaim/status gate |
 | AC-013 | Final LLM 無 MCP/DB/RAG access，只消費 validated Evidence Pack | none | **missing**：current LLM直接持有tools + McpHandle；相關types/modules不存在 |
@@ -78,8 +76,8 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | TC | Source | Evidence boundary |
 |---|---|---|
 | TC-U20 | `injection::versioned_detector_matches_zh_and_en_injection` | detector 單元 |
-| TC-U21 | `pipeline::detects_prompt_injection_and_warns` + `orchestrator::prompt_injection_is_refused_without_calling_upstream` | production producer→policy→zero-upstream |
-| TC-U21b | `orchestrator::prompt_injection_refusal_is_not_persisted_to_memory` | rejected attack 不寫 memory |
+| TC-U21 | `pipeline::detects_prompt_injection_and_warns` + `turn::prompt_injection_is_refused_without_calling_upstream` | production producer→policy→zero-upstream |
+| TC-U21b | `turn::prompt_injection_refusal_is_not_persisted_to_memory` | rejected attack 不寫 memory |
 | TC-U22 | `answer_policy::refuses_unknown_or_low_confidence_off_scope` | config-backed policy threshold |
 | TC-U23 | `answer_policy::adds_disclaimer_for_gray_confidence` | config-backed policy threshold |
 | TC-U24 | `answer_policy::answers_when_confidence_is_clear` | config-backed policy threshold |
@@ -126,22 +124,34 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 | TC | Source | Evidence boundary |
 |---|---|---|
-| TC-U03 | `handler::stream_mapping_preserves_external_sse_events` | legacy event mapping/filter |
-| TC-U04 | `handler::runtime_route_selection_requires_built_enabled_runtime` | handler branch selection |
+| ~~TC-U03~~ | ~~`handler::stream_mapping_preserves_external_sse_events`~~ | **已刪除**：legacy event mapping 隨 legacy path 移除；現行 `AgentEvent`→`StreamFrame` 映射由 `handler::insight_frames_stream_stages_tokens_and_a_clean_terminal` 覆蓋 |
+| ~~TC-U04~~ | ~~`handler::runtime_route_selection_requires_built_enabled_runtime`~~ | **已刪除**：0.4.0 起 runtime 必要、無 legacy 分支；rollback 503 行為由 handler 直接回傳，尚無專屬測試（gap） |
 | TC-U04b | `appstate::runtime_enabled_env_defaults_on_with_explicit_rollback` + `explicit_rollback_skips_invalid_runtime_config` | cutover + startup rollback |
-| TC-U05 | 3 個 `agent_response_*` tests | outcome→REST response |
-| TC-C01 | `handler::turn_event_maps_to_external_stream_frame` | runtime event mapping |
-| TC-I01 | `orchestrator::streams_intent_resolved_then_tokens_then_done` | fake AgentPort ordering |
-| TC-I02 | `orchestrator::rest_consumes_same_orchestration_with_noop_emit` | shared core orchestration |
+| ~~TC-U05~~ | ~~3 個 `agent_response_*` tests~~ | **已刪除**：`AgentResponse` DTO 隨非串流端點退役移除 |
+| TC-C01 | `turn::maps_llm_events_to_runtime_frames` + `tests/runtime_contract.rs` wire serialization | `LlmEvent`→`AgentTurnFrame` 與 `StreamFrame` wire 兩段映射 |
+| TC-I01 | `turn::streams_intent_resolved_then_tokens_then_done` | fake AgentPort ordering |
+| TC-I02 | `turn::rest_consumes_same_turn_with_noop_emit` | shared core turn（`run_agent_turn` 本身 dormant，此為 module test） |
 | TC-I03 | 2 個 `tests/runtime_contract.rs` stream serialization tests | public wire serialization |
 | TC-I03b | 2 個 `tests/runtime_contract.rs` request serde tests | history default、metadata fields |
-| TC-I04 | `orchestrator::refusal_does_not_call_upstream` | off-scope refusal；不證明 injection E2E |
+| TC-I04 | `turn::refusal_does_not_call_upstream` | off-scope refusal；不證明 injection E2E |
 | TC-I05 | 2 個 memory orchestration tests | fake/in-memory path |
 | TC-I06 | 2 個 audit orchestration tests | fake sink event calls |
-| TC-I07 | `orchestrator::clear_frame_clears_buffer` | core buffer |
-| TC-I08 | `orchestrator::disclaimer_is_prepended_before_agent_tokens` | core ordering |
-| TC-I09 | `orchestrator::upstream_error_always_fails_truncation_aborts` | fake AgentPort frames；不測 live adapter EOF |
+| TC-I07 | `turn::clear_frame_clears_buffer` | core buffer |
+| TC-I08 | `turn::disclaimer_is_prepended_before_agent_tokens` | core ordering |
+| TC-I09 | `turn::upstream_error_always_fails_truncation_aborts` | fake AgentPort frames；不測 live adapter EOF |
 | TC-I10 | 2 個 LLM normalizer orchestration tests | fake normalizer |
+
+### 4.7 Route-level（0.4.0 新增）
+
+依 [`src/test_support.rs`](../../../src/test_support.rs) 的 stub MCP fixture（`tokio::io::duplex`）組出真 `AppState` 並對 `build_router` 做 oneshot——第一批打到組裝後 router 的測試。
+
+| TC | Source | Evidence boundary |
+|---|---|---|
+| TC-R01 | `route::retired_paths_return_404_regardless_of_authorization` | 4 條退役路徑 × 3 種 Authorization 狀態都回 404 |
+| TC-R02 | `route::surviving_paths_are_still_routed` | 5 條存活路徑不落入 fallback（只 pin routing，不 pin handler 行為） |
+| TC-R03 | `route::unmatched_paths_do_not_leak_token_validity` | 任意未匹配路徑對 3 種 Authorization 狀態回應一致（token-validity oracle 迴歸） |
+| TC-R04 | `route::per_group_timeout_layers_survive_a_merge` | merge 後 per-group timeout 各自存活（結構等價縮時版，不打真 router） |
+| TC-R05 | `route::openai_timeout_returns_openai_error_envelope` | OpenAI 群逾時回 504 + `{"error":{"type":"server_error",...}}`（結構等價版） |
 
 ## 5. Non-test sources
 
@@ -151,8 +161,8 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | TC-E02 | `scripts/staging-smoke.sh` | script；只檢查基本 response keys/event allowlist，不覆蓋全部 AC |
 | TC-E03 | eval CLI command | reported failure exit nonzero；evaluator quality scope仍有限 |
 | TC-B05 | Router middleware reference | 不是 test；body >64 KiB 最終 status 未固定 |
-| TC-CT01 | auth 418 讀碼 | 沒有 HTTP characterization test |
-| TC-CT02 | legacy intent unknown 讀碼/handler mapping | 沒有 Router-level characterization test |
+| TC-CT01 | auth 418/401 讀碼 | envelope/body 仍沒有 HTTP characterization test；未匹配路徑對 Authorization 的**一致性**已由 TC-R03 覆蓋 |
+| ~~TC-CT02~~ | ~~legacy intent unknown 讀碼~~ | **已失效**：legacy serving path 與 `AgentResponse` DTO 隨 0.4.0 移除 |
 
 ## 6. Boundary matrix
 
@@ -160,9 +170,10 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 |---|---|---|---|
 | ~~legacy 2000/2001~~ | — | — | **已移除**：cap 收斂為 runtime 單一來源 4000 |
 | runtime 4000 | accepted | input_guard test | no handler test |
-| runtime 4001 | runtime error | input_guard test | no REST/SSE status test |
+| runtime 4001 | pre-stream HTTP 400（0.4.0 起，非 200+frame） | input_guard test | no route-level status test |
 | runtime 2001 | accepted | explicit parity-diff test | covered |
 | body >64 KiB | Router rejects before handler; exact final mapping not pinned | none | gap |
+| unmatched path | 404、空 body、與 Authorization 無關 | TC-R01/R03 | covered |
 | history omitted | `[]` | crate integration test | covered |
 | memory max turns | oldest removed | store test | covered |
 | provider partial EOF | missing/incompatible finish reason emits Error | finish-state unit contract；真 transport test缺 | partial |
@@ -173,7 +184,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 | Error | Existing evidence | Missing evidence |
 |---|---|---|
 | empty/overlong prompt | helper/input_guard unit tests | runtime SSE external status/frame |
-| invalid auth | read code only | Router oneshot 418/body/header |
+| invalid auth | TC-R03（未匹配路徑一致性）；envelope 仍 read code only | Router oneshot 418/401 envelope body/header |
 | upstream error | fake orchestrator test | real LlmAgentPort EOF/transport combinations |
 | off-scope refusal | orchestrator fake | route-level REST/SSE contract |
 | injection refusal | producer→consumer→zero-upstream/no-memory component tests | Router-level REST/SSE |
@@ -190,7 +201,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 這些是 gap，不是已存在的 TC：
 
-1. Router oneshot suite：auth scope、418 envelope、JSON rejection、64 KiB、REST/SSE prompt caps。
+1. Router oneshot suite：**部分完成**（TC-R01~R05 覆蓋 routing、404 一致性、per-group timeout/envelope）；仍缺 auth 418/401 envelope body、JSON rejection、64 KiB、prompt cap 的 route-level status。
 2. Runtime SSE lifecycle：bounded backpressure、disconnect cancellation、JoinError、terminal frame。
 3. LLM adapter transport integration：EOF without finish reason、explicit finish、transport error、tool-call truncation（finish-state unit contract已有）。
 4. MCP semantic result：`is_error` 保留到 `ToolResult.ok=false` 與 audit。
@@ -211,7 +222,8 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 目前可誠實宣稱：
 
-- check/clippy/fmt/test 通過（2026-06-30 fresh run）。
+- clippy/fmt/test/pipeline-eval/replay-smoke 通過（2026-08-20 fresh run，214 passed/0 failed）。
+- 退役路徑回 404、未匹配路徑不洩漏 token 有效性、per-group timeout 與 OpenAI timeout envelope——都有 router-level 迴歸測試。
 - 所有被 qa-plan 引用的 Rust test fn 都存在。
 - deterministic pipeline/replay smoke 目前無 reported failure。
 - eval reported regression 會使 process nonzero。
@@ -222,7 +234,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 - 完整 config-selected evaluator quality gate 已落地。
 - audit redaction、config-only pluggability 已 E2E 生效。
-- 所有 route status/limits/timeouts 已有 contract test。
+- 所有 route status/limits 已有 contract test（auth envelope、JSON rejection、64 KiB、prompt cap status 仍缺）。
 - live LLM/MCP 與 deployment probes 已驗收。
 - Evidence Pack、Capability Gateway、Prompt Builder、Final LLM isolation或Output Validator已實作。
 

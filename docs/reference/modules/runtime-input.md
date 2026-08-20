@@ -7,14 +7,13 @@
 ## 職責
 決定性（非 LLM）的輸入工程 pipeline：把原始使用者輸入正規化、分類 intent、抽取 slots，輸出帶信心分數的 `NormalizedInput`。領域內容（lexicon、allowlist、門檻）來自 config。
 
-## 子檔案
+## 結構
 
-| 檔案 | 職責 |
-|---|---|
-| [`normalizer.rs`](../../../src/runtime/input/normalizer.rs) | 文字正規化：NFKC + **手工全形標點對照表**、空白、大小寫 |
-| [`intent.rs`](../../../src/runtime/input/intent.rs) | intent 分類：`option_id` option-path + rule-lexicon 計分 + text-override |
-| [`slots.rs`](../../../src/runtime/input/slots.rs) | slot 抽取：time range / metric / asset / rank limit；asset 未知判定走 config allowlist |
-| [`pipeline.rs`](../../../src/runtime/input/pipeline.rs) | `InputPipeline::run_with_config` 串接，實際執行 `normalize → injection → intent → slots`；config `input_stages` 仍為宣告性、目前未據其分派（input_guard 為 orchestrator 前置步） |
+子檔案分工見各檔 `//!`（[`mod.rs`](../../../src/runtime/input/mod.rs)、`normalizer.rs`、`intent.rs`、`slots.rs`、`pipeline.rs`）。本頁只記 doc comment 沒說的部分：
+
+- intent 判定是三層合成：`option_id` option-path ＋ rule-lexicon 計分 ＋ text-override。
+- **`pipeline.rs` 的執行順序是寫死的** `normalize → injection → intent → slots`；config
+  `input_stages` 仍為宣告性、未據其分派（input_guard 是 orchestrator 前置步，不在本 pipeline 內）。
 
 ## 關鍵點
 - **NFKC 不足**：`、「」` 等全形標點需手工對照表補。
