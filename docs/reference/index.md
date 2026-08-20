@@ -18,8 +18,9 @@
 1. [`prd.md`](./prd.md) 是**目標產品樣貌**；每條需求必須標 `已完成 / 部分完成 / 待建置 / 待決策`，不可把 status 省略。
 2. Spec、QA、endpoint 與 module 頁只記錄**目前已實作行為與證據**，不把 PRD target 寫成現況。
 3. 可執行程式碼、設定與測試是現況行為證據；若與 current-state reference 衝突，先校正文件。
-4. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
-5. 移植期的歷史 PRD／Spec／TC 已自 worktree 移除，由 git 保存（取回方式見 [`docs/index.md`](../index.md#歷史git-保存不在-worktree)）。PRD／Spec／TC 三類文件的完整歸屬見 [`docs/index.md`](../index.md#prd--spec--tc-的歸屬)。
+4. module 頁只寫**落差、決策、陷阱**與跨模組 wiring 現實；「模組／檔案是什麼」的結構描述唯一擁有者是 `src/**` 的 `//!` doc comment（與程式同 diff，漂移即刻可見），module 頁不複述。endpoint 頁不適用本條——wire contract 沒有其他家，完整保留。
+5. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
+6. 移植期的歷史 PRD／Spec／TC 已自 worktree 移除，由 git 保存（取回方式見 [`docs/index.md`](../index.md#歷史git-保存不在-worktree)）。PRD／Spec／TC 三類文件的完整歸屬見 [`docs/index.md`](../index.md#prd--spec--tc-的歸屬)。
 
 ## 2. 一句話定位
 

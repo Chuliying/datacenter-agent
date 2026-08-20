@@ -1,8 +1,8 @@
 schema_version: work-item/v3
 slug: reference-docs-040-sync
-title: docs/reference 的 PRD／Spec／QA 同步到 crate 0.4.0 現況
+title: docs/reference 的 PRD／Spec／QA 同步到 crate 0.4.0 現況＋module 頁縮減
 created_at: 2026-08-20T14:48:00+08:00
-updated_at: 2026-08-20T14:48:00+08:00
+updated_at: 2026-08-20T16:30:00+08:00
 execution_mode: refactor
 work_status: active
 delivery_status: not_requested
@@ -18,3 +18,5 @@ inputs:
   - src/test_support.rs
   - commit:2762be7
   - commit:18c1d5c
+  - user:modules-shrink-endpoints-keep-2026-08-20
+  - docs/reference/modules/index.md

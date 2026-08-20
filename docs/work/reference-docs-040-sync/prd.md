@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | Story ID | S-DOCS-01 |
-| Version | v1.0.0 |
+| Version | v1.1.0 |
 | Status | Ready |
 | Sprint | N/A |
 | has_ui | false |
@@ -40,6 +40,7 @@
 | 同步時把 PRD 的 target state 改寫成現況，讓 PRD 失去「未完成」的標記 | 三份文件角色不同，一起改時的混用成本最高 | 沿用 `docs/reference/index.md` §1 的分工：`prd.md` 只標建置狀態，Spec/QA 只寫已實作行為 |
 | 引用測試作為證據，後續重構改名後證據失效 | QA 頁以測試名當 evidence | 只引測試函式名 + 檔案路徑，不引行號（沿用 `docs/reference/**` 現行慣例） |
 | 三份文件共 872 行，一次改寫時只改標頭、不動內文即可看起來完成 | 版本標頭與內文分離 | AC 逐份要求可 grep 的具體事實，不接受只改版本號 |
+| module 頁縮減時把落差／決策／陷阱誤當可推導內容刪掉 | 縮減與同步同一輪進行，黃金內容混在可推導表格附近（例：agent.md 子模組表格內嵌「ToolRegistry dormant」） | 每條刪除必須能在對應 `//!` doc comment 找到同義事實才可刪；找不到就地保留並歸類為落差／決策／陷阱（見 ERR-003） |
 | Evidence | `docs/reference/index.md` 的 ⚠ 同步狀態段；`docs/reference/spec/spec.md:49`（只記 418，未記 outer fallback）；`docs/reference/tests/qa-plan.md:154`（`TC-CT01 auth 418 讀碼 / 沒有 HTTP characterization test`）；`src/server/route.rs`（`retired_paths_return_404_regardless_of_authorization`、`unmatched_paths_do_not_leak_token_validity`、`surviving_paths_are_still_routed`、`openai_timeout_returns_openai_error_envelope`、`per_group_timeout_layers_survive_a_merge`）；`src/test_support.rs` | 以 worktree 程式碼為現況證據，衝突時改文件 |
 
 ---
@@ -52,12 +53,16 @@
 - `docs/reference/spec/spec.md`：記入 0.4.0 的 outer `fallback` 統一 404 行為，以及 `Router::merge` 會帶走 sub-router fallback 這個成因。
 - `docs/reference/tests/qa-plan.md`：把 evidence 欄位從「讀碼」改指 0.4.0 新增的 router-level 測試，並更新剩餘 gap 清單。
 - `docs/reference/index.md`：⚠ 同步狀態改為逐檔陳述，同步完成的檔案從警告中移除。
+- `docs/reference/modules/**`：縮到「程式說不出口的那一半」——每頁只留**落差**（宣告未接線、dormant）、
+  **決策**（為何如此設計）、**陷阱**（移植注意），以及跨模組 wiring 現實；「子檔案／子模組職責表」與
+  型別重講刪除，改一行指向對應 `src/**/mod.rs` 的 `//!` doc comment（結構的唯一擁有者）。
+  （2026-08-20 使用者拍板：modules 縮、endpoints 留。）
 
 ### Out of scope
 
 - 改變任何 runtime 行為，包含 418 → 401 的遷移決策。
 - 歷史移植文件（已自 worktree 移除，git 保存）與本機 `docs/archives/`（未版控）——兩者都不是現況權威，不在同步範圍。
-- `docs/reference/endpoints/**` 與 `docs/reference/modules/**`（2026-08-17 已校正，只在與三份文件衝突時順手修正）。
+- `docs/reference/endpoints/**`：**原樣保留**。endpoint 頁是 wire contract（request/response 形狀、status code、timeout）唯一的家，rustdoc 與 OpenAPI 都不涵蓋；縮它等於刪掉外部消費者的 API reference。只在與三份文件衝突時順手修正。
 - 補測試。QA 頁只記錄現有 evidence 與 gap，不在本 work item 寫 Rust 測試。
 
 ---
@@ -127,6 +132,23 @@ Flow: N/A，因為這是文件同步工作，沒有使用者互動流程；驗�
 
 - 清單為空時明寫「無已知落差」，不刪整段——下次落後時要有地方寫。
 
+### FR-005: module 頁只承載程式說不出口的內容
+
+**使用者價值**: 「模組是什麼」在 `//!` doc comment 與 module 頁各有一份時，改 code 的人只會同步前者（spec-05 的 orchestrator→turn 改名即前例）；把可推導內容的唯一擁有者定為 doc comment 後，module 頁剩下的每一行都是必須人腦維護、也值得人腦維護的內容。
+
+**Behavior**: `docs/reference/modules/*.md`（`index.md` 除外，它是地圖）逐頁改寫：刪除子檔案／子模組職責表與型別結構重講，改為一行指向對應 `src/**/mod.rs`；保留並前置「Production reality／落差／關鍵點／陷阱」段。`agent.md`、`server.md` 為主要縮減對象；`runtime-audit.md` 的形狀（已實作五行 + Production reality 六行）是目標範本。
+
+**Data source**: Existing `src/**/mod.rs` 與各檔 `//!` doc comment（刪除前的比對基準）
+
+**Permissions / Visibility**: 同上
+
+**Boundary conditions**:
+
+- 只刪「對應 `//!` comment 已有同義事實」的內容；doc comment 沒有的事實不刪，就地歸類。
+- 內嵌在表格裡的落差註記（如 dormant 標記）先抽出保留，再刪表格。
+- `endpoints/**` 完全不動（見 Out of scope）。
+- `docs/reference/index.md` §1 的分工規則（結構歸 rustdoc、落差歸 module 頁）與本 FR 一致。
+
 ---
 
 ## 7. Error Scenarios (ERR)
@@ -146,6 +168,14 @@ Flow: N/A，因為這是文件同步工作，沒有使用者互動流程；驗�
 **Expected behavior**: QA 頁引用的每個測試名都能在 worktree 中找到。
 
 **Recovery**: 對每個引用執行 `grep -rn "<test_name>" src tests`，找不到就改回 gap 敘述。
+
+### ERR-003: 縮減時黃金內容被連帶刪除
+
+**Trigger**: 刪除子模組表格或型別重講時，混在其中的落差／決策／陷阱敘述（dormant 標記、wiring 現實、移植注意）一併消失。
+
+**Expected behavior**: 每條被刪的敘述都能在對應 `//!` doc comment 指出同義事實；指不出來的敘述不刪。
+
+**Recovery**: 以 `git diff docs/reference/modules/` 逐條檢視刪除行，對每行執行「`//!` 有沒有這件事」的比對；沒有就還原該行並歸入落差／決策／陷阱段。
 
 ---
 
@@ -185,6 +215,17 @@ Given docs/reference/prd.md 已完成本次同步
 When 執行 git diff 檢視該檔變更
 Then 變更只出現在版本標頭、版本歷史與每條需求的狀態標記
 And 沒有任何需求敘述或 AC 條文本身被刪除或改寫
+```
+
+### AC-005: module 頁縮減後黃金內容仍在、可推導內容已交還
+
+```gherkin
+Given docs/reference/modules/*.md 已完成本次縮減
+When 在 modules/ 目錄搜尋子檔案／子模組職責表（「| 檔案 | 職責 |」表頭）
+Then 除 index.md 外找不到任何一個
+And grep 仍找得到已知黃金事實：AgentPort（agent.md 的 wiring 落差）、redact_secrets（runtime-audit.md 的未呼叫落差）、NFKC（runtime-input.md 的手工對照表陷阱）、ToolRegistry dormant（自表格抽出後保留）
+And 每頁含一行指向對應 src/**/mod.rs 的結構指針
+And docs/reference/endpoints/**（chat-completions.md 的 mapping 規則與「三個不同」表）無任何刪除
 ```
 
 ---
