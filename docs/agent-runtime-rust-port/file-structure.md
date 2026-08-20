@@ -1,5 +1,7 @@
 # Agent Runtime Rust 移植 — 嚴謹 File Structure
 
+> **已被取代（superseded）**：現況的模組結構權威為 [`docs/reference/modules/index.md`](../reference/modules/index.md)。本檔是移植期規劃的檔案結構，僅供溯源，不代表目前 worktree。
+
 **版本**: v1.0.0  
 **狀態**: draft  
 **SSOT**: 本檔定義落地檔案結構；行為細節以 `spec/` 分檔為準。

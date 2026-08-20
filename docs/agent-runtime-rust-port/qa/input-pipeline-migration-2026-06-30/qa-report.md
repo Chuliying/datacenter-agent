@@ -1,5 +1,7 @@
 # Falcon Client → Rust Input Pipeline 遷移驗收報告
 
+> **歷史驗收紀錄**：本報告記錄 2026-06-30 falcon-client → Rust input pipeline 的遷移驗收，不隨程式碼更新。原存於 `.agent/artifacts/qa/`，2026-08-20 移到它引用的 PRD／QA plan 旁邊。現況測試覆蓋見 [`docs/reference/tests/qa-plan.md`](../../../reference/tests/qa-plan.md)。
+
 **驗收日期**：2026-06-30  
 **驗收環境**：local Falcon Client `http://localhost:3001` → Docker Rust Agent `http://localhost:8080`  
 **對應 PRD**：`docs/agent-runtime-rust-port/prd.md`  

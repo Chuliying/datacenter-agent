@@ -1,5 +1,7 @@
 # Agent Runtime Rust Port QA Plan
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/tests/qa-plan.md`](../../reference/tests/qa-plan.md)。本檔是移植期（2026-06-25）的 TC 清單，狀態停在 draft，僅供溯源，不代表目前的測試現況。
+
 **對應 PRD**: `docs/agent-runtime-rust-port/prd.md` v1.2.0  
 **對應 Spec**: `docs/agent-runtime-rust-port/spec/spec-overview.md` + `spec-01`..`spec-06`  
 **Story ID**: S-RUNTIME-01  

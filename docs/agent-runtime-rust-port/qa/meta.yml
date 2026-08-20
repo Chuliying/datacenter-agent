@@ -1,8 +1,16 @@
 skill: qa
 stage: qa
 created_at: 2026-06-25T00:00:00+08:00
-status: draft
+status: superseded
+superseded_by: docs/reference/tests/qa-plan.md
 primary_output: qa-plan.md
+outputs:
+  - qa-plan.md
+  - qa-report.md
+note: >-
+  移植期（2026-06-25）的 QA 方案與驗收；現況測試權威已移至 docs/reference/tests/qa-plan.md。
+  同期 falcon-client → Rust input pipeline 的遷移驗收自帶 meta，放在
+  input-pipeline-migration-2026-06-30/，原存於 .agent/artifacts/qa/。
 inputs:
   - docs/agent-runtime-rust-port/prd.md
   - docs/agent-runtime-rust-port/spec/spec-overview.md

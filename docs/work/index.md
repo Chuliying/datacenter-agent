@@ -48,5 +48,5 @@ skill-commons v0.10.0 起，`work_status: completed` 的 v3 work item 必須宣�
 
 - `docs/work/<slug>/meta.yml` is the owner for work status, delivery status and stage state.
 - Validate with `bash .agent/skills/_shared/scripts/work-items.sh check`.
-- Promote long-lived facts to `docs/reference/`; keep work-specific history here.
+- Promote long-lived facts to `docs/reference/`; keep work-specific history here. PRD／Spec／TC 的完整歸屬見 [`docs/index.md`](../index.md#prd--spec--tc-的歸屬)。
 - New work items follow `.agent/skills/_shared/ARTIFACTS.md` and declare `schema_version: work-item/v3`.

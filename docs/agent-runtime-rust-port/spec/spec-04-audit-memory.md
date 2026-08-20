@@ -1,5 +1,7 @@
 # P4 — L14 Audit（完整 + 可插拔）+ L12 Memory
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md)、[`docs/reference/modules/runtime-audit.md`](../../reference/modules/runtime-audit.md) 與 [`runtime-memory.md`](../../reference/modules/runtime-memory.md)。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **分期**: P4 ・ 依賴: P1, P2 ・ 估時: ~5h ・ 上層: `spec-overview.md`
 
 > audit 涵蓋每個決策點且可插拔；memory 為 server 端、trait 化、可換後端。

@@ -1,5 +1,7 @@
 # Agent Runtime Rust Port QA Report
 
+> **歷史驗收紀錄**：本報告記錄 2026-06-26 移植期的閘門結果，不隨程式碼更新。現況測試覆蓋與缺口見 [`docs/reference/tests/qa-plan.md`](../../reference/tests/qa-plan.md)。同期另一份驗收見 [`input-pipeline-migration-2026-06-30/qa-report.md`](./input-pipeline-migration-2026-06-30/qa-report.md)。
+
 **Story ID**: S-RUNTIME-01  
 **Date**: 2026-06-26  
 **Scope**: local `datacenter-agent` runtime implementation through PR-10 replay-smoke coverage.

@@ -1,5 +1,7 @@
 # Agent Runtime Response Baseline Guide
 
+> **歷史操作指引**：本檔寫於 2026-06-26 的 PR-10 階段。現況的 eval 行為與 baseline 設定權威為 [`docs/reference/modules/runtime-eval.md`](../reference/modules/runtime-eval.md)；沿用本指引前先確認該頁描述的現況。
+
 **Story ID**: S-RUNTIME-01  
 **Date**: 2026-06-26  
 

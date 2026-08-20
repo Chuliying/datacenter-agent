@@ -19,7 +19,7 @@
 2. Spec、QA、endpoint 與 module 頁只記錄**目前已實作行為與證據**，不把 PRD target 寫成現況。
 3. 可執行程式碼、設定與測試是現況行為證據；若與 current-state reference 衝突，先校正文件。
 4. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
-5. `docs/agent-runtime-rust-port/**` 與 `docs/archives/**` 是歷史移植需求、設計與計畫資料，不是目前 target/current contract。
+5. `docs/agent-runtime-rust-port/**` 與 `docs/archives/**` 是歷史移植需求、設計與計畫資料，不是目前 target/current contract。PRD／Spec／TC 三類文件的完整歸屬（現況／過程／歷史各在哪裡）見 [`docs/index.md`](../index.md#prd--spec--tc-的歸屬)。
 
 ## 2. 一句話定位
 

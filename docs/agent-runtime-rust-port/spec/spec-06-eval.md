@@ -1,5 +1,7 @@
 # P6 — 模型 / skill Eval（第二條驗證軸）
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md) 與 [`docs/reference/modules/runtime-eval.md`](../../reference/modules/runtime-eval.md)。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **分期**: P6 ・ 依賴: P1–P5 ・ 估時: ~5h ・ 上層: `spec-overview.md`
 
 > 確定性測試驗機制；eval 分兩軸：pipeline eval 離線驗 intent/slots/action，response eval 驗 LLM/skill **輸出品質**。eval 與其他模組同一套可拔插機制（經 Registry），fixtures 隨能力包，可重跑當 CI gate。對齊 falcon-client I12。

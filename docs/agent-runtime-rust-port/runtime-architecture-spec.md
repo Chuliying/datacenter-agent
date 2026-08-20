@@ -1,5 +1,7 @@
 # 通用 Agent Runtime — 平台架構規格（System Architecture / Design / Testing）
 
+> **已被取代（superseded）**：現況架構權威為 [`docs/reference/index.md`](../reference/index.md) 與 [`docs/reference/modules/`](../reference/modules/index.md)。本檔是移植期的平台架構規格（v1.0.0），其中尚未落地的部分屬 target 而非現況，僅供溯源。
+
 **Spec 版本**: v1.0.0
 **性質**: 領域無關的平台架構規格。`spec/`（falcon-client 移植，已依分期拆檔）是本架構的**第一個實例**；本文件定義「任何垂直應用都能接上」的通用骨架。
 **目標 repo**: `datacenter-agent`（Rust）

@@ -1,5 +1,7 @@
 # P2 — L5 Input Engineering
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md) 與 [`docs/reference/modules/runtime-input.md`](../../reference/modules/runtime-input.md)。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **分期**: P2 ・ 依賴: P1 ・ 估時: ~4h ・ 上層: `spec-overview.md`
 
 > 把原始中文/中英混合輸入收斂成 `NormalizedInput`（intent + slots + confidence + warnings）。純函式、stage 化（由 P1 的 registry 依 config 組裝啟用順序）。

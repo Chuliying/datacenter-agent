@@ -1,5 +1,7 @@
 # P5 — Orchestrator + 接線
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md) 與 [`docs/reference/modules/runtime-turn.md`](../../reference/modules/runtime-turn.md)（本檔的 `runtime::orchestrator` 已改名為 `runtime::turn`）。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **分期**: P5 ・ 依賴: P1–P4 ・ 估時: ~6h ・ 上層: `spec-overview.md`
 
 > 一輪 turn 的編排權威；只依賴 trait；包覆現有 `llm_connector` agent loop。把 P1–P4 串成完整流程並接上 axum host。

@@ -1,5 +1,7 @@
 # P1 — config + registry + schema + error
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md) 與 [`docs/reference/modules/runtime-registry.md`](../../reference/modules/runtime-registry.md)。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **分期**: P1 ・ 依賴: 無 ・ 估時: ~5h ・ 上層: `spec-overview.md`
 
 > 本層是「config 驅動 + 模組拔插」的地基：載入能力包、註冊可插拔模組、定義核心型別與錯誤。

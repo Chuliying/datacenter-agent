@@ -1,5 +1,7 @@
 # P3 — L6 Guardrails + 回答前決策
 
+> **已被取代（superseded）**：現況權威為 [`docs/reference/spec/spec.md`](../../reference/spec/spec.md) 與 [`docs/reference/modules/runtime-guardrails.md`](../../reference/modules/runtime-guardrails.md)。本檔為原始移植規格，僅供溯源，不代表目前 contract。
+
 **分期**: P3 ・ 依賴: P1, P2 ・ 估時: ~3h ・ 上層: `spec-overview.md`
 
 > 注入偵測、結構性 guard、回答前 4 級決策。決定「擋下/拒絕/加提示/作答」，且在呼叫 LLM 前完成。
