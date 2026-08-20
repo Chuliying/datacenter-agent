@@ -442,6 +442,8 @@ pub const ERR_INVALID_REQUEST: &str = "invalid_request_error";
 pub const ERR_UPSTREAM: &str = "upstream_error";
 /// OpenAI error `type` for an internal / unavailable condition (HTTP 5xx).
 pub const ERR_SERVER: &str = "server_error";
+/// OpenAI error `type` for a burst-limited request (HTTP 429, AC-015).
+pub const ERR_RATE_LIMIT: &str = "rate_limit_error";
 
 /// OpenAI error envelope: `{"error": {"message": ..., "type": ...}}`.
 ///

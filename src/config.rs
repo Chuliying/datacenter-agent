@@ -131,6 +131,46 @@ struct Manifest {
     /// Optional `/report` pipeline assets (the HTML template; default path applied when absent).
     #[serde(default)]
     report: Option<ReportManifest>,
+    /// Optional `[server]` section (ingress policy; defaults applied when absent).
+    #[serde(default)]
+    server: Option<ServerManifest>,
+}
+
+/// Optional `[server]` section: HTTP ingress policy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerManifest {
+    /// Optional `[server.rate_limit]` global burst-admission policy.
+    #[serde(default)]
+    rate_limit: Option<RateLimitConfig>,
+}
+
+/// `[server.rate_limit]`: opt-in process-local global burst limiter for the
+/// expensive routes (S-RUNTIME-SEC-01 FR-005). Disabled unless the section is
+/// present and `enabled = true`; when the section is present, the policy must
+/// be explicit — there is no undocumented crate preset (FR-004).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Whether the limiter is attached at all. Default: disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Token-bucket burst size (admissions available at once).
+    pub burst_size: std::num::NonZeroU32,
+    /// One admission token refills every this many milliseconds.
+    pub refill_period_ms: std::num::NonZeroU64,
+}
+
+impl Default for RateLimitConfig {
+    /// The absent-section shape: disabled, with placeholder policy values
+    /// that are never consulted while `enabled` is false.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            burst_size: std::num::NonZeroU32::MIN,
+            refill_period_ms: std::num::NonZeroU64::new(1000).expect("1000 is non-zero"),
+        }
+    }
 }
 
 /// Optional `[report]` section: assets for the `/report` HTML pipeline.
@@ -309,6 +349,8 @@ pub struct AppConfig {
     /// The `/report` HTML template body, read at load from `[report].template` (or its default
     /// path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
     pub report_template: String,
+    /// Resolved `[server.rate_limit]` policy (disabled default when absent).
+    pub rate_limit: RateLimitConfig,
 }
 
 /// Resolved `/insight` pipeline tool grants — which tools each sub-agent exposes to its LLM.
@@ -458,6 +500,11 @@ impl AppConfig {
 
         let report_template = load_report_template(&root, manifest.report.as_ref())?;
 
+        let rate_limit = manifest
+            .server
+            .and_then(|server| server.rate_limit)
+            .unwrap_or_default();
+
         // Log the loaded config
         info!(
             root = %root.display(),
@@ -471,6 +518,7 @@ impl AppConfig {
             runtime,
             insight_grants,
             report_template,
+            rate_limit,
         })
     }
 

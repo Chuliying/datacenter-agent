@@ -31,9 +31,13 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use std::sync::Arc;
+
 use super::auth::{require_bearer, require_bearer_openai};
 use super::handler;
+use super::rate_limit::{self, ErrorFamily, GlobalBurstLimiter};
 use super::{openai, AppState};
+use crate::runtime::audit::{AuditSink, TracingAuditSink};
 
 /// Convert a middleware error on the OpenAI sub-router into the OpenAI **error envelope**
 /// (`{"error":{"message","type"}}`), so `/v1/chat/completions` never returns the empty body a bare
@@ -95,6 +99,18 @@ pub fn build_router(state: AppState) -> Router {
             HeaderValue::from_static("no-referrer"),
         ));
 
+    // Opt-in global burst limiter (S-RUNTIME-SEC-01 FR-005): one shared bucket
+    // for the expensive routes only. Rejections audit through the runtime's
+    // sink when the runtime is wired, else the tracing sink — same stream.
+    let limiter = state.rate_limit.enabled.then(|| {
+        let audit: Arc<dyn AuditSink> = state
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.audit_sink.clone())
+            .unwrap_or_else(|| Arc::new(TracingAuditSink));
+        Arc::new(GlobalBurstLimiter::new(&state.rate_limit, audit))
+    });
+
     // The four standard endpoints: standard 120 s timeout, `require_bearer` (D6, `418` on a bad
     // token). Auth + timeout are applied to this sub-router so they stay scoped to these routes.
     //
@@ -103,11 +119,23 @@ pub fn build_router(state: AppState) -> Router {
     // forced-pipeline variants were redundant — and they were the only prompt entry points that
     // bypassed the runtime prelude (no guardrails, no audit). Callers use `/agent/stream`
     // (streaming) or `/v1/chat/completions` (non-streaming).
+    //
+    // `/agent/stream` sits on its own nested router so the opt-in limiter can wrap it without
+    // touching `/health`, `/ready`, or `/greeting` (AC-009). Auth is layered after (= outside)
+    // the limiter, so a bad token is rejected before any admission capacity is consumed (AC-014).
+    let mut agent_stream = Router::new().route("/agent/stream", post(handler::agent_stream));
+    if let Some(limiter) = &limiter {
+        let limiter = limiter.clone();
+        agent_stream = agent_stream.layer(middleware::from_fn(move |req, next| {
+            let limiter = limiter.clone();
+            async move { rate_limit::enforce(limiter, ErrorFamily::Standard, req, next).await }
+        }));
+    }
     let standard = Router::new()
         .route("/health", get(handler::health))
         .route("/ready", get(handler::ready))
         .route("/greeting", get(handler::greeting))
-        .route("/agent/stream", post(handler::agent_stream))
+        .merge(agent_stream)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,
@@ -121,8 +149,18 @@ pub fn build_router(state: AppState) -> Router {
     // non-streaming path (finding #1), and a dedicated bearer gate that rejects with `401` + the
     // OpenAI error envelope rather than `418` (finding #6). The shared `require_bearer` (and its
     // D6 contract for the standard endpoints above) is left untouched.
-    let openai = Router::new()
-        .route("/v1/chat/completions", post(handler::chat_completions))
+    let mut openai_routes =
+        Router::new().route("/v1/chat/completions", post(handler::chat_completions));
+    if let Some(limiter) = &limiter {
+        // Innermost layer: a 429 is an ordinary response, so it passes back through the
+        // timeout/error stack untouched; auth still runs first (outermost).
+        let limiter = limiter.clone();
+        openai_routes = openai_routes.layer(middleware::from_fn(move |req, next| {
+            let limiter = limiter.clone();
+            async move { rate_limit::enforce(limiter, ErrorFamily::OpenAi, req, next).await }
+        }));
+    }
+    let openai = openai_routes
         // `HandleErrorLayer` (outer) catches the `tower::timeout` layer's `Elapsed` error and turns
         // it into the OpenAI error envelope, instead of the empty body `tower_http`'s
         // `with_status_code` variant would send (finding #4). Auth stays outermost (applied last).

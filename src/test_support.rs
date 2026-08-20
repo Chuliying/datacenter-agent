@@ -142,6 +142,7 @@ pub(crate) async fn app_state() -> (AppState, StubMcpSession) {
         runtime: None,
         insight_grants: InsightGrants::default(),
         report_template: Arc::new(String::new()),
+        rate_limit: crate::config::RateLimitConfig::default(),
     };
 
     (state, session)

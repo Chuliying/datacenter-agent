@@ -197,6 +197,10 @@ pub struct AppState {
     /// The `/report` HTML template body (from `[report].template`), shared read-only. Its
     /// `__REPORT_DATA_JSON__` placeholder is validated present at boot; the `renderer` fills it.
     pub report_template: Arc<String>,
+    /// Resolved `[server.rate_limit]` policy. Disabled by default; when
+    /// enabled, `build_router` attaches the global burst limiter to the
+    /// expensive routes (S-RUNTIME-SEC-01 FR-005).
+    pub rate_limit: crate::config::RateLimitConfig,
 }
 
 /// Runtime dependencies assembled at boot.
@@ -268,6 +272,7 @@ impl AppState {
             runtime,
             insight_grants: app_config.insight_grants.clone(),
             report_template: Arc::new(app_config.report_template.clone()),
+            rate_limit: app_config.rate_limit.clone(),
         })
     }
 
