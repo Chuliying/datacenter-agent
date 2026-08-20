@@ -27,6 +27,6 @@
 
 ## 相關
 - 何時被呼叫 → [turn](./runtime-turn.md) 流程第 1、4 步
-- regex 移植注意（`\b` 對 CJK 語意）→ [移植 PRD](../../agent-runtime-rust-port/prd.md)
+- regex 移植注意（源自 TS 移植）：`/i`→`(?i)`、`\b` 的 word boundary 對 CJK 語意不同、anchor 行為有差——新增 pattern 逐條檢視，不可 verbatim 搬
 - 後端組裝 → [registry](./runtime-registry.md)
 - 決策後的稽核 → [audit](./runtime-audit.md)

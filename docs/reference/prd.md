@@ -333,7 +333,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - 不承諾任意第三方動態載入 native code；「可拔插」限定為 registry 已註冊元件的 config 組合。
 - 不在沒有 identity contract 前宣稱 multi-tenant memory 安全完成。
 - 不用 LLM judge 名稱包裝 substring/heuristic checks。
-- 不把 historical `docs/agent-runtime-rust-port/**` 當成目前完成狀態。
+- 不把 historical 移植文件（已自 worktree 移除，git 保存於 `817418c`）當成目前完成狀態。
 - 不讓 Final LLM 自行決定或直接執行 MCP/DB/RAG calls；若未來需要 iterative retrieval，必須由受控 planner/gateway 階段完成並輸出新版 Evidence Pack。
 - 不把 Evidence Pack 當「把所有 raw data 塞進 prompt」；必須遵守 provenance、classification、budget 與 untrusted-data boundary。
 - 不在本 runtime 內建集團級 Platform Control Plane（app/tenant/quota/cost/release-gate console）或機房/GPU 算力規劃；runtime 只需可被上層平台治理，這些屬平台層範圍。
@@ -344,4 +344,4 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - [Current implementation spec](./spec/spec.md)
 - [Current QA evidence](./tests/qa-plan.md)
 - [Code change plan](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)
-- [Historical migration documents](../agent-runtime-rust-port/prd.md)
+- Historical migration documents：`git show 817418c:docs/agent-runtime-rust-port/prd.md`（全表見 [`docs/index.md`](../index.md#歷史git-保存不在-worktree)）

@@ -33,3 +33,13 @@ jobs:
 
       - name: Response replay smoke
         run: cargo run --bin eval -- --response --replay config/runtime/evals/replay-smoke.json
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 不 init submodule：gate 只驗外層 repo 的連結，submodule 路徑以 .gitmodules 白名單放行
+      - name: Doc link gate
+        run: bash scripts/check-doc-links.sh

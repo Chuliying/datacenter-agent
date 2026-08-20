@@ -11,7 +11,7 @@ stages:
   prd: { skill: prd-interview, file: prd.md, status: ready }
 inputs:
   - .agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md
-  - docs/agent-runtime-rust-port/spec/spec-06-eval.md
+  - commit:817418c（docs/agent-runtime-rust-port/spec/spec-06-eval.md，歷史 spec，已自 worktree 移除）
   - docs/reference/modules/runtime-eval.md
   - src/runtime/eval/evaluator.rs
   - src/runtime/eval/runner.rs

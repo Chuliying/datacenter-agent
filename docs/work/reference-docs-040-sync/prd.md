@@ -56,7 +56,7 @@
 ### Out of scope
 
 - 改變任何 runtime 行為，包含 418 → 401 的遷移決策。
-- `docs/agent-runtime-rust-port/**` 與 `docs/archives/**`（歷史區，不是現況權威）。
+- 歷史移植文件（已自 worktree 移除，git 保存）與本機 `docs/archives/`（未版控）——兩者都不是現況權威，不在同步範圍。
 - `docs/reference/endpoints/**` 與 `docs/reference/modules/**`（2026-08-17 已校正，只在與三份文件衝突時順手修正）。
 - 補測試。QA 頁只記錄現有 evidence 與 gap，不在本 work item 寫 Rust 測試。
 
