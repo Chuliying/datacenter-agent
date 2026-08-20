@@ -77,23 +77,27 @@ JSON 使用 snake_case 欄位；只有 `prompt` 必填。所有 `JsonRejection` 
 
 ### 2.4 SSE wire
 
-`StreamFrame` 使用 `#[serde(tag = "event", rename_all = "lowercase")]`；`IntentResolved` 額外 rename 為 `intent.resolved`，payload 使用 camelCase。
+`StreamFrame` 使用 `#[serde(tag = "event", rename_all = "lowercase")]`，共 **9 種 variant**，`/agent/stream` 全部外送（`insight_frames` 映射 `AgentEvent` → `StreamFrame`）：
 
-```text
-data: {"event":"intent.resolved","data":{"intent":"charging","candidateIntents":["charging"]}}
-data: {"event":"token","data":"..."}
-data: {"event":"clear"}
-data: {"event":"done"}
-data: {"event":"error","data":"..."}
-```
+| event | payload | 說明 |
+|---|---|---|
+| `intent.resolved` | `IntentResolvedData`（camelCase） | prelude 解析結果，只在 stream 開頭一次 |
+| `stage` | `StageData` | sub-agent stage 轉換（started/success/failure） |
+| `token` | string | 答案增量 |
+| `tool_call` | `ToolCallData` | 模型的 tool-call 意圖 |
+| `tool_args` | `ToolArgsData` | tool 參數增量 |
+| `usage` | `UsageData` | token 用量 |
+| `clear` | — | 清除已送答案 buffer |
+| `done` | — | 正常終止 |
+| `error` | string | 錯誤終止 |
 
-`intent.resolved` 只由 runtime path 產生。`ToolCalled`/`ToolResult` 不映射到外部 SSE。
+v1.3.x 記錄的「`ToolCalled`/`ToolResult` 不映射到外部 SSE」描述的是已 dormant 的 runtime `TurnEvent` 路徑，**不適用**現行 handler 直驅 pipeline 的 wire。逐 frame 契約與範例見 [`../endpoints/agent-stream.md`](../endpoints/agent-stream.md)。
 
 ## 3. Serving path 與 rollback
 
 ### 3.1 Runtime 必要性
 
-`runtime_enabled_from_env` 只有 trim 後 case-insensitive `false` 或字串 `0` 視為 rollback；其他值與未設均啟用 runtime。0.4.0 起 rollback **不再選擇替代 serving path**：兩個 prompt 端點都回 503（`runtime disabled (RUNTIME_ENABLED=false)` 訊息；OpenAI 端點以 envelope 包裝），僅剩 `/health`、`/ready`、`/greeting` 可用。rollback 時 `AppRuntime` 為 None 且在讀 capability config 前跳過 runtime build，壞 config 不阻擋 startup（`explicit_rollback_skips_invalid_runtime_config`）；runtime enabled 但 top-level `[runtime]` 缺失則 startup fail，不靜默降級。
+`runtime_enabled_from_env` 以 trim 後 case-insensitive 比對 `RUNTIME_DISABLED_VALUES = ["false", "0", "no", "off", "disabled"]`（`src/appstate.rs`），五種拼法都觸發 rollback；其他值與未設均啟用 runtime。0.4.0 起 rollback **不再選擇替代 serving path**：兩個 prompt 端點都回 503（`runtime disabled (RUNTIME_ENABLED=false)` 訊息；OpenAI 端點以 envelope 包裝），僅剩 `/health`、`/ready`、`/greeting` 可用。rollback 時 `AppRuntime` 為 None 且在讀 capability config 前跳過 runtime build，壞 config 不阻擋 startup（`explicit_rollback_skips_invalid_runtime_config`）；runtime enabled 但 top-level `[runtime]` 缺失則 startup fail，不靜默降級。
 
 ### 3.2 Prompt validation
 
@@ -254,14 +258,14 @@ GenerationConfig + discovered MCP tool schemas
 |---|---|
 | runtime prompt cap | 4000 |
 | answer policy effective thresholds | config `answer_gray` / `answer_normal`（目前 0.5 / 0.7） |
-| intent allowlist | `unknown`, `revenue`, `charging`, `site-build` |
+| intent allowlist | `unknown`, `revenue`, `charging`, `site-build`, `member`, `report`（`report` 亦驅動 pipeline routing，見 `wants_report_pipeline`） |
 | memory max turns | 5 |
 | memory context chars | 1200 |
-| runtime enabled env | default true；只有明確 `false`/`0` rollback |
+| runtime enabled env | default true；`false`/`0`/`no`/`off`/`disabled`（case-insensitive）都 rollback |
 
 ## 10. Verification evidence and gaps
 
-2026-08-20 fresh `cargo test` 為 **214 passed、0 failed、3 ignored**（lib 208 + integration 6；ignored 為 live LLM/MCP test 與 doc tests）。`cargo fmt --check` 通過；`eval --pipeline-only` passed=3。這不等於所有 HTTP/async failure mode 已被覆蓋。
+2026-08-20 fresh `cargo test` 為 **220 passed、0 failed、6 ignored**（lib 208 ＋ bin/eval 4 ＋ integration 8；ignored 為 5 個 live LLM/MCP test 與 1 個 doc test）。`cargo fmt --check` 通過；`eval --pipeline-only` passed=3。這不等於所有 HTTP/async failure mode 已被覆蓋。
 
 0.4.0 **已補上**的覆蓋：router-level 路由表迴歸（退役路徑 404、存活路徑仍被路由）、未匹配路徑對 Authorization 的一致性、per-group timeout 在 merge 後存活、OpenAI timeout envelope（`src/server/route.rs` 五個測試，依 `src/test_support.rs` 的 stub MCP fixture 組出真 `AppState`）。
 

@@ -37,7 +37,7 @@ exist in the tree. The real starting point:
   full tool set into the *same* streaming tool-loop
   ([`llm_connector::agent_stream`](../../src/llm_connector/agent.rs)).
 - **A pre-existing `runtime/` turn-orchestrator — NOT the contract's orchestrator.**
-  [`runtime/orchestrator.rs`](../../src/runtime/turn.rs) owns `run_agent_turn`, an
+  [`runtime/orchestrator.rs`（現 `turn.rs`）](../../src/runtime/turn.rs) owns `run_agent_turn`, an
   `AgentPort` trait, and an *input* "pipeline" (normalize → guard → intent → slots) plus
   answer-policy, memory, and audit. Its `LlmAgentPort` wraps the single streaming loop. `/agent`
   routes through this (default `RUNTIME_ENABLED=on`); `/report` **bypasses it** on the legacy

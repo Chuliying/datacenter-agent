@@ -46,7 +46,7 @@ bash .agent/skills/_shared/bootstrap/onboard.sh
 - `test_glob`: tests/**/*.rs
 - `work_root`: docs/work
 - `docs_root`: docs
-- `legacy_artifacts_root`: .agent/artifacts（僅剩 plan/2026-06-29-runtime-correctness/ 這份 retired 三件式 plan，狀態仍 active。歷史 QA artifact 已隨移植文件自 worktree 移除，git 保存於 817418c。新 work item 一律使用 docs/work）
+- `legacy_artifacts_root`: .agent/artifacts（僅剩 plan/2026-06-29-runtime-correctness/ 這份 retired 三件式 plan，狀態仍 active。歷史 QA artifact 已隨移植文件自 worktree 移除；取回：git show 817418c:docs/agent-runtime-rust-port/qa/input-pipeline-migration-2026-06-30/qa-report.md（該 commit 中已搬到新路徑，勿查舊 .agent 路徑）。新 work item 一律使用 docs/work）
 
 ## Stack
 

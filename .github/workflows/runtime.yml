@@ -40,6 +40,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 不 init submodule：gate 只驗外層 repo 的連結，submodule 路徑以 .gitmodules 白名單放行
+      # 不 init submodule：gate 對 .gitmodules 宣告的路徑整段跳過（存在性與版控檢查都不做），
+      # 只驗外層 repo 的連結——submodule 內容由 gitlink 釘住，不是本 gate 的職責
       - name: Doc link gate
         run: bash scripts/check-doc-links.sh

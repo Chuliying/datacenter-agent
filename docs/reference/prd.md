@@ -248,7 +248,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - runtime 開啟時 fail-fast 驗證全部 contract。
 - rollout/rollback 有 startup tests、smoke runbook 與明確 telemetry。
 
-現況（0.4.0 重判）：runtime 預設開啟；明確 `RUNTIME_ENABLED=false/0` 會在載入 capability config 前跳過 runtime build，且有 invalid-config regression test。惟 0.4.0 起 rollback 不再有 legacy serving——兩個 prompt 端點回 503，僅剩 health/ready/greeting，「legacy 可獨立開機」的 target 只剩 startup 成立、serving 不成立。staging rollback smoke/telemetry 尚未完成。
+現況（0.4.0 重判）：runtime 預設開啟；明確的 disable 值（`false`/`0`/`no`/`off`/`disabled`，case-insensitive）會在載入 capability config 前跳過 runtime build，且有 invalid-config regression test。惟 0.4.0 起 rollback 不再有 legacy serving——兩個 prompt 端點回 503，僅剩 health/ready/greeting，「legacy 可獨立開機」的 target 只剩 startup 成立、serving 不成立。staging rollback smoke/telemetry 尚未完成。
 
 ### FR-013：Evidence Pack 與 Final LLM isolation — 待建置
 

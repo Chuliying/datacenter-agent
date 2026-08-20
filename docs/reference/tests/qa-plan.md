@@ -14,12 +14,12 @@
 |---|---|
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --all-targets --all-features -- -D warnings` | exit 0 |
-| `cargo test` | **214 passed、0 failed、3 ignored** |
+| `cargo test` | **220 passed、0 failed、6 ignored** |
 | `cargo run --bin eval -- --pipeline-only` | reported passed=3、failed=0；exit 0 |
 | `cargo run --bin eval -- --response --replay config/runtime/evals/replay-smoke.json` | reported passed=2、failed=0；exit 0 |
 | synthetic failing replay | `tests/eval_cli.rs` 驗證 reported failed=1 時 process exit nonzero（隨 `cargo test` 執行） |
 
-三個 ignored 項目：外部 LLM/MCP live test 與 doc tests。一般 `cargo test` 不執行 live test。docker build 證據停在 v1.3.x（0.3.x image），未隨本次重驗。
+六個 ignored 項目：5 個外部 LLM/MCP live test 與 1 個 doc test。一般 `cargo test` 不執行 live test。docker build 證據停在 v1.3.x（0.3.x image），未隨本次重驗。
 
 ## 2. 測試層級定義
 
@@ -222,7 +222,7 @@ qa source 驗證曾展開 79 個 Rust test function references；79/79 都有 te
 
 目前可誠實宣稱：
 
-- clippy/fmt/test/pipeline-eval/replay-smoke 通過（2026-08-20 fresh run，214 passed/0 failed）。
+- clippy/fmt/test/pipeline-eval/replay-smoke 通過（2026-08-20 fresh run，220 passed/0 failed）。
 - 退役路徑回 404、未匹配路徑不洩漏 token 有效性、per-group timeout 與 OpenAI timeout envelope——都有 router-level 迴歸測試。
 - 所有被 qa-plan 引用的 Rust test fn 都存在。
 - deterministic pipeline/replay smoke 目前無 reported failure。

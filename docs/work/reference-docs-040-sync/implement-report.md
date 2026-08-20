@@ -12,8 +12,7 @@
   fallback 統一 404 與 `Router::merge` 成因（FR-002）；`AgentResponse` 與 legacy serving path
   移除；§3 改寫（validation error 已是 pre-stream HTTP status）；§4.2 記 `run_agent_turn`
   dormant、channel bounded（8192）；§10 換 2026-08-20 fresh 快照。
-- `docs/reference/tests/qa-plan.md` → v1.4.0：快照更新（`cargo test` **214 passed / 0 failed /
-  3 ignored**、clippy 0、pipeline eval 3/0、replay smoke 2/0）；新增 §4.7 route-level TC-R01~R05；
+- `docs/reference/tests/qa-plan.md` → v1.4.0：快照更新（`cargo test` **220 passed / 0 failed / 6 ignored**、clippy 0、pipeline eval 3/0、replay smoke 2/0）；新增 §4.7 route-level TC-R01~R05；
   AC-001/AC-010 verdict 重判；TC-CT01 更新、TC-CT02/TC-U03/TC-U04/TC-U05 標已刪除（附原因）；
   `orchestrator::` 前綴改 `turn::`、TC-I02/TC-C01 修正改名後的 fn 引用。
 - `docs/reference/prd.md` → v1.4.0：只動狀態標記（AC-004 驗證：diff 全部落在版本標頭、版本
@@ -53,5 +52,31 @@
 ## Fresh 驗證（2026-08-20）
 
 `cargo fmt --check` ✓、`cargo clippy --all-targets --all-features -- -D warnings` ✓、
-`cargo test` 214/0/3 ✓、`eval --pipeline-only` 3/0 ✓、replay smoke 2/0 ✓、
-`bash scripts/check-doc-links.sh` PASS（63 檔）、`work-items.sh check` ✓、`scan-secrets.sh` PASS。
+`cargo test` 220/0/6 ✓、`eval --pipeline-only` 3/0 ✓、replay smoke 2/0 ✓、
+`bash scripts/check-doc-links.sh` PASS（64 檔）、`work-items.sh check` ✓、`scan-secrets.sh` PASS。
+
+## Review 修正（2026-08-20，fresh subagent review）
+
+獨立 reviewer（無本 session context）對整條 branch 複審，9 條 findings 全數處置：
+
+1. **F1 MAJOR**：docs CI job 在乾淨 checkout 必掛——gate 的存在性檢查沒豁免未 init 的
+   submodule 路徑。修：submodule 路徑整段跳過（存在性與版控檢查都不做），以空 submodule
+   目錄模擬乾淨 checkout 驗證 PASS。
+2. **F2 MAJOR**：快照數字寫成 214/0/3，實為 **220/0/6**——當時 `head -8` 截斷了
+   13 行 test result 輸出。spec/qa-plan/本報告三處已改。
+3. **F3 MAJOR**：rollback 值集漏了三個——`RUNTIME_DISABLED_VALUES` 是
+   `false/0/no/off/disabled` 五種（`src/appstate.rs:363`），spec §3.1/§9 與 PRD FR-012
+   現況已改（v1.3.x 遺留錯誤，本次同步應抓而未抓）。
+4. **F4 MAJOR**：intent allowlist 漏 `member`、`report`（`intents.toml` 實為 6 項），spec §9 已補。
+5. **F5 MAJOR**：spec §2.4 只列 5 種 SSE frame，實際 `/agent/stream` 外送全部 9 種
+   （`stage`/`tool_call`/`tool_args`/`usage` 漏列；「ToolCalled 不外送」描述的是 dormant
+   的 TurnEvent 路徑）。§2.4 重寫為 9-variant 表。
+6. **F6 MINOR**：manifest 的 QA artifact 取回指標沒給路徑，讀者會查舊 `.agent` 路徑撲空
+   （檔案在 817418c 已搬到新路徑）。已補完整 `git show` 路徑。
+7. **F7 MINOR**：所有 `817418c` 取回指標依賴 merge commit 保留 branch 歷史——squash merge
+   會使 hash 懸空。已在 PR 描述明示**勿 squash**（repo 慣例本為 merge commit）。
+8. **F8 NIT**：gate 對解析出 repo 外的連結會丟 ValueError traceback。改為明確 BROKEN 訊息。
+9. **F9 NIT**：`.spec/plan/sub_agent.md` link text 與 href 檔名不一致，已標註現名。
+
+複審後全部 gate 重跑：link gate PASS（64 檔）、work-items 4 valid、scan-secrets PASS、
+乾淨 checkout 模擬 PASS。

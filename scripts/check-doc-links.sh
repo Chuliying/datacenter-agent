@@ -10,7 +10,7 @@ cd "$(git rev-parse --show-toplevel)"
 git ls-files -z '*.md' \
   | grep -zv -e '^.agent/skills/_shared/' -e '^.claude/skills/' -e '^.codex/skills/' \
   | python3 -c '
-import pathlib, re, subprocess, sys
+import os, pathlib, re, subprocess, sys
 
 files = [pathlib.Path(p) for p in sys.stdin.buffer.read().decode().split("\0") if p]
 tracked = set(subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True).stdout.splitlines())
@@ -33,15 +33,19 @@ for f in files:
         target = raw.split("#")[0]
         if not target:
             continue
-        resolved = (f.parent / target).resolve().relative_to(pathlib.Path.cwd())
+        resolved = os.path.relpath((f.parent / target).resolve(), pathlib.Path.cwd())
+        if resolved.startswith(".."):
+            print(f"BROKEN   {f}: ({raw}) 解析到 repo 外：{resolved}")
+            errors += 1
+            continue
+        # submodule 內的目標整段跳過：未 init 時不可驗存在性（CI 不 init submodule），
+        # 內容由 gitlink 釘住，不是本 gate 的職責。
+        if any(resolved.startswith(s) for s in submodules):
+            continue
         if not (f.parent / target).exists():
             print(f"BROKEN   {f}: ({raw}) -> {resolved} 不存在")
             errors += 1
-        elif (
-            (f.parent / target).is_file()
-            and str(resolved) not in tracked
-            and not any(str(resolved).startswith(s) for s in submodules)
-        ):
+        elif (f.parent / target).is_file() and resolved not in tracked:
             print(f"UNTRACKED {f}: ({raw}) -> {resolved} 未版控，乾淨 clone 無此檔")
             errors += 1
 
