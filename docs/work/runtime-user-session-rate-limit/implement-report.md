@@ -16,11 +16,11 @@ Branch: `codex/runtime-user-session-rate-limit`
 | `src/runtime/store/month.rs` | NEW | S3 |
 | `src/runtime/store/sanitize.rs` | NEW | S4 |
 | `src/runtime/store/sqlite.rs` | NEW | S5/S6 |
-| `tests/runtime_store_sqlite.rs` | NEW | S7(20 tests) |
+| `tests/runtime_store_sqlite.rs` | NEW | S7(23 tests) |
 | `src/runtime/audit.rs` | MODIFY | S8(`RateLimitRejected`) |
 | `src/config.rs` | MODIFY | S9(`[server.rate_limit]`,deny_unknown_fields) |
 | `config/config.toml` | MODIFY | S9(註解範例區塊) |
-| `src/server/rate_limit.rs` | NEW | S10 + S12 tests(7 tests,in-crate) |
+| `src/server/rate_limit.rs` | NEW | S10 + S12 tests(8 tests,in-crate) |
 | `src/server/mod.rs` | MODIFY | S10 |
 | `src/server/route.rs` | MODIFY | S11(limiter 在 bearer 之內;probe/greeting 不掛) |
 | `src/server/openai.rs` | MODIFY | S10(`ERR_RATE_LIMIT`) |
@@ -96,7 +96,7 @@ qa-plan TC-001 實作註記寫「repo 無 tempfile dep」——已過時,本次�
 ```text
 type-check: PASS  (cargo check,含 clippy 全 targets)
 lint:       PASS  (cargo clippy --all-targets --all-features -- -D warnings:0 warnings)
-test:       PASS  (cargo test:260 passed / 0 failed;含 20 條 sqlite 整合、7 條 limiter router)
+test:       PASS  (cargo test:267 passed / 0 failed;含 23 條 sqlite 整合、8 條 limiter router;兩輪 review 修正後 fresh)
 eval:       PASS  (cargo run --bin eval -- --pipeline-only:3/3;--response --replay:2/2)
 UI mockup:  N/A   (has_ui=false)
 ```
@@ -117,11 +117,11 @@ Step 2: RED-GREEN-REFACTOR - PASS
   Evidence: 4 個 RED→GREEN cycle,RED 皆為 observed failing test(non-compile);
   REFACTOR=cargo fmt 後全綠
 Step 3: 專案模式與完整驗證 - PASS
-  Evidence: 260/260 tests、clippy 0 warnings、CI eval gates 同位;
+  Evidence: 267/267 tests、clippy 0 warnings、CI eval gates 同位;
   documentation impact 已落 docs/reference/endpoints/*
 Gate:
   type-check: PASS
   lint: PASS
-  test: PASS (260/260)
+  test: PASS (267/267)
   UI mockup: N/A
 ```

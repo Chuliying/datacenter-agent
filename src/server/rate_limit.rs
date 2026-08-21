@@ -82,6 +82,13 @@ pub async fn enforce(
     req: Request,
     next: Next,
 ) -> Response {
+    // Both limited endpoints are POST-only; a wrong-method request is headed
+    // for the method router's cheap `405` and must not consume admission
+    // capacity (the layer wraps the whole nested router, so it sees such
+    // requests before the method dispatch does).
+    if req.method() != axum::http::Method::POST {
+        return next.run(req).await;
+    }
     let not_until = match limiter.limiter.check() {
         Ok(_) => return next.run(req).await,
         Err(not_until) => not_until,
@@ -287,6 +294,32 @@ mod tests {
             admitted.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "the teapot must not have consumed the only slot"
+        );
+    }
+
+    /// Second-review finding 7: a wrong-method request (405 from the method
+    /// router) must not consume admission capacity.
+    #[tokio::test]
+    async fn wrong_method_requests_do_not_consume_capacity() {
+        let app = limited_app(1).await;
+
+        let get = HttpRequest::builder()
+            .method("GET")
+            .uri("/agent/stream")
+            .header(
+                "authorization",
+                format!("Bearer {}", crate::test_support::TEST_TOKEN),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let rejected = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let admitted = app.oneshot(authed("/agent/stream")).await.unwrap();
+        assert_ne!(
+            admitted.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a 405 probe must not have consumed the only slot"
         );
     }
 

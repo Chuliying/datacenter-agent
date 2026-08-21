@@ -18,10 +18,14 @@ pub fn default_redact_patterns() -> Vec<Regex> {
         r"(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}",
         // IPv4
         r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-        // IPv6, compressed forms included ({0,4} admits the empty "::" group).
-        // Biased toward over-redaction: a colon-separated hex run like
-        // "14:30:05" also matches, which is the safe direction for this field.
-        r"(?i)\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{1,4}\b",
+        // IPv6 full form: exactly eight hex groups. A clock time (two or
+        // three groups) can never look like this.
+        r"(?i)\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b",
+        // IPv6 compressed form: a `::` is mandatory, so `HH:MM:SS` content
+        // (`time_range_label`'s natural shape) never matches. The leading
+        // alternative covers `::1` / `::abcd`, where no word boundary can
+        // precede `:`.
+        r"(?i)(?:\b(?:[0-9a-f]{1,4}:){1,7}:|::)(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6}\b)?",
         // bearer token
         r"(?i)bearer\s+[a-z0-9._~+/=-]+",
         // cookie header with its pairs
@@ -73,6 +77,31 @@ mod tests {
         assert!(out.contains(REDACTED));
         // An ordinary clock time must survive.
         assert_eq!(sanitize("meeting at 12:30 today"), "meeting at 12:30 today");
+    }
+
+    /// Second-review finding 1: leading-compressed forms (`::1`, `::abcd`)
+    /// have no word boundary before `:` and must still be caught.
+    #[test]
+    fn redacts_leading_compressed_ipv6() {
+        for fixture in ["::1", "::abcd", "fe80::1"] {
+            let out = sanitize(&format!("peer was {fixture} today"));
+            assert!(!out.contains(fixture), "leaked {fixture}: {out}");
+            assert!(out.contains(REDACTED), "no redaction for {fixture}: {out}");
+        }
+    }
+
+    /// Second-review finding 2: seconds-precision times are the natural shape
+    /// of `time_range_label` content and must not be eaten by the IP pattern.
+    #[test]
+    fn preserves_time_of_day_content() {
+        assert_eq!(
+            sanitize("finished at 14:30:05 sharp"),
+            "finished at 14:30:05 sharp"
+        );
+        assert_eq!(
+            sanitize("window 08:00:00-17:00:00 daily"),
+            "window 08:00:00-17:00:00 daily"
+        );
     }
 
     #[test]

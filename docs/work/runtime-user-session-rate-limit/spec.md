@@ -20,6 +20,7 @@
 |---|---|---|---|---|---|
 | v1.0.0 | 2026-08-13 15:55 | 初版:兩個 POC slices(SQLite repositories;ingress admission + audit) | 新模組 + opt-in middleware,預設行為不變 | PRD v0.5.0 | Claude (Fable 5) |
 | v1.0.1 | 2026-08-20 18:50 | review 後文字對齊:expensive routes 只剩兩條(退役註記)、TTL 邊界改 `<=`;實作偏差記錄見 implement-report | 無行為變更(文件同步) | PRD v0.5.0 | Claude (Fable 5) |
+| v1.0.2 | 2026-08-20 20:10 | 第二輪 review 對齊:StoreError 契約列移除 BudgetExceeded(屬 ReserveOutcome)、router 測試改記 in-crate 位置與命令、audit 寫入改記 inline await | 無行為變更(文件同步) | PRD v0.5.0 | Claude (Fable 5) |
 
 ## Files
 
@@ -38,7 +39,7 @@
 | `src/config.rs` | MODIFY | 新增 `[server.rate_limit]` 設定(`enabled`/`burst_size`/`refill_period_ms`),預設 disabled。 |
 | `config/config.toml` | MODIFY | 加入註解過的 `[server.rate_limit]` 範例區塊(不動 `version = 1`)。 |
 | `tests/runtime_store_sqlite.rs` | NEW | Slice 1 整合測試:AC-001~006、AC-011~013 + ERR-001~004、ERR-006。 |
-| `tests/rate_limit_ingress.rs` | NEW | Slice 2 router 測試:AC-008~010、AC-014~015 + ERR-005。 |
+| `src/server/rate_limit.rs`(`#[cfg(test)]`) | NEW | Slice 2 router 測試:AC-008~010、AC-014~015 + ERR-005(in-crate:`AppState` fixture 是 `#[cfg(test)]`,integration test 組不出;見 implement-report 偏差 #1)。 |
 | `docs/work/runtime-user-session-rate-limit/runbook.md` | NEW | FR-004 POC runbook:DB path/persistent volume/備份/單 replica/遷移限制/burst policy。 |
 
 ## Contracts
@@ -50,7 +51,7 @@
 | Contract | Source | Shape / fields | Evidence |
 |---|---|---|---|
 | `StoreConfig` | `src/runtime/store/mod.rs` | `db_path: PathBuf`, `max_turns: usize (=5)`, `ttl_days: u32 (=30)`, `busy_timeout_ms: u64 (=5000)`, `summary_char_limit: usize (=500)`, `redact_patterns: Vec<Regex>` | `cargo check` |
-| `StoreError` | 同上 | `Unavailable(String)` / `OwnershipConflict` / `InvalidIdentifier(&'static str)` / `BudgetExceeded { snapshot }` / `ReservationMismatch` | `cargo check`;錯誤不含任何 stored value(NFR Security) |
+| `StoreError` | 同上 | `Unavailable(String)` / `OwnershipConflict` / `InvalidIdentifier(&'static str)` / `ReservationMismatch`(budget exceeded 是 `ReserveOutcome` 的結果態,不是錯誤——對齊 PRD FR-003 output) | `cargo check`;錯誤不含任何 stored value(NFR Security) |
 | `SessionRecord` | 同上 | `session_id`, `actor_key`, `created_at_ms`, `last_append_ms` | `cargo check` |
 | `TurnSummaryInput` | 同上 | 對齊既有 `SessionMemoryTurn` 欄位(`turn_id`, `user_summary`, `answer_summary`, `intent`, `metric`, `asset`, `time_range_label`, `option_id`);時間一律由注入 instant 決定 | 既有型別:`src/runtime/memory/store.rs:21` |
 | `ReserveOutcome` | 同上 | `Reserved { snapshot }` / `BudgetExceeded { snapshot, next_reset_utc }` | `cargo check` |
@@ -101,7 +102,7 @@ Slice 2(request path,opt-in):
   request → bearer gate(418/401;不耗 bucket)
           → rate_limit middleware(governor check;全域 key)
               ├─ 拒絕 → 429 + Retry-After + no-store + per-family body
-              │         → tokio::spawn(AuditSink.write(RateLimitRejected{...}))(僅一筆;零 SQLite 寫入)
+              │         → await AuditSink.write(RateLimitRejected{...})(inline;僅一筆;零 SQLite 寫入)
               └─ 允許 → JSON extractor → handler(既有路徑)
 
 Slice 1(repository-only,不接 request path):
@@ -157,8 +158,8 @@ Slice 1(repository-only,不接 request path):
 | S8 | `src/runtime/audit.rs` [MODIFY] | `RateLimitRejected` variant(D-007 欄位) | none | 15min | `cargo check` + 既有 audit tests |
 | S9 | `src/config.rs` [MODIFY], `config/config.toml` [MODIFY] | `RateLimitConfig`(serde default disabled)+ 註解範例區塊 | none | 20min | `cargo test --test deployment_contract`(config 不變性) |
 | S10 | `src/server/rate_limit.rs` [NEW], `src/server/mod.rs` [MODIFY] | governor middleware:全域 key、429 組裝(兩 family body + Retry-After + no-store)、audit spawn | S1,S8,S9 | 60min | `cargo check` |
-| S11 | `src/server/route.rs` [MODIFY] | 兩 sub-router 依 D-006 順序掛 opt-in layer;probe/greeting 不掛 | S10 | 30min | `cargo test --test rate_limit_ingress` |
-| S12 | `tests/rate_limit_ingress.rs` [NEW] | burst=1 確定性測試:AC-008/009/010/014/015 + handler-spy 證明拒絕不進 handler | S11 | 60min | `cargo test --test rate_limit_ingress` |
+| S11 | `src/server/route.rs` [MODIFY] | 兩 sub-router 依 D-006 順序掛 opt-in layer;probe/greeting 不掛 | S10 | 30min | `cargo test --lib rate_limit` |
+| S12 | `src/server/rate_limit.rs` tests [NEW] | burst=1 確定性測試:AC-008/009/010/014/015 + handler-spy 證明拒絕不進 handler | S11 | 60min | `cargo test --lib rate_limit` |
 | S13 | `docs/work/runtime-user-session-rate-limit/runbook.md` [NEW] | FR-004/AC-007:volume、備份(停機 copy)、單 replica、遷移前提、burst 調參 | S7,S12 | 30min | 人工 read-through 對 AC-007 |
 | S14 | 全部 | `cargo fmt` + `cargo clippy -- -D warnings` + `cargo test` 全綠 | S1–S13 | 20min | 三命令輸出 |
 
@@ -169,7 +170,7 @@ Slice 1(repository-only,不接 request path):
 | Level | Scope | Command / evidence | Applicability |
 |---|---|---|---|
 | Unit | `month.rs`(AC-006)、`sanitize.rs`(AC-003 fixtures)、`RateLimitConfig` default | `cargo test`(模組 `#[cfg(test)]`) | required |
-| Integration | Slice 1 repository:AC-001/002/004/005/011/012/013 + ERR-001~004/006;Slice 2 router:AC-008/009/010/014/015 + ERR-005 | `cargo test --test runtime_store_sqlite`、`cargo test --test rate_limit_ingress` | required(`has_api: true`;無外部服務——PRD 禁 POC 測試呼叫 OpenRouter/MCP) |
+| Integration | Slice 1 repository:AC-001/002/004/005/011/012/013 + ERR-001~004/006;Slice 2 router:AC-008/009/010/014/015 + ERR-005 | `cargo test --test runtime_store_sqlite`、`cargo test --lib rate_limit` | required(`has_api: true`;無外部服務——PRD 禁 POC 測試呼叫 OpenRouter/MCP) |
 | Component | N/A | N/A | N/A(has_ui=false) |
 | E2E | N/A | N/A | N/A(has_e2e=false) |
 

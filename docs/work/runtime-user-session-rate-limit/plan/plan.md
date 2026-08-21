@@ -41,8 +41,8 @@ BEGIN IMMEDIATE、ownership/TTL/cap5、micro-USD ledger)、整合測試。
 
 #### Verification
 
-- `cargo test --lib store::` → 16 passed(month 5 + sanitize 8 + boundary)。
-- `cargo test --test runtime_store_sqlite` → 20 passed / 0 failed。
+- `cargo test --lib store::` → 19 passed(month 5 + sanitize 12 + config boundary)。
+- `cargo test --test runtime_store_sqlite` → 23 passed / 0 failed(含兩輪 review 加測)。
 
 ### T02 | slice-2-burst-limiter
 
@@ -65,7 +65,7 @@ AC-008~010、014~015 + ERR-005 + TC-B08 全綠;429 envelope 依 family 釘死。
 
 #### Verification
 
-- `cargo test --lib rate_limit` → 7 passed / 0 failed。
+- `cargo test --lib rate_limit` → 8 passed / 0 failed。
 
 ### T03 | runbook-and-docs
 
@@ -110,7 +110,7 @@ S14:fmt + clippy -D warnings + 全測試 + CI eval gates。
 #### Verification
 
 - `cargo clippy --all-targets --all-features -- -D warnings` → clean。
-- `cargo test` → 260 passed / 0 failed。
+- `cargo test` → 267 passed / 0 failed。
 - `eval --pipeline-only` 3/3、`--response --replay` 2/2。
 
 ## Change Log
@@ -118,3 +118,4 @@ S14:fmt + clippy -D warnings + 全測試 + CI eval gates。
 - 2026-08-20T18:00+08:00: Created alongside implementation(單 session 完成,
   plan 與執行同步落檔;RED/GREEN 證據見 implement-report.md)。
 - 2026-08-20T18:25+08:00: T01~T04 全部 done。
+- 2026-08-20T20:20+08:00: 兩輪 fable review 修正併入(counts refresh:267/0)。

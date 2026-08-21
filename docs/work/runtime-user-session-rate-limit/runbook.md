@@ -1,6 +1,6 @@
 # Runtime SQLite Persistence + Burst Limiter — POC Runbook
 
-**Story**: S-RUNTIME-SEC-01 · **Spec**: `spec.md` v1.0.0 · **Scope**: FR-004 / AC-007
+**Story**: S-RUNTIME-SEC-01 · **Spec**: `spec.md` v1.0.2 · **Scope**: FR-004 / AC-007
 
 這份 runbook 是兩個 opt-in POC slice 的操作邊界。兩者預設皆關閉;
 預設行為(HTTP shape、memory backend)完全不變。
@@ -39,7 +39,7 @@ let store = SqliteRuntimeStore::open(StoreConfig::new("/data/runtime-store.db".i
 ```
 
 `StoreConfig` 預設:`max_turns=5`、`ttl_days=30`、`busy_timeout_ms=5000`、
-`summary_char_limit=500`、redact patterns(email/IPv4/cookie/bearer)。
+`summary_char_limit=500`、redact patterns(email/IPv4/IPv6/cookie/bearer)。
 
 ### PRAGMA(開檔即設,每次)
 

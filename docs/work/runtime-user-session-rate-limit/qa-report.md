@@ -22,8 +22,8 @@ slug: runtime-user-session-rate-limit
 ### Unit / Integration(L2/L4)
 
 - 命令:`cargo test`(fresh,非採信舊 report)
-- 結果:**260 passed / 0 failed**(lib 233:含 month 5、sanitize 8、rate_limit router 7;
-  `runtime_store_sqlite` 整合 20;其餘既有 suites 全綠回歸)
+- 結果:**267 passed / 0 failed**(lib:含 month 5、sanitize 12、rate_limit router 8;
+  `runtime_store_sqlite` 整合 23;其餘既有 suites 全綠回歸;兩輪 review 修正後 fresh)
 - CI 同位:`cargo run --bin eval -- --pipeline-only` → 3/3;
   `--response --replay config/runtime/evals/replay-smoke.json` → 2/2
 - 確定性:Slice 1 全部注入 `now`;Slice 2 用 `burst_size=1` + 1h refill,零 wall-clock 依賴
@@ -95,8 +95,23 @@ Review 範圍:實作兩 commit,對 spec/PRD/qa-plan 的對抗式審查。verdict
 
 修正後 fresh evidence:`cargo test` 全綠、clippy `-D warnings` 乾淨(見下)。
 
+## 第二輪 code review findings 處理(2026-08-20,fresh-context fable,全分支範圍)
+
+範圍:分支對 main 的全部變更(docs + code + tests)。verdict:MERGEABLE,8 筆全 Minor:
+
+| # | Finding | 處置 |
+|---|---|---|
+| 1 | IPv6 redaction 漏 leading-compressed(`::1`) | **已修**:拆成 full-form(8 組)+ 強制含 `::` 的 compressed 兩條 pattern。測試 `redacts_leading_compressed_ipv6` |
+| 2 | 同 pattern 誤殺 HH:MM:SS(`time_range_label` 的自然形狀) | **已修**:compressed 形強制 `::`,時刻字串不再命中。測試 `preserves_time_of_day_content` |
+| 3 | 三份報告的測試數字停在 review 前 | **已修**:全部 refresh 到 267/0(sqlite 23、router 8) |
+| 4 | spec 三處與程式碼漂移(StoreError 契約列、測試檔位置、audit spawn) | **已修**:spec v1.0.2 |
+| 5 | meta `documentation_impact` 只列 agent-stream.md | **記錄接受**:work-item/v3 schema 規定該欄位「恰好一個結果」(scalar),無法列兩份;chat-completions.md 的變更已列於 implement-report Files 表 |
+| 6 | runbook redact 清單缺 IPv6 | **已修** |
+| 7 | 錯誤 method 請求(405)耗 bucket | **已修**:`enforce` 對非 POST 直接放行(兩條受限路由皆 POST-only)。測試 `wrong_method_requests_do_not_consume_capacity` |
+| 8 | settle unknown id 無測試、錯誤訊息誤導 | **已修**:`ReservationMismatch` 訊息涵蓋 unknown/settled;測試 `settle_unknown_reservation_is_a_typed_mismatch` |
+
 ## 驗收結論
 
-**PASS** — 15/15 AC、6/6 ERR、8/8 boundary 全數通過;review 1 Important + 4 Minor
-已修、1 Minor 記錄接受;lint/typecheck/eval gates 乾淨;可進入 release gate
-(PR #10 review)。
+**PASS** — 15/15 AC、6/6 ERR、8/8 boundary 全數通過;第一輪 review 1 Important + 4 Minor
+已修、1 Minor 記錄接受;第二輪 review 8 Minor 中 7 筆已修、1 筆 schema 限制記錄接受;
+lint/typecheck/eval gates 乾淨;可進入 release gate(PR #10 review)。

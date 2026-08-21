@@ -618,3 +618,14 @@ async fn load_recent_returns_newest_turns_under_a_smaller_cap() {
         "must be the newest three in chronological order"
     );
 }
+
+/// Second-review finding 8: settling a reservation ID that was never created
+/// is a typed mismatch, not a panic or a silent success.
+#[tokio::test]
+async fn settle_unknown_reservation_is_a_typed_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let store = open_store(&dir).await;
+
+    let result = store.settle("never-created", Some(1_000), t0()).await;
+    assert!(matches!(result, Err(StoreError::ReservationMismatch)));
+}

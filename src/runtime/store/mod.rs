@@ -58,7 +58,8 @@ impl StoreConfig {
 }
 
 /// Typed repository errors. Error values never carry stored content
-/// (NFR Security); `BudgetExceeded` carries only the ledger snapshot.
+/// (NFR Security); budget exhaustion is not an error — it is
+/// [`ReserveOutcome::BudgetExceeded`], per PRD FR-003's output table.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The database cannot be opened, migrated, or a transaction failed.
@@ -73,9 +74,11 @@ pub enum StoreError {
     /// Summary content never triggers this (FR-002 boundary).
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(&'static str),
-    /// A reservation with the same ID exists but actor, month, or amount
-    /// differ (FR-003 boundary).
-    #[error("reservation id reused with a different actor, month, or amount")]
+    /// The reservation ID is unknown, already settled, or reused with a
+    /// different actor, month, or amount (FR-003 boundary).
+    #[error(
+        "unknown or mismatched reservation id (wrong actor, month, amount, or already settled)"
+    )]
     ReservationMismatch,
 }
 
