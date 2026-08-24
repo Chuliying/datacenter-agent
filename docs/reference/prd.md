@@ -1,10 +1,10 @@
 # datacenter-agent Runtime 平台 PRD
 
 **Story ID**：S-RUNTIME-01  
-**版本**：v1.3.0  
+**版本**：v1.4.0  
 **狀態**：Target-state product source of truth  
-**對應現況 Spec**：[spec v1.3.0](./spec/spec.md)
-**對應現況 QA**：[qa v1.3.0](./tests/qa-plan.md)
+**對應現況 Spec**：[spec v1.4.0](./spec/spec.md)
+**對應現況 QA**：[qa v1.4.0](./tests/qa-plan.md)
 **Source**：產品目標來自本頁；建置狀態以 [`src/`](../../src/lib.rs)、[`config/`](../../config/config.toml) 與 [QA evidence](./tests/qa-plan.md) 驗證
 
 > 本 PRD 描述**全部完成後的產品樣貌**。每條需求都標示目前建置狀態，未完成不代表已上線。現況技術行為以 [Spec](./spec/spec.md) 為準；部分完成／待建置 項目的執行順序以 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 為準。
@@ -17,6 +17,7 @@
 | v1.1.0 | 2026-06-29 | 改為 target-state PRD；逐項標建置狀態並連結現況證據/計劃 | v1.1.0 |
 | v1.2.0 | 2026-06-29 | 加入 Capability/Evidence architecture、Evidence Pack contract 與 Final LLM isolation | v1.2.0 |
 | v1.3.0 | 2026-06-29 | output format 改由 capability config 決定（避免 markdown 隱性硬編）；明列 Platform Control Plane／infra 為 non-goal | v1.2.0 |
+| v1.4.0 | 2026-08-20 | 依 crate 0.4.0 證據重判建置狀態：SSE pre-stream validation 缺口已修、channel bounded、router-level tests 落地、legacy serving path 移除；需求本文未動 | v1.4.0 |
 
 ## 1. 狀態定義
 
@@ -97,13 +98,13 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 
 | 原則 | 完成樣貌 | 現況 |
 |---|---|---|
-| 單一推理權威 | input/policy/memory/audit/orchestration 都在 Rust runtime | 部分完成 legacy/runtime 雙路徑仍有契約差異 |
+| 單一推理權威 | input/policy/memory/audit/orchestration 都在 Rust runtime | 部分完成 0.4.0 起唯一 prompt serving 都經 runtime prelude；orchestration 仍由 handler 直呼 sub-agent wiring（`AgentPort` dormant） |
 | Config 負責內容與組合 | stage/guardrail/extractor/evaluator 依 config dispatch | 部分完成 ID 有驗證，但多數沒有 dispatch |
 | 機制可插拔 | registry builder 回傳真正會被 AppState/request path 使用的 component | 部分完成 部分 backend 已接線 |
 | Secure by default | 最小 CORS、標準 bearer、secret-safe log、tenant-safe memory | 部分完成／待建置 |
 | Streaming 可取消 | 有 backpressure、deadline、disconnect cancellation、terminal event | 待建置 |
 | Evidence before claim | CI 對 regression 回 nonzero，QA 區分 unit/contract/live | 部分完成 process gate 已生效；evaluator coverage仍有限 |
-| 可回滾 | runtime 關閉時不載入 runtime config，legacy 可獨立開機 | 部分完成 false/0 startup rollback 已接線/測試；staging smoke待補 |
+| 可回滾 | runtime 關閉時不載入 runtime config，legacy 可獨立開機 | 部分完成 false/0 startup rollback 已接線/測試；rollback 後僅剩 health/ready/greeting（無 legacy serving）；staging smoke待補 |
 | 能力隔離 | Final LLM 只做生成；所有 MCP/DB/RAG 存取經 gateway 產出 Evidence Pack | 待建置 現況 Final LLM tool loop 直接持有 MCP tools |
 | 證據可追溯 | 每個可驗證事實能回指 Evidence Pack item/citation/provenance | 待建置 沒有 Evidence Pack/Output Validator |
 
@@ -119,7 +120,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - legacy compatibility path 在 rollout 完成前保留，不改既有 wire event。
 - 所有 route status/body/header 都有 Router-level contract tests。
 
-現況缺口：runtime SSE 在 response 建立後才驗證 prompt，錯誤是 HTTP 200 + error frame；body cap/auth/timeout 沒有 Router-level tests。
+現況缺口（0.4.0 重判）：SSE validation timing 已修——prelude 在建立 Response 前執行，錯誤映射 HTTP status；timeout 與路由表已有 Router-level tests（`route::` 五測試）。仍缺：auth envelope body、body cap、JSON rejection 的 route-level status。另 legacy serving path 已於 0.4.0 移除（breaking），「legacy compatibility path 保留」的 target 不再適用；`/agent` 聚合 JSON 的角色由 `/v1/chat/completions` 承接。
 
 ### FR-002：明確且一致的 limits — 部分完成
 
@@ -131,7 +132,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - body >64 KiB 保留 extractor/middleware 的 413，不被統一轉成 400。
 - 120 秒是完整 turn deadline：REST deadline 前未完成回 504；SSE 在 deadline emit terminal error 並取消 producer/upstream。
 
-現況缺口：runtime SSE validation timing、SSE body deadline、JSON rejection status。
+現況缺口（0.4.0 重判）：validation timing 已修（pre-stream HTTP status）。仍缺：SSE body deadline、JSON rejection status、64 KiB 最終 mapping。timeout 現況為 per-group（standard 120 s／OpenAI 600 s + envelope），與「120 秒是完整 turn deadline」的 target 不同。
 
 ### FR-003：可配置 input pipeline — 部分完成
 
@@ -191,7 +192,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 
 現況：event model、seq、sink 與 failure policy 已有；redaction helper 未接 sink，actor 未接入，aborted/cancelled terminal evidence 不完整。
 
-### FR-008：可靠 SSE lifecycle — 待建置
+### FR-008：可靠 SSE lifecycle — 部分完成
 
 完成樣貌：
 
@@ -201,7 +202,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - 每個 stream 恰有一個 terminal outcome：done、error、cancelled 或 timeout。
 - slow consumer、disconnect、deadline、JoinError 有 deterministic tests。
 
-現況：unbounded channel、send error ignored、dropped JoinHandle detaches producer、JoinError 未映射。
+現況（0.4.0 重判）：channel 已 bounded（`mpsc::channel(8192)`）；producer JoinHandle 由 handler `run.await` 觀察並寫 terminal audit。仍缺：client disconnect cancellation、slow-consumer 契約、單一 terminal outcome 的 deterministic tests。
 
 ### FR-009：LLM/MCP terminal semantics — 部分完成
 
@@ -236,7 +237,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - probe auth policy 與 deployment profile 一致並有自動 smoke test；不假設 Kubernetes 不能帶 header。
 - `/ready` 的外部依賴 probe 有 rate/timeout/cache policy，不洩漏 raw URL。
 
-現況：全 route bearer、constant-time compare 已有；失敗 418；CORS very-permissive；repo 無 deployment manifest。418 migration 與 probe policy需決策。
+現況（0.4.0 重判）：全 route bearer、constant-time compare 已有；standard 群失敗 418、OpenAI 群 401 + envelope；未匹配路徑由 outer fallback 回統一 404、不經 auth（修掉 token-validity oracle），有 router-level 迴歸測試。CORS very-permissive；repo 無 deployment manifest。418 migration 與 probe policy 需決策。
 
 ### FR-012：真正可回滾的 rollout — 部分完成
 
@@ -247,7 +248,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - runtime 開啟時 fail-fast 驗證全部 contract。
 - rollout/rollback 有 startup tests、smoke runbook 與明確 telemetry。
 
-現況：runtime 預設開啟；明確 `RUNTIME_ENABLED=false/0` 會在載入 capability config 前跳過 runtime build，且有 invalid-config regression test。staging rollback smoke/telemetry 尚未完成。
+現況（0.4.0 重判）：runtime 預設開啟；明確的 disable 值（`false`/`0`/`no`/`off`/`disabled`，case-insensitive）會在載入 capability config 前跳過 runtime build，且有 invalid-config regression test。惟 0.4.0 起 rollback 不再有 legacy serving——兩個 prompt 端點回 503，僅剩 health/ready/greeting，「legacy 可獨立開機」的 target 只剩 startup 成立、serving 不成立。staging rollback smoke/telemetry 尚未完成。
 
 ### FR-013：Evidence Pack 與 Final LLM isolation — 待建置
 
@@ -269,11 +270,11 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 | ID | 目標 | 狀態 |
 |---|---|---|
 | NFR-001 Correctness | partial output 不得被標 Done；tool/audit success 必須符合上游語意 | 部分完成 |
-| NFR-002 Reliability | bounded streaming、cancellation、deadline、單一 terminal outcome | 待建置 |
+| NFR-002 Reliability | bounded streaming、cancellation、deadline、單一 terminal outcome | 部分完成／待建置 bounded channel 已有；cancellation/deadline 契約仍缺 |
 | NFR-003 Security | standard auth、least-privilege CORS、secret-safe log、tenant memory | 部分完成／待建置 |
 | NFR-004 Operability | probe/deployment contract、stable error/audit codes、rollback startup | 部分完成 |
 | NFR-005 Config safety | 完整 numeric/order/module validation | 部分完成 |
-| NFR-006 Compatibility | legacy wire 在 migration window 不破壞；breaking auth/status 需 versioning | 部分完成 |
+| NFR-006 Compatibility | legacy wire 在 migration window 不破壞；breaking auth/status 需 versioning | 部分完成 0.4.0 依 CHANGELOG 宣告 breaking 移除四端點與 `AgentResponse`，migration 路徑已記載 |
 | NFR-007 Evidence | 每條已完成項有 contract test；CI negative gate 會真的 fail | 部分完成 |
 | NFR-008 Capability isolation | Final LLM type/port 不可取得 MCP/DB/RAG handles 或 credentials | 待建置 |
 | NFR-009 Evidence integrity | Evidence Pack 有 provenance、freshness、classification、digest、budget 與 citation mapping | 待建置 |
@@ -333,7 +334,7 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - 不承諾任意第三方動態載入 native code；「可拔插」限定為 registry 已註冊元件的 config 組合。
 - 不在沒有 identity contract 前宣稱 multi-tenant memory 安全完成。
 - 不用 LLM judge 名稱包裝 substring/heuristic checks。
-- 不把 historical `docs/agent-runtime-rust-port/**` 當成目前完成狀態。
+- 不把 historical 移植文件（已自 worktree 移除，git 保存於 `817418c`）當成目前完成狀態。
 - 不讓 Final LLM 自行決定或直接執行 MCP/DB/RAG calls；若未來需要 iterative retrieval，必須由受控 planner/gateway 階段完成並輸出新版 Evidence Pack。
 - 不把 Evidence Pack 當「把所有 raw data 塞進 prompt」；必須遵守 provenance、classification、budget 與 untrusted-data boundary。
 - 不在本 runtime 內建集團級 Platform Control Plane（app/tenant/quota/cost/release-gate console）或機房/GPU 算力規劃；runtime 只需可被上層平台治理，這些屬平台層範圍。
@@ -344,4 +345,4 @@ Evidence Pack 不得包含 bearer/API key、DB/MCP credentials、可執行 instr
 - [Current implementation spec](./spec/spec.md)
 - [Current QA evidence](./tests/qa-plan.md)
 - [Code change plan](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md)
-- [Historical migration documents](../agent-runtime-rust-port/prd.md)
+- Historical migration documents：`git show 817418c:docs/agent-runtime-rust-port/prd.md`（全表見 [`docs/index.md`](../index.md#歷史git-保存不在-worktree)）

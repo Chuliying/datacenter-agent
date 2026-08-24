@@ -7,13 +7,9 @@
 ## 職責
 OpenRouter（OpenAI-compatible）LLM 連接 + MCP tool-calling 迴圈 —— agentic flow 的心臟。
 
-## 子檔案
+## 結構
 
-| 檔案 | 職責 |
-|---|---|
-| [`mod.rs`](../../../src/llm_connector/mod.rs) | 入口：`agent_stream` / `generate`；`LlmEvent` |
-| [`agent.rs`](../../../src/llm_connector/agent.rs) | MCP tool-calling 迴圈（多輪：模型要工具→執行→回灌→再迴圈） |
-| [`client.rs`](../../../src/llm_connector/client.rs) | 建 `async-openai` client（指向 OpenRouter） |
+子檔案分工見各檔 `//!`（[`mod.rs`](../../../src/llm_connector/mod.rs) 入口與 `LlmEvent`、`agent.rs` tool-calling 迴圈、`client.rs` async-openai client → OpenRouter）。
 
 ## 兩個入口
 

@@ -12,7 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The core HTTP server.
+//! The core HTTP server: routing, middleware, auth, handlers, DTOs, error mapping, the
+//! OpenAI-compatible layer, and the boot-time greeting task.
+//!
+//! The submodules are:
+//!
+//! - [`route`] — router + middleware assembly ([`route::build_router`]): two sub-routers
+//!   (standard 4 routes / OpenAI 1 route) each carrying their own timeout and auth layer, merged
+//!   under a shared 64 KiB body cap, permissive CORS, trace/compression, and security headers,
+//!   with an explicit outer fallback answering a uniform `404`.
+//! - [`handler`] — the five handlers: `health` / `ready` / `greeting` / `agent_stream` /
+//!   `chat_completions`.
+//! - [`openai`] — OpenAI-compatible DTOs and mapping (`ChatCompletionRequest`, `map_request`,
+//!   `error_type_for_status`, the error envelope).
+//! - [`dto`] — request/response types: `AgentRequest`, `StreamFrame` and its data payloads,
+//!   `GreetingResponse`, `ReadyBody`.
+//! - [`auth`] — the two bearer middlewares: `require_bearer` (`418`) and `require_bearer_openai`
+//!   (`401` + OpenAI error envelope), both constant-time.
+//! - [`error`] — the outward HTTP error types (`AppError` / `ErrorBody`).
+//! - [`greeting`] — the boot-time background task pre-generating greetings through the two-stage
+//!   greeting pipeline.
 
 pub mod auth;
 pub mod dto;

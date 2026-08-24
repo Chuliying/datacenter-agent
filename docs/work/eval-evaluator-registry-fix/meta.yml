@@ -2,15 +2,16 @@ schema_version: work-item/v3
 slug: eval-evaluator-registry-fix
 title: Eval evaluator registry fix
 created_at: 2026-07-02T14:30:00+08:00
-updated_at: 2026-08-19T10:43:11+08:00
+updated_at: 2026-08-20T14:48:00+08:00
 execution_mode: team-feature
 work_status: active
 delivery_status: not_requested
+documentation_impact: doc:docs/reference/modules/runtime-eval.md
 stages:
   prd: { skill: prd-interview, file: prd.md, status: ready }
 inputs:
   - .agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md
-  - docs/agent-runtime-rust-port/spec/spec-06-eval.md
+  - commit:817418c（docs/agent-runtime-rust-port/spec/spec-06-eval.md，歷史 spec，已自 worktree 移除）
   - docs/reference/modules/runtime-eval.md
   - src/runtime/eval/evaluator.rs
   - src/runtime/eval/runner.rs

@@ -2,14 +2,19 @@
 
 > **文件類型**：documentation source of truth。PRD 定義完成後的 target state 並逐項標建置狀態；Spec、QA、endpoint 與 module 頁描述目前 worktree。  
 > **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/agent/`](../../src/agent/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
-> **對應版本**：PRD v1.3.0 · Spec v1.3.0 · QA v1.3.0（2026-06-30）
+> **對應版本**：PRD v1.4.0 · Spec v1.4.0 · QA v1.4.0（2026-08-20，對應 crate 0.4.0）
 >
-> **⚠ 同步狀態**：endpoints/、modules/ 已於 2026-08-17 依實際程式碼校正兩次——先補上 sub-agent
-> 層與 `/v1/chat/completions`，再依 work item
-> [`retire-superseded-agent-endpoints`](../work/retire-superseded-agent-endpoints/prd.md)
-> 移除已退役的 `/insight`、`/insight/stream`、`/report`、`/report/stream`（以及更早移除的
-> `POST /agent`）。
-> `prd.md`、`spec/spec.md`、`tests/qa-plan.md` **尚未**同步，仍停在 v1.3.0 的視角。
+> **同步狀態（逐檔）**：
+>
+> | 檔案 | 同步基準 | 已知落差 |
+> |---|---|---|
+> | `prd.md` | crate 0.4.0（2026-08-20） | 無已知落差 |
+> | `spec/spec.md` | crate 0.4.0（2026-08-20） | 無已知落差 |
+> | `tests/qa-plan.md` | crate 0.4.0（2026-08-20 fresh run） | docker build 證據停在 0.3.x image |
+> | `endpoints/**` | 2026-08-17 兩次校正（sub-agent 層＋`/v1/chat/completions`；退役端點移除） | 無已知落差 |
+> | `modules/**` | 2026-08-17 校正；2026-08-20 依 §1 規則 4 縮減 | 無已知落差 |
+>
+> 下次落後時把該檔移回本表的落差欄，不整段警告。
 
 ## 1. 文件權威與邊界
 
@@ -18,8 +23,9 @@
 1. [`prd.md`](./prd.md) 是**目標產品樣貌**；每條需求必須標 `已完成 / 部分完成 / 待建置 / 待決策`，不可把 status 省略。
 2. Spec、QA、endpoint 與 module 頁只記錄**目前已實作行為與證據**，不把 PRD target 寫成現況。
 3. 可執行程式碼、設定與測試是現況行為證據；若與 current-state reference 衝突，先校正文件。
-4. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
-5. `docs/agent-runtime-rust-port/**` 與 `docs/archives/**` 是歷史移植需求、設計與計畫資料，不是目前 target/current contract。
+4. module 頁只寫**落差、決策、陷阱**與跨模組 wiring 現實；「模組／檔案是什麼」的結構描述唯一擁有者是 `src/**` 的 `//!` doc comment（與程式同 diff，漂移即刻可見），module 頁不複述。endpoint 頁不適用本條——wire contract 沒有其他家，完整保留。
+5. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
+6. 移植期的歷史 PRD／Spec／TC 已自 worktree 移除，由 git 保存（取回方式見 [`docs/index.md`](../index.md#歷史git-保存不在-worktree)）。PRD／Spec／TC 三類文件的完整歸屬見 [`docs/index.md`](../index.md#prd--spec--tc-的歸屬)。
 
 ## 2. 一句話定位
 

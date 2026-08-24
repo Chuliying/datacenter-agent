@@ -12,7 +12,7 @@
 - capability_packs: optional
 
 版本由 submodule gitlink 釘住（`git submodule status` 會印出 `git describe` 結果，目前為
-`v0.9.0-1-g643253b`，即 v0.9.0 之後一個未發版 commit），不另存版本號欄位以免與 gitlink 兩處不一致。
+`v0.10.0`），不另存版本號欄位以免與 gitlink 兩處不一致。
 首次 clone 後、或 gitlink 變更後執行：
 
 ```bash
@@ -46,7 +46,7 @@ bash .agent/skills/_shared/bootstrap/onboard.sh
 - `test_glob`: tests/**/*.rs
 - `work_root`: docs/work
 - `docs_root`: docs
-- `legacy_artifacts_root`: .agent/artifacts（歷史保留；新 work item 使用 docs/work）
+- `legacy_artifacts_root`: .agent/artifacts（僅剩 plan/2026-06-29-runtime-correctness/ 這份 retired 三件式 plan，狀態仍 active。歷史 QA artifact 已隨移植文件自 worktree 移除；取回：git show 817418c:docs/agent-runtime-rust-port/qa/input-pipeline-migration-2026-06-30/qa-report.md（該 commit 中已搬到新路徑，勿查舊 .agent 路徑）。新 work item 一律使用 docs/work）
 
 ## Stack
 
