@@ -101,9 +101,13 @@ drain 出來的。answer policy 要求 disclaimer 時，disclaimer 會被 prepen
 | `RUNTIME_ENABLED=false` | 503 | `server_error` |
 | 逾時（600 s） | 504 | `server_error` |
 | 其他 middleware 錯誤 | 500 | `server_error` |
+| burst limiter 拒絕（`[server.rate_limit]` opt-in，預設關閉） | 429 | `rate_limit_error` |
 
 `type` 由 `error_type_for_status` 決定：`400..=499` → `invalid_request_error`，
-其餘 → `server_error`。envelope 永遠帶 `type`，不會省略。
+其餘 → `server_error`。envelope 永遠帶 `type`，不會省略。唯一例外是 opt-in
+burst limiter 的 `429`：`type` 固定為 `rate_limit_error`，並帶整數秒
+`Retry-After` 與 `Cache-Control: no-store`；bearer 驗證（401）先於 limiter，
+不消耗 bucket。詳見 `docs/work/runtime-user-session-rate-limit/runbook.md`。
 
 `JsonRejection` 依 extractor 自己的 status 分流成 413 / 415 / 400，不像其他端點一律壓成 400。
 

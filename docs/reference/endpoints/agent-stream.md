@@ -53,6 +53,20 @@ report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer po
 > **這是與舊文件不同之處。** pre-stream validation 錯誤現在回**正確的 HTTP status**，
 > 不再是「先回 200 再送 error frame」。空／超長 prompt 的行為因此與 REST 路徑一致。
 
+## Opt-in 全域 burst limiter（429）
+
+`config.toml` 的 `[server.rate_limit]`（預設關閉）啟用後，本端點與
+`/v1/chat/completions` 共用一個 process-local token bucket。bucket 耗盡時，
+**在 bearer 驗證之後、JSON 解析與 handler 之前**回：
+
+- `429` + 整數秒 `Retry-After` + `Cache-Control: no-store`
+- body `{"error": "rate limited: retry after <n>s"}`（本端點的統一 envelope）
+- 恰一筆 `audit.rate_limit_rejected` 結構化事件
+
+無效 bearer 仍回 `418` 且不消耗 bucket。`/health`、`/ready`、`/greeting`
+永不受限。狀態 process-local、重啟歸零；詳見
+`docs/work/runtime-user-session-rate-limit/runbook.md`。
+
 ## SSE frame
 
 每個 SSE `data:` 是一個 JSON object，discriminator 為 `event`。`StreamFrame` 共 **9 種** variant：

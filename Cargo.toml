@@ -67,6 +67,8 @@ futures = "0.3"
 mimalloc = { version = "0.1", default-features = false }
 constant_time_eq = "0.3"
 rand = "0.8"
+tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
+governor = "0.10.4"
 
 # Test-only. Router-level tests need a real `AppState`, whose `mcp` field wraps an rmcp
 # `Peer<RoleClient>` that only a completed MCP handshake produces. `rmcp/server` (which pulls in
@@ -75,7 +77,9 @@ rand = "0.8"
 # still depends on rmcp as an HTTP client only.
 [dev-dependencies]
 rmcp = { version = "0.17", default-features = false, features = ["server"] }
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["io-util"] }
+tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 
 # [target.'cfg(target_env = "musl")'.dependencies]
 # mimalloc = { version = "0.1", default-features = false }

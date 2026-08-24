@@ -107,6 +107,24 @@ charter = ["emit_chart"]
 template = "report_template/report.html"
 
 
+# ──── Server ingress policy ───
+# Opt-in process-local global burst limiter for the expensive routes
+# (/agent/stream, /v1/chat/completions). Applied after each route family's
+# bearer gate; /health, /ready and /greeting are never limited. When the
+# bucket is exhausted the request is rejected with 429 + Retry-After before
+# JSON extraction and before any LLM/MCP/SQLite business operation.
+#
+# Disabled by default. When the section is present, the policy must be
+# explicit — there is no undocumented preset. State is process-local and
+# resets on restart: this is short-window admission control, not a durable
+# quota (see docs/work/runtime-user-session-rate-limit/runbook.md).
+#
+# [server.rate_limit]
+# enabled = true
+# burst_size = 5           # admissions available at once
+# refill_period_ms = 1000  # one admission refills every second
+
+
 # ──── Runtime capability pack section ───
 # These refs are parsed at boot but not wired into AppState until the
 # runtime route flag work begins.

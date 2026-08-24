@@ -98,6 +98,18 @@ pub enum AuditEvent {
         /// Duration in milliseconds.
         duration_ms: u64,
     },
+    /// A request was rejected by the global burst limiter (S-RUNTIME-SEC-01
+    /// FR-005). Field set is pinned by spec D-007: `request_id` and `route`
+    /// ride on the [`AuditCtx`]; no IP, session, actor, token, prompt, or
+    /// response data is ever attached.
+    RateLimitRejected {
+        /// Decision label (always `rejected` for this event).
+        decision: String,
+        /// Advised retry delay in whole seconds.
+        retry_after_secs: u64,
+        /// Active limiter policy, e.g. `burst=5;refill_ms=1000`.
+        policy_version: String,
+    },
 }
 
 /// Actor metadata attached to audit records.
@@ -306,6 +318,20 @@ impl AuditSink for TracingAuditSink {
                 error_code = %error_code,
                 duration_ms,
                 "audit.response_failed"
+            ),
+            AuditEvent::RateLimitRejected {
+                decision,
+                retry_after_secs,
+                policy_version,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                decision = %decision,
+                retry_after_secs,
+                policy_version = %policy_version,
+                "audit.rate_limit_rejected"
             ),
         }
         Ok(())

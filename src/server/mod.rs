@@ -39,6 +39,7 @@ pub mod error;
 pub mod greeting;
 pub mod handler;
 pub mod openai;
+pub mod rate_limit;
 pub mod route;
 
 pub use crate::appstate::AppState;
