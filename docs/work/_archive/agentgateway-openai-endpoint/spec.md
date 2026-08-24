@@ -26,16 +26,16 @@ prd: docs/work/agentgateway-openai-endpoint/prd.md
 > D1/D2 修正 PRD 的技術假設(基於 code 研究,佐證見各項)。
 
 ### D1 — 串流採「偽串流」（真串流不可行）
-- **事實**:sub-agent pipeline 的最終答案由終端純邏輯 stage 事後組裝——insight 的 `Finalizer` 把 analyst 報告 `trim_end` 後**附加 charts fenced block**([pipeline.rs:304](src/agent/pipeline.rs:304));report 的 `Renderer` 產出注入 `report.data` 的 **HTML**([pipeline.rs:434](src/agent/pipeline.rs:434))。`AgentEvent::ContentDelta` 只由 streaming LLM adapter 發([llm.rs:485](src/agent/llm.rs:485)),是各 stage 的**中間 preview**,終端純邏輯 stage 不發。故**無任何 token 流等於最終答案**;現有契約在 `Finished` 時發 `[Clear, Token(完整答案), Done]`([handler.rs:821](src/server/handler.rs:821))撤回 preview。OpenAI `delta` 無撤回語意。
+- **事實**:sub-agent pipeline 的最終答案由終端純邏輯 stage 事後組裝——insight 的 `Finalizer` 把 analyst 報告 `trim_end` 後**附加 charts fenced block**([pipeline.rs:304](../../../../src/agent/pipeline.rs));report 的 `Renderer` 產出注入 `report.data` 的 **HTML**([pipeline.rs:434](../../../../src/agent/pipeline.rs))。`AgentEvent::ContentDelta` 只由 streaming LLM adapter 發([llm.rs:485](../../../../src/agent/llm.rs)),是各 stage 的**中間 preview**,終端純邏輯 stage 不發。故**無任何 token 流等於最終答案**;現有契約在 `Finished` 時發 `[Clear, Token(完整答案), Done]`([handler.rs:821](../../../../src/server/handler.rs))撤回 preview。OpenAI `delta` 無撤回語意。
 - **決策**:跑 pipeline 到 `AgentEvent::Finished`(或 buffered `run()` 拿 `FinalResult.assistant`),取完整答案字串,**切塊逐塊送** `chat.completion.chunk`(`choices[0].delta.content`);首塊帶 `role:"assistant"`,末塊 `delta:{}` + `finish_reason:"stop"`,再 `data: [DONE]`。**不轉發中間 preview**。
 - **影響**:首 token 延遲 ≈ 完整計算時間(等同現有 clear+重送語意,只是改為分塊)。這是 pipeline 架構的本質限制,不是實作選擇。
 
 ### D2 — 非串流走 buffered pipeline（Option A），不字面接 `run_agent_turn`
-- **事實**:`run_agent_turn` / `LlmAgentPort` 驅動的是**舊 monolith** loop([turn.rs:156](src/runtime/turn.rs:156)),production 未使用;`AgentTurnOutcome` 也無 usage 欄位([turn.rs:35](src/runtime/turn.rs:35))。
-- **決策**:非串流仿 `/agent/stream` 但 buffered——`plan_stream_turn` prelude → `wants_report_pipeline(&normalized)` 選 pipeline → `build_*_pipeline(..., sink=None)` → `Orchestrator::run()` → `final_answer(outcome)`([handler.rs:748](src/server/handler.rs:748))。達成 **REST/stream 同後端(pipeline)**,契合使用者「REST/stream 同組件」判準。
+- **事實**:`run_agent_turn` / `LlmAgentPort` 驅動的是**舊 monolith** loop([turn.rs:156](../../../../src/runtime/turn.rs)),production 未使用;`AgentTurnOutcome` 也無 usage 欄位([turn.rs:35](../../../../src/runtime/turn.rs))。
+- **決策**:非串流仿 `/agent/stream` 但 buffered——`plan_stream_turn` prelude → `wants_report_pipeline(&normalized)` 選 pipeline → `build_*_pipeline(..., sink=None)` → `Orchestrator::run()` → `final_answer(outcome)`([handler.rs:748](../../../../src/server/handler.rs))。達成 **REST/stream 同後端(pipeline)**,契合使用者「REST/stream 同組件」判準。
 
 ### D3 — usage 自行累加
-- pipeline 每個 stage 各發一次 `AgentEvent::Usage`([llm.rs:634](src/agent/llm.rs:634)),**目前無任何累計**。新端點累加所有 `Usage`(sum prompt/completion/total,reasoning 有則 sum)填 OpenAI `usage`。⚠️ buffered `OpenAiLlm` **不發 Usage**([llm.rs:401](src/agent/llm.rs:401)):非串流若要 usage,需改用 streaming client + 收集 sink(見 Steps 5)。
+- pipeline 每個 stage 各發一次 `AgentEvent::Usage`([llm.rs:634](../../../../src/agent/llm.rs)),**目前無任何累計**。新端點累加所有 `Usage`(sum prompt/completion/total,reasoning 有則 sum)填 OpenAI `usage`。⚠️ buffered `OpenAiLlm` **不發 Usage**([llm.rs:401](../../../../src/agent/llm.rs)):非串流若要 usage,需改用 streaming client + 收集 sink(見 Steps 5)。
 
 > **實作狀態(2026-07-23,已補齊,符合 OpenAI contract)**：
 > - **非串流 usage 已取值**：`openai_buffered_response` 不再走 buffered `run()`,改走 **streaming client + drain**(`build_openai_pipeline(Some(sink))` → `run_emitting` → 收集 `AgentEvent::Usage`),`accumulate_usage` 填實值(不動 `llm.rs`/`payload.rs`)。
@@ -44,20 +44,20 @@ prd: docs/work/agentgateway-openai-endpoint/prd.md
 > - **memory 仍 inert**:OpenAI body 無 `session_id`(恆 `None`),無 turn 可複製,故 `append_memory_turn_if_enabled` 省略(設計如此,非落差)。
 
 ### D4 — prompt 長度上限 4000（runtime）
-走 `plan_stream_turn` prelude → `input_guard::validate_prompt(prompt, 4000)`([input_guard.rs:6](src/runtime/guardrails/input_guard.rs:6)、[config.rs:38](src/runtime/config.rs:38))。非 legacy 2000。
+走 `plan_stream_turn` prelude → `input_guard::validate_prompt(prompt, 4000)`([input_guard.rs:6](../../../../src/runtime/guardrails/input_guard.rs)、[config.rs:38](../../../../src/runtime/config.rs))。非 legacy 2000。
 
 ### D5 — system message 忽略
-pipeline 無 system 槽(各 stage 自帶 designed instruction,[payload.rs:179](src/agent/payload.rs:179))。傳入 `role:"system"` 忽略(spec 明確;不 prepend,避免污染既有 stage prompt 設計)。
+pipeline 無 system 槽(各 stage 自帶 designed instruction,[payload.rs:179](../../../../src/agent/payload.rs))。傳入 `role:"system"` 忽略(spec 明確;不 prepend,避免污染既有 stage prompt 設計)。
 
 ### D6 — auth bearer（/v1 回 401,其他 7 端點維持 418）
 > **2026-07-23 修正(finding #6)**:原設計繼承共用 `require_bearer`(失敗 418),對 OpenAI client / gateway 不友善。
-新路由改掛**專屬** `require_bearer_openai`([auth.rs](src/server/auth.rs)):**相同 constant-time 比對 `GLOBAL_TOKEN`**,但失敗回 **401 + OpenAI error envelope**(`invalid_request_error`),符合 OpenAI 慣例。**共用 `require_bearer`(其他 7 端點的 418 契約)完全不動**——route 拆成 standard / openai 兩個 sub-router,各自掛自己的 auth layer 再 `.merge()`。
+新路由改掛**專屬** `require_bearer_openai`([auth.rs](../../../../src/server/auth.rs)):**相同 constant-time 比對 `GLOBAL_TOKEN`**,但失敗回 **401 + OpenAI error envelope**(`invalid_request_error`),符合 OpenAI 慣例。**共用 `require_bearer`(其他 7 端點的 418 契約)完全不動**——route 拆成 standard / openai 兩個 sub-router,各自掛自己的 auth layer 再 `.merge()`。
 
 ### D7 — runtime-off 行為
-端點需 runtime(走 prelude);`RUNTIME_ENABLED=false` 時回 **503** + OpenAI 風格 error body(與 `/agent/stream` 一致,[handler.rs:455](src/server/handler.rs:455))。
+端點需 runtime(走 prelude);`RUNTIME_ENABLED=false` 時回 **503** + OpenAI 風格 error body(與 `/agent/stream` 一致,[handler.rs:455](../../../../src/server/handler.rs))。
 
 ### D8 — 非串流 timeout 覆寫 600s（finding #1）
-> 全域 `TimeoutLayer` 為 120s([route.rs](src/server/route.rs));非串流 `/v1/chat/completions` 需 await **整條** sub-agent pipeline,常超過 120s → 被砍成空 body 504。
+> 全域 `TimeoutLayer` 為 120s([route.rs](../../../../src/server/route.rs));非串流 `/v1/chat/completions` 需 await **整條** sub-agent pipeline,常超過 120s → 被砍成空 body 504。
 route 拆 standard(120s)/ openai(**600s**)兩 sub-router,各自套 `TimeoutLayer` 再 `.merge()`,故只有 `/v1/chat/completions` 得到較長 timeout,其他 7 端點維持 120s。SSE 串流的 response handle 立即回傳,body timeout 本就不影響(D1 偽串流)。
 > **2026-07-23 修正(第二輪 #4)**:openai sub-router 逾時原回空 body → 改回 **OpenAI error envelope**(504),見下方「第二輪 code review 決策 §#4」。
 
@@ -69,7 +69,7 @@ route 拆 standard(120s)/ openai(**600s**)兩 sub-router,各自套 `TimeoutLayer
 > 本節 D10 與 #2/#4/#5 註記為**第二輪** review 修正（與上方第一輪 finding 編號不同源）。
 
 ### D10 — history 織入 prompt（第二輪 #1）
-- **事實**:engine `ConfiguredAgent::run`([engine.rs:234](src/agent/engine.rs:234))`AgentPayload::Initial(p) => (p.prompt, …)` **只取 `p.prompt`**,`InitialPrompt.history` 完全不進 LLM;`map_request` 映射出的 history 因此白費,多輪對話塌成只剩最後一則 user。
+- **事實**:engine `ConfiguredAgent::run`([engine.rs:234](../../../../src/agent/engine.rs))`AgentPayload::Initial(p) => (p.prompt, …)` **只取 `p.prompt`**,`InitialPrompt.history` 完全不進 LLM;`map_request` 映射出的 history 因此白費,多輪對話塌成只剩最後一則 user。
 - **決策(handler 層,不動 engine / `/agent/stream` / falcon)**:抽純函式 `fold_history_into_prompt(&[Exchange], &str) -> String`,history 非空時把各輪 render 成 `User: …\nAssistant: …` transcript **prepend** 到目前問題前;空 history 原樣回傳(單輪不變)。`chat_completions` 的 `Proceed` 分支用它組 `Initial.prompt`,`Initial.history` 留空(engine 本就忽略,避免重複)。**僅改 `chat_completions` 一處**;`/agent/stream` 建 `InitialPrompt` 之處未動。
 - **影響**:多輪 OpenAI 請求現能讓第一 stage 的 LLM 看到完整對話;prompt 長度上限(D4,prelude 對「目前問題」驗 4000)在 fold 之前完成,history 不計入該 cap。
 
@@ -88,9 +88,9 @@ OpenAI `include_usage` 契約:啟用時**每個 content chunk 帶 `usage: null`*
 |---|---|---|
 | `src/server/openai.rs` | **NEW** | OpenAI DTO(`ChatCompletionRequest/Response/Chunk`、`ChatMessage`、`Usage`)+ `messages↔AgentRequest` 映射 + usage 累加 helper |
 | `src/server/handler.rs` | **MODIFY** | 新增 `chat_completions` handler;複用 `sse_event`/`INSIGHT_STREAM_BUFFER`/`final_answer`/`wants_report_pipeline`/`insight_error_to_app_error` |
-| `src/server/route.rs` | **MODIFY** | `Router::new()`([route.rs:61](src/server/route.rs:61))auth layer **之前**加 `.route("/v1/chat/completions", post(handler::chat_completions))` |
+| `src/server/route.rs` | **MODIFY** | `Router::new()`([route.rs:61](../../../../src/server/route.rs))auth layer **之前**加 `.route("/v1/chat/completions", post(handler::chat_completions))` |
 | `src/server/mod.rs` | **MODIFY** | `mod openai;` |
-| `src/agent/llm.rs` / `payload.rs` | **MODIFY(僅非串流要 usage)** | buffered `OpenAiLlm::chat` 補發 `Usage`,或 `FinalResult` 加 usage 欄位([payload.rs:229](src/agent/payload.rs:229) 已預留 EXTEND) |
+| `src/agent/llm.rs` / `payload.rs` | **MODIFY(僅非串流要 usage)** | buffered `OpenAiLlm::chat` 補發 `Usage`,或 `FinalResult` 加 usage 欄位([payload.rs:229](../../../../src/agent/payload.rs) 已預留 EXTEND) |
 
 > 不動 `run_agent_turn`(D2);Option C(`PipelineAgentPort`)不在本次範圍。
 
@@ -134,7 +134,7 @@ pub struct Usage { pub prompt_tokens: u32, pub completion_tokens: u32, pub total
 > `created` 由呼叫端傳入(避免在純函式取時間);`id` 用固定前綴 + 計數/隨機來源由 handler 提供。
 
 ### 既有內部型別（引用,不改）
-`AgentRequest`([dto.rs:27](src/server/dto.rs:27))[EXISTING]、`StreamPlan`/`AgentTurnDeps`([turn.rs:70](src/runtime/turn.rs:70))[EXISTING]、`AgentEvent`([agent](src/agent))[EXISTING]、`UsageData`([dto.rs:155](src/server/dto.rs:155))[EXISTING,可複用累加]。
+`AgentRequest`([dto.rs:27](../../../../src/server/dto.rs))[EXISTING]、`StreamPlan`/`AgentTurnDeps`([turn.rs:70](../../../../src/runtime/turn.rs))[EXISTING]、`AgentEvent`([agent](../../../../src/agent))[EXISTING]、`UsageData`([dto.rs:155](../../../../src/server/dto.rs))[EXISTING,可複用累加]。
 
 ### 映射規則 `messages → AgentRequest`（2026-07-23 放寬,finding #2）
 > 原規則對真實 OpenAI client 的合法形狀過嚴(一律 400),放寬如下:
@@ -182,7 +182,7 @@ messages ──(映射)──▶ AgentRequest ──▶ plan_stream_turn(dummy A
                         累加 Usage(D3);忽略中間 ContentDelta;
                         於 Finished 取完整 assistant → 切塊送 chunk → finish_reason:"stop" → [DONE]   [D1]
 ```
-prelude 呼叫樣板見 [handler.rs:496](src/server/handler.rs:496)(dummy `UnusedAgentPort` + no-op emit,`plan_stream_turn` 不碰 agent/emit)。
+prelude 呼叫樣板見 [handler.rs:496](../../../../src/server/handler.rs)(dummy `UnusedAgentPort` + no-op emit,`plan_stream_turn` 不碰 agent/emit)。
 
 ## Errors
 
