@@ -28,6 +28,12 @@ pub struct SessionMemoryTurn {
     pub answer_summary: String,
     /// Intent id.
     pub intent: Option<String>,
+    /// Whether this turn was answered by the **report** pipeline.
+    ///
+    /// Not derivable from `intent`: the selector fires when `report` is merely a *candidate*
+    /// intent, so 「營收報告」 stores `intent = "revenue"` while producing a full mixed-topic
+    /// report. The replay filter needs the pipeline that actually ran, not the top intent.
+    pub report_pipeline: bool,
     /// Metric id.
     pub metric: Option<String>,
     /// Asset id/name.
@@ -158,6 +164,7 @@ mod tests {
             time_range_label: None,
             option_id: None,
             created_at_ms: 1,
+            report_pipeline: false,
         }
     }
 

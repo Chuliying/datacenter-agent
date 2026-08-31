@@ -69,13 +69,21 @@ prelude 的其餘部分（prompt 長度上限、injection 偵測、session memor
 
 與 `/agent/stream` 相同：
 
-- Request body 為 `AgentRequest`（`{prompt, history?, session_id?, option_id?}`）。
-- Bearer required（失敗 418）。
+- Request body 為 `AgentRequest`（`{prompt, history?, session_id?, option_id?}`）。授權模式下
+  `history` 被忽略：server-side session memory 是唯一脈絡來源，與 `/agent/stream` 相同（FR-009）。
+- Service bearer required（失敗 418）。
+- **使用者身份 required**：`X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`。缺失回
+  `401` + `identity.header_missing`；token 失效依 `error_code` 白名單回 `identity.token_refreshable`
+  （可續期一次）或 `identity.token_terminal`（不得續期）——與 `/agent/stream` 完全同一個身份層。
+- **SS 權限 gate**：本路由不做 intent 判定（SS 問題在 EV intent pack 下一律 `unknown`），授權改依
+  `[authz].ss_chat_permissions`——持有任一列出的 Falcon 權限碼即解鎖完整 `[ss_chat.grants]`
+  fetcher 集合；一個都沒有（含只持 `startrade-power` 父層頁）則在呼叫 LLM／MCP 之前以
+  `200` SSE 拒答收場：`token`（拒答文案）→ `refusal`（`code: authz.insufficient`）→ `done`。
 - 成功後為 `text/event-stream`，keep-alive interval 15 秒。
 - prompt cap 為 runtime config `thresholds.input.max_prompt_chars`（目前 4 000），由 prelude 執行。
 - SSE frame 型別與 `/agent/stream` 完全一致（`intent.resolved` / `stage` / `token` / `tool_call` /
   `tool_args` / `usage` / `clear` / `error` / `done`）。
-- Standard group 成員，共用 120 s timeout 與 opt-in burst limiter（與 `/agent/stream` 同一個 bucket）。
+- Standard group 成員，共用 120 s timeout、外層全域 burst limiter（與 `/agent/stream` 同一個 bucket）與**內層 per-actor limiter**（以 `actor_key` 為鍵；超限回 `429` + `rate_limit.actor`）。
 
 Prelude 的三種結果（`Error` / `Refused` / `Proceed`）對外行為與
 [agent-stream](./agent-stream.md#prelude-的三種結果) 相同。

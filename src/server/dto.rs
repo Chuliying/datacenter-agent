@@ -62,7 +62,10 @@ pub enum StreamFrame {
     /// Done event, used to indicate the end of the stream
     Done,
     /// Error event, used to indicate an error
-    Error { data: String },
+    Error { data: String, code: String },
+    /// Terminal authorization refusal. This is deliberately separate from `Error`: a refusal is
+    /// a successful, policy-shaped answer (`200`) rather than an upstream or transport failure.
+    Refusal { code: String },
     /// Clear event, used to suggest down stream reset current accumulated tokens.
     Clear,
     /// Sub-agent stage transition. `data` carries the sub-agent id and its lifecycle phase

@@ -20,15 +20,25 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 
+use super::codes;
+
 /// Uniform error envelope returned by every non-2xx response.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorBody {
     pub error: String,
+    pub code: String,
 }
 
 impl ErrorBody {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self { error: msg.into() }
+        Self::with_code(codes::SERVER_INTERNAL, msg)
+    }
+
+    pub fn with_code(code: &str, msg: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            code: code.to_string(),
+        }
     }
 }
 
@@ -60,12 +70,20 @@ impl AppError {
             }
         }
     }
+
+    fn code(&self) -> &'static str {
+        match self {
+            AppError::BadRequest(_) => codes::REQUEST_INVALID,
+            AppError::BadGateway(_) => codes::UPSTREAM_ERROR,
+            AppError::ServiceUnavailable(_) => codes::SERVER_UNAVAILABLE,
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let body = Json(ErrorBody::new(self.message().to_owned()));
+        let body = Json(ErrorBody::with_code(self.code(), self.message().to_owned()));
         (status, body).into_response()
     }
 }

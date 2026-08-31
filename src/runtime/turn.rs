@@ -14,7 +14,7 @@ use super::guardrails::answer_policy::{AnswerDecision, AnswerPolicy};
 use super::guardrails::input_guard::validate_prompt;
 use super::input::pipeline::InputPipeline;
 use super::llm_normalizer::LlmInputNormalizer;
-use super::memory::context::build_session_memory_context;
+use super::memory::context::build_filtered_session_memory_context;
 use super::memory::store::{SessionMemoryScope, SessionMemoryStore, SessionMemoryTurn};
 use super::schema::{AgentTurnFrame, AgentTurnInput, NormalizedInput};
 use crate::llm_connector::{self, LlmEvent};
@@ -89,7 +89,7 @@ pub enum StreamPlan {
         /// Text to prepend before agent tokens (disclaimer, or empty).
         prefix: String,
         /// Memory-augmented agent input.
-        agent_input: AgentTurnInput,
+        agent_input: Box<AgentTurnInput>,
         /// Normalized input, carrying the resolved intent. Boxed to keep the
         /// enum small (the other variants are tiny).
         normalized: Box<NormalizedInput>,
@@ -149,6 +149,15 @@ pub struct AgentTurnDeps<'a> {
     pub audit: &'a AuditWriter,
     /// Live event sink (REST: no-op; stream: SSE).
     pub emit: TurnEmit<'a>,
+    /// Authorization mappings supplied by the identity-protected HTTP host. Legacy runtime
+    /// callers leave this unset, which preserves their existing memory behavior.
+    pub authz: Option<&'a crate::config::AuthzConfig>,
+    /// MCP tool names advertised at boot.
+    pub advertised_tools: &'a [String],
+    /// Boot data ceiling for the insight fetcher.
+    pub insight_grant: &'a [String],
+    /// Boot data ceiling for the report fetcher.
+    pub report_grant: &'a [String],
 }
 
 /// Adapter from the existing LLM/MCP loop into runtime frames.
@@ -222,7 +231,7 @@ pub async fn run_agent_turn(
                 (deps.emit)(TurnEvent::Token { data: prefix });
             }
             stream_agent_response(
-                agent_input,
+                *agent_input,
                 audit_ctx,
                 deps,
                 started,
@@ -306,7 +315,8 @@ pub async fn plan_stream_turn(
         AnswerDecision::Refuse(reason) => {
             let copy = refusal_copy(&reason);
             if reason != "prompt_injection" {
-                append_memory_turn_if_enabled(&input, deps.sessions, &normalized, &copy).await?;
+                append_memory_turn_if_enabled(&input, deps.sessions, &normalized, &copy, false)
+                    .await?;
             }
             deps.audit
                 .write(
@@ -335,7 +345,7 @@ pub async fn plan_stream_turn(
             Ok(StreamPlan::Proceed {
                 started,
                 prefix,
-                agent_input,
+                agent_input: Box::new(agent_input),
                 normalized: Box::new(normalized),
             })
         }
@@ -344,7 +354,7 @@ pub async fn plan_stream_turn(
             Ok(StreamPlan::Proceed {
                 started,
                 prefix: String::new(),
-                agent_input,
+                agent_input: Box::new(agent_input),
                 normalized: Box::new(normalized),
             })
         }
@@ -398,8 +408,14 @@ async fn stream_agent_response(
                     .await?;
             }
             AgentTurnFrame::Done => {
-                append_memory_turn_if_enabled(&memory_input, deps.sessions, normalized, response)
-                    .await?;
+                append_memory_turn_if_enabled(
+                    &memory_input,
+                    deps.sessions,
+                    normalized,
+                    response,
+                    false,
+                )
+                .await?;
                 deps.audit
                     .write(
                         audit_ctx,
@@ -459,7 +475,10 @@ async fn apply_memory_context(
     };
     let scope = SessionMemoryScope {
         session_id,
-        actor_id: None,
+        actor_id: input
+            .identity
+            .as_ref()
+            .map(|identity| identity.actor_key.as_str().to_string()),
     };
     let Some(memory) = sessions.get(&scope).await else {
         deps.audit
@@ -467,6 +486,7 @@ async fn apply_memory_context(
                 audit_ctx,
                 AuditEvent::MemoryContext {
                     used_turn_count: 0,
+                    dropped_turn_count: 0,
                     dropped_reason: None,
                 },
             )
@@ -474,21 +494,25 @@ async fn apply_memory_context(
         input.history.clear();
         return Ok(input);
     };
-    match build_session_memory_context(
+    let filtered = build_filtered_session_memory_context(
         &memory,
         deps.runtime_config
             .thresholds
             .memory
             .max_memory_context_chars,
         &deps.runtime_config.injection_detector,
-    ) {
+        |turn| memory_turn_is_allowed(turn, input.identity.as_ref(), &deps),
+    );
+    match filtered.context {
         Some(context) => {
             deps.audit
                 .write(
                     audit_ctx,
                     AuditEvent::MemoryContext {
-                        used_turn_count: memory.recent_turns.len(),
-                        dropped_reason: None,
+                        used_turn_count: filtered.used_turn_count,
+                        dropped_turn_count: filtered.dropped_turn_count,
+                        dropped_reason: (filtered.dropped_turn_count > 0)
+                            .then_some("permission_filtered".into()),
                     },
                 )
                 .await?;
@@ -496,12 +520,21 @@ async fn apply_memory_context(
             input.history.clear();
         }
         None => {
+            let dropped_reason = match (filtered.used_turn_count, filtered.dropped_turn_count) {
+                (0, 0) => None,
+                (0, _) => Some("permission_filtered".into()),
+                (_, dropped) if dropped > 0 => {
+                    Some("permission_filtered_and_budget_exhausted".into())
+                }
+                _ => Some("budget_exhausted".into()),
+            };
             deps.audit
                 .write(
                     audit_ctx,
                     AuditEvent::MemoryContext {
-                        used_turn_count: 0,
-                        dropped_reason: Some("budget_exhausted".into()),
+                        used_turn_count: filtered.used_turn_count,
+                        dropped_turn_count: filtered.dropped_turn_count,
+                        dropped_reason,
                     },
                 )
                 .await?;
@@ -518,11 +551,13 @@ async fn apply_memory_context(
 /// (e.g. the `/agent/stream` router, which drives the sub-agent pipeline directly
 /// to preserve its stage frames) can persist memory with the exact same shape —
 /// no drift between the two paths.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_memory_turn_if_enabled(
     input: &AgentTurnInput,
     sessions: Option<&dyn SessionMemoryStore>,
     normalized: &NormalizedInput,
     response: &str,
+    report_pipeline: bool,
 ) -> RuntimeResult<()> {
     let Some(session_id) = input.session_id.as_ref() else {
         return Ok(());
@@ -532,7 +567,10 @@ pub(crate) async fn append_memory_turn_if_enabled(
     };
     let scope = SessionMemoryScope {
         session_id: session_id.clone(),
-        actor_id: None,
+        actor_id: input
+            .identity
+            .as_ref()
+            .map(|identity| identity.actor_key.as_str().to_string()),
     };
     sessions
         .append_turn(
@@ -542,6 +580,7 @@ pub(crate) async fn append_memory_turn_if_enabled(
                 user_summary: input.raw_input.clone(),
                 answer_summary: response.to_string(),
                 intent: Some(normalized.intent.clone()),
+                report_pipeline,
                 metric: normalized.slots.metric.clone(),
                 asset: normalized.slots.asset.clone(),
                 time_range_label: normalized.slots.time_range.clone(),
@@ -551,6 +590,52 @@ pub(crate) async fn append_memory_turn_if_enabled(
         )
         .await;
     Ok(())
+}
+
+/// Decide whether one stored turn is safe to reintroduce under the current permission snapshot.
+/// The report path is stricter than its live degradation rule: a partially authorized report may
+/// be generated, but its mixed-topic summary is not safe to replay after a permission change.
+fn memory_turn_is_allowed(
+    turn: &SessionMemoryTurn,
+    identity: Option<&crate::server::identity::IdentityContext>,
+    deps: &AgentTurnDeps<'_>,
+) -> bool {
+    let Some(identity) = identity else {
+        return true;
+    };
+    let Some(authz) = deps.authz else {
+        return true;
+    };
+    let Some(intent) = turn.intent.as_deref() else {
+        return false;
+    };
+    if intent == "unknown" || intent.is_empty() {
+        return false;
+    }
+    // Not `intent == "report"`: the selector fires when `report` is merely a candidate, so a
+    // mixed-topic report can be stored under a topic intent such as `revenue`. Keying the strict
+    // rule off the top intent would let exactly that turn escape it after a permission change.
+    let report = turn.report_pipeline || intent == "report";
+    let boot_grant = if report {
+        deps.report_grant
+    } else {
+        deps.insight_grant
+    };
+    let decision = crate::server::authz::authorize_pipeline(
+        authz,
+        boot_grant,
+        &identity.permissions.codes,
+        intent,
+        report,
+        deps.advertised_tools,
+        &[],
+        &[],
+    );
+    if report {
+        decision.allowed && decision.omitted_tools.is_empty()
+    } else {
+        decision.allowed
+    }
 }
 
 fn now_ms() -> u64 {
@@ -595,6 +680,7 @@ fn disclaimer_copy(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use futures::stream;
@@ -610,6 +696,9 @@ mod tests {
         InMemorySessionStore, SessionMemoryStore, SessionMemoryTurn,
     };
     use crate::runtime::registry::BuiltinRegistry;
+    use crate::server::actor::ActorKey;
+    use crate::server::falcon::Permissions;
+    use crate::server::identity::IdentityContext;
 
     #[test]
     fn maps_llm_events_to_runtime_frames() {
@@ -722,6 +811,7 @@ mod tests {
             history: Vec::new(),
             session_id: None,
             option_id: None,
+            identity: None,
         }
     }
 
@@ -730,6 +820,7 @@ mod tests {
             request_id: "req".into(),
             session_id: None,
             route: "/agent".into(),
+            actor_key: None,
             actor: None,
         }
     }
@@ -761,6 +852,10 @@ mod tests {
                 agent: &agent,
                 audit: &audit,
                 emit: &|_event| {},
+                authz: None,
+                advertised_tools: &[],
+                insight_grant: &[],
+                report_grant: &[],
             },
         )
         .await
@@ -804,6 +899,10 @@ mod tests {
                 agent: &agent,
                 audit: &audit,
                 emit: &|_event| {},
+                authz: None,
+                advertised_tools: &[],
+                insight_grant: &[],
+                report_grant: &[],
             },
         )
         .await
@@ -843,11 +942,94 @@ mod tests {
                 agent: &agent,
                 audit: &audit,
                 emit: &|_event| {},
+                authz: None,
+                advertised_tools: &[],
+                insight_grant: &[],
+                report_grant: &[],
             },
         )
         .await
         .expect("turn should run");
         (outcome, calls)
+    }
+
+    fn identity(user_id: i64, permission_codes: &[&str]) -> IdentityContext {
+        IdentityContext {
+            actor_key: ActorKey::derive(user_id, b"0123456789abcdef0123456789abcdef")
+                .expect("test actor key should derive"),
+            permissions: Permissions {
+                user_id,
+                codes: permission_codes
+                    .iter()
+                    .map(|code| (*code).to_string())
+                    .collect::<HashSet<_>>(),
+            },
+        }
+    }
+
+    async fn run_with_authorized_sessions(
+        mut input: AgentTurnInput,
+        sessions: &dyn SessionMemoryStore,
+    ) -> (
+        AgentTurnOutcome,
+        Arc<Mutex<Option<AgentTurnInput>>>,
+        Arc<CapturingAuditSink>,
+    ) {
+        let cfg = runtime_config();
+        let authz = AppConfig::load("config/config.toml")
+            .expect("app config should load")
+            .authz
+            .expect("shipped authz config should load");
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy::new(&cfg.thresholds.confidence);
+        let advertised = [
+            "bill_revenue",
+            "station_revenue_ranking",
+            "bill_charge",
+            "business_metrics",
+            "member_analysis",
+            "bill_member_analysis",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let insight_grant = vec!["*".to_string()];
+        let report_grant = advertised.clone();
+        let last_input = Arc::new(Mutex::new(None));
+        let agent = FakeAgentPort {
+            frames: vec![
+                AgentTurnFrame::Token {
+                    data: "answer".into(),
+                },
+                AgentTurnFrame::Done,
+            ],
+            calls: Arc::new(Mutex::new(0)),
+            last_input: last_input.clone(),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink.clone(), AuditFailurePolicy::FailClosed);
+        input.identity.get_or_insert_with(|| identity(123, &[]));
+        let outcome = run_agent_turn(
+            input,
+            &audit_ctx(),
+            AgentTurnDeps {
+                runtime_config: &cfg,
+                input_pipeline: &pipeline,
+                answer_policy: &policy,
+                llm_normalizer: None,
+                sessions: Some(sessions),
+                agent: &agent,
+                audit: &audit,
+                emit: &|_event| {},
+                authz: Some(&authz),
+                advertised_tools: &advertised,
+                insight_grant: &insight_grant,
+                report_grant: &report_grant,
+            },
+        )
+        .await
+        .expect("authorized turn should run");
+        (outcome, last_input, audit_sink)
     }
 
     #[tokio::test]
@@ -1137,6 +1319,7 @@ mod tests {
                     time_range_label: None,
                     option_id: None,
                     created_at_ms: 1,
+                    report_pipeline: false,
                 },
             )
             .await;
@@ -1164,7 +1347,8 @@ mod tests {
             record.event,
             AuditEvent::MemoryContext {
                 used_turn_count: 1,
-                dropped_reason: None
+                dropped_reason: None,
+                ..
             }
         )));
         let memory = store.get(&scope).await.expect("memory should remain");
@@ -1175,6 +1359,132 @@ mod tests {
                 .map(|turn| turn.user_summary.as_str()),
             Some("營收 收入 這個月呢")
         );
+    }
+
+    #[tokio::test]
+    /// S-RUNTIME-SEC-02 AC-023, AC-024
+    async fn authorized_memory_context_drops_revoked_topics_and_audits_the_count() {
+        let store = InMemorySessionStore::new(10);
+        let actor = identity(123, &["hdrenewables/elecsvc/starcharger/finance"]);
+        let scope = SessionMemoryScope {
+            session_id: "s-authz".into(),
+            actor_id: Some(actor.actor_key.as_str().into()),
+        };
+        for (id, intent, user, answer) in [
+            ("revenue", Some("revenue"), "營收摘要", "finance answer"),
+            (
+                "member",
+                Some("member"),
+                "會員秘密",
+                "member answer must not leak",
+            ),
+            (
+                "report",
+                Some("report"),
+                "完整報告秘密",
+                "report answer must not leak",
+            ),
+            (
+                "unknown",
+                Some("unknown"),
+                "unknown secret",
+                "unknown answer",
+            ),
+        ] {
+            store
+                .append_turn(
+                    &scope,
+                    SessionMemoryTurn {
+                        turn_id: id.into(),
+                        user_summary: user.into(),
+                        answer_summary: answer.into(),
+                        intent: intent.map(str::to_string),
+                        metric: None,
+                        asset: None,
+                        time_range_label: None,
+                        option_id: None,
+                        created_at_ms: 1,
+                        report_pipeline: false,
+                    },
+                )
+                .await;
+        }
+
+        let mut input = turn_input("營收 收入 賺多少");
+        input.session_id = Some("s-authz".into());
+        input.identity = Some(actor);
+        let (_, last_input, audit) = run_with_authorized_sessions(input, &store).await;
+        let sent = last_input
+            .lock()
+            .await
+            .clone()
+            .expect("agent input should be captured");
+
+        assert!(sent.prompt.contains("營收摘要"));
+        for secret in [
+            "會員秘密",
+            "member answer must not leak",
+            "完整報告秘密",
+            "unknown secret",
+        ] {
+            assert!(
+                !sent.prompt.contains(secret),
+                "filtered memory leaked {secret}"
+            );
+        }
+        assert!(audit.records.lock().await.iter().any(|record| {
+            let AuditEvent::MemoryContext {
+                used_turn_count,
+                dropped_turn_count,
+                dropped_reason,
+            } = &record.event
+            else {
+                return false;
+            };
+            *used_turn_count == 1
+                && *dropped_turn_count == 3
+                && dropped_reason.as_deref() == Some("permission_filtered")
+        }));
+    }
+
+    #[tokio::test]
+    /// S-RUNTIME-SEC-02 AC-005
+    async fn memory_scope_uses_actor_key_so_same_session_cannot_cross_users() {
+        let store = InMemorySessionStore::new(10);
+        let first_actor = identity(123, &["hdrenewables/elecsvc/starcharger/finance"]);
+        let second_actor = identity(456, &["hdrenewables/elecsvc/starcharger/finance"]);
+        let first_scope = SessionMemoryScope {
+            session_id: "shared-session".into(),
+            actor_id: Some(first_actor.actor_key.as_str().into()),
+        };
+        store
+            .append_turn(
+                &first_scope,
+                SessionMemoryTurn {
+                    turn_id: "first".into(),
+                    user_summary: "第一位使用者的私有摘要".into(),
+                    answer_summary: "private answer".into(),
+                    intent: Some("revenue".into()),
+                    metric: Some("revenue".into()),
+                    asset: None,
+                    time_range_label: None,
+                    option_id: None,
+                    created_at_ms: 1,
+                    report_pipeline: false,
+                },
+            )
+            .await;
+
+        let mut input = turn_input("營收 收入 賺多少");
+        input.session_id = Some("shared-session".into());
+        input.identity = Some(second_actor);
+        let (_, last_input, _) = run_with_authorized_sessions(input, &store).await;
+        let sent = last_input
+            .lock()
+            .await
+            .clone()
+            .expect("agent input should be captured");
+        assert!(!sent.prompt.contains("第一位使用者的私有摘要"));
     }
 
     async fn plan_with_fake(input: AgentTurnInput) -> StreamPlan {
@@ -1200,6 +1510,10 @@ mod tests {
                 agent: &agent,
                 audit: &audit,
                 emit: &|_event| {},
+                authz: None,
+                advertised_tools: &[],
+                insight_grant: &[],
+                report_grant: &[],
             },
         )
         .await
@@ -1266,6 +1580,10 @@ mod tests {
                 agent: &agent,
                 audit: &audit,
                 emit: &emit,
+                authz: None,
+                advertised_tools: &[],
+                insight_grant: &[],
+                report_grant: &[],
             },
         )
         .await

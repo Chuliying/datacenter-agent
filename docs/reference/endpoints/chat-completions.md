@@ -1,7 +1,7 @@
 # `POST /v1/chat/completions` — 現況契約
 
 > ← [Endpoints](./index.md)  
-> **Source**：[`src/server/openai.rs`](../../../src/server/openai.rs)（DTO + mapping）、[`src/server/handler.rs`](../../../src/server/handler.rs) `chat_completions` / `openai_buffered_response` / `openai_stream_response` / `fold_history_into_prompt`、[`src/server/auth.rs`](../../../src/server/auth.rs) `require_bearer_openai`、[`src/server/route.rs`](../../../src/server/route.rs)  
+> **Source**：[`src/server/openai.rs`](../../../src/server/openai.rs)（DTO + mapping）、[`src/server/handler.rs`](../../../src/server/handler.rs) `chat_completions` / `openai_buffered_response` / `openai_stream_response`、[`src/server/auth.rs`](../../../src/server/auth.rs) `require_bearer_openai`、[`src/server/route.rs`](../../../src/server/route.rs)
 > **交付紀錄**：[`docs/work/_archive/agentgateway-openai-endpoint/`](../../work/_archive/agentgateway-openai-endpoint/spec.md)（spec D1–D9、qa-report findings）
 
 OpenAI 相容端點，讓本服務能被註冊成 **agentgateway Path C**（OpenAI-compatible LLM backend），
@@ -24,11 +24,7 @@ routinely 超過 120 s。
 ```json
 {
   "model": "datacenter-agent",
-  "messages": [
-    {"role": "user", "content": "本月充電量？"},
-    {"role": "assistant", "content": "..."},
-    {"role": "user", "content": "那 AC 佔比呢？"}
-  ],
+  "messages": [{"role": "user", "content": "本月充電量？"}],
   "stream": true,
   "stream_options": {"include_usage": true}
 }
@@ -43,32 +39,11 @@ routinely 超過 120 s。
 
 ### `messages` mapping 規則
 
-- 只有 `user` / `assistant` 兩種 role 帶對話輪次；**其他 role 全部丟棄**，包含
-  `system` / `developer`（pipeline 沒有 system slot，各 stage 自帶設計好的 instruction），
-  以及 `tool` / `function`（本端點不宣告任何 tool）。
-- 丟棄而非合併的理由：重播帶 tool message 的 transcript 時，不會污染 user/assistant history。
-- 必須有結尾的 `user` message 當 prompt。沒有任何 message、或結尾不是 `user`（例如以
-  `assistant` 收尾）→ `400 invalid_request_error`。
-
-### History 折入時機（重要）
-
-history 在**呼叫 runtime prelude 之前**就折入 prompt（`fold_history_into_prompt`），
-格式為：
-
-```
-以下是先前的對話紀錄:
-User: ...
-Assistant: ...
-
-目前的問題:
-<最後一則 user message>
-```
-
-這個順序讓 **intent 分類與 answer policy 也看得到對話上下文**——多輪 follow-up
-（例如前輪問營收、本輪問「那 AC 佔比呢？」）能正確分類，不會被誤判成 unknown 而拒答。
-
-副作用：折入後的 prompt 一併受 prelude 的 4 000-char cap 約束。適度多輪無虞，
-極長對話可能觸 cap，屬既有輸入保護。
+授權模式固定為**單輪**：從 `messages` 尾端找最後一個 `user`，只把它作為 prompt；之前所有
+`user`、`assistant`、`system`、`developer`、`tool`、`function` message 都丟棄。沒有任何
+`user` message（空陣列、只有 system、或只有 assistant）才回 `400 invalid_request_error`。
+因此沒有 transcript folding，也沒有 OpenAI 的 `session_id`／`option_id` 對應；server-side
+memory 在本端點 inert。選中的單一 prompt 再經 runtime 的 4 000-char cap。
 
 ## Response
 
@@ -89,19 +64,27 @@ drain 出來的。answer policy 要求 disclaimer 時，disclaimer 會被 prepen
 
 ## Error mapping
 
-全部使用 OpenAI error envelope `{"error":{"message","type"}}`。
+全部使用 OpenAI error envelope `{"error":{"message","type","code"}}`。
 
 | 情況 | HTTP | `type` |
 |---|---|---|
-| 認證失敗 | 401 | `invalid_request_error` |
-| `messages` 無 user message / 結尾非 user | 400 | `invalid_request_error` |
+| service bearer 失敗 | 401 | `invalid_request_error` / `auth.service_token_invalid` |
+| Falcon header 缺失或格式錯誤 | 401 | `invalid_request_error` / `identity.header_missing` |
+| Falcon permissions 401，body `error_code` 為 `auth.token_invalid` | 401 | `invalid_request_error` / `identity.token_refreshable`（可花一次 refresh 並重送一次）|
+| Falcon permissions 401，其餘／未知／無 `error_code` | 401 | `invalid_request_error` / `identity.token_terminal`（**不得** refresh）|
+| Falcon timeout／連線失敗／5xx／畸形 200 | 503 | `server_error` / `identity.upstream_unavailable` |
+| `messages` 無 user message | 400 | `invalid_request_error` / `request.invalid` |
 | malformed JSON | 400 | `invalid_request_error` |
 | 缺少或錯誤 content-type | 415 | `invalid_request_error` |
 | body > 64 KiB | 413 | `invalid_request_error` |
 | `RUNTIME_ENABLED=false` | 503 | `server_error` |
 | 逾時（600 s） | 504 | `server_error` |
 | 其他 middleware 錯誤 | 500 | `server_error` |
-| burst limiter 拒絕（`[server.rate_limit]` opt-in，預設關閉） | 429 | `rate_limit_error` |
+| global／per-actor limiter 拒絕 | 429 | `rate_limit_error` / `rate_limit.global` 或 `rate_limit.actor` |
+
+`authz.insufficient` 不是 HTTP error：它是 `200` 的正常 assistant refusal，buffered response
+帶 `x_refusal_code`，stream response 在內容後以 `[DONE]` 結束；因此 client 不應把它當作可重試
+的 upstream failure。部分 report 權限則仍回成功答案，但終端答案會聲明省略主題並寫入 audit。
 
 `type` 由 `error_type_for_status` 決定：`400..=499` → `invalid_request_error`，
 其餘 → `server_error`。envelope 永遠帶 `type`，不會省略。唯一例外是 opt-in
@@ -120,15 +103,15 @@ burst limiter 的 `429`：`type` 固定為 `rate_limit_error`，並帶整數秒
 ```bash
 curl -s http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $GLOBAL_TOKEN" \
+  -H "X-Falcon-Authorization: Bearer $FALCON_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"model":"datacenter-agent","messages":[{"role":"user","content":"本月充電量？"}]}'
 ```
 
 ## Test evidence 與缺口
 
-- cargo lib 207/0、clippy 綠；`route.rs` 有 timeout envelope 與 merge-survival test。
-- **未完成的端到端驗證**（見 work item 的 qa-report）：
-  - 真實上游 `DATACENTER_API_BASE`（正確 host）的成功查詢 e2e——目前只用本機 mock stub 驗過。
-  - 平台端 agentgateway 對接煙霧測試。
-- 刻意保留：斷線 abort（共用多工 rmcp peer，mid-request 取消安全無法離線確證）、
-  真 pipeline 兩路徑整合測試（`McpHandle` 無 fake 接縫）。
+- `openai.rs`、`handler.rs`、`identity.rs`、`route.rs` 與 `runtime_contract.rs` 的 crate／integration
+  tests 覆蓋單輪 mapping、三種 identity 失敗、拒答 code、降級 helper、timeout envelope 與 route scope。
+- Falcon client tests 覆蓋文件化 200 shape、generic 401、畸形 200／transport negative cache 與 LRU。
+- 非本地範圍：真實上游與 agentgateway 對接、斷線 cancellation、slow consumer 與 live LLM/MCP
+  pipeline；這些不會在 `cargo test` 中消耗憑證或外部服務。

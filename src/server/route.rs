@@ -35,7 +35,8 @@ use std::sync::Arc;
 
 use super::auth::{require_bearer, require_bearer_openai};
 use super::handler;
-use super::rate_limit::{self, ErrorFamily, GlobalBurstLimiter};
+use super::identity;
+use super::rate_limit::{self, ErrorFamily, GlobalBurstLimiter, PerActorBurstLimiter};
 use super::{openai, AppState};
 use crate::runtime::audit::{AuditSink, TracingAuditSink};
 
@@ -102,14 +103,20 @@ pub fn build_router(state: AppState) -> Router {
     // Opt-in global burst limiter (S-RUNTIME-SEC-01 FR-005): one shared bucket
     // for the expensive routes only. Rejections audit through the runtime's
     // sink when the runtime is wired, else the tracing sink — same stream.
-    let limiter = state.rate_limit.enabled.then(|| {
-        let audit: Arc<dyn AuditSink> = state
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.audit_sink.clone())
-            .unwrap_or_else(|| Arc::new(TracingAuditSink));
-        Arc::new(GlobalBurstLimiter::new(&state.rate_limit, audit))
-    });
+    let audit: Arc<dyn AuditSink> = state
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.audit_sink.clone())
+        .unwrap_or_else(|| Arc::new(TracingAuditSink));
+    let limiter = state
+        .rate_limit
+        .enabled
+        .then(|| Arc::new(GlobalBurstLimiter::new(&state.rate_limit, audit.clone())));
+    let actor_limiter = state
+        .rate_limit
+        .per_actor
+        .as_ref()
+        .map(|config| Arc::new(PerActorBurstLimiter::new(config, audit.clone())));
 
     // The four standard endpoints: standard 120 s timeout, `require_bearer` (D6, `418` on a bad
     // token). Auth + timeout are applied to this sub-router so they stay scoped to these routes.
@@ -129,9 +136,25 @@ pub fn build_router(state: AppState) -> Router {
     // pipeline over the `ss_*` tools, with intent filtering off (see `handler::ss_chat_stream`).
     // It shares the limiter with `/agent/stream` — both drive the same LLM/MCP cost — so the two
     // sit on one nested router.
+    //
+    // Both are **prompt routes**, so both carry the identity layer and the per-actor limiter. A
+    // prompt entrypoint without identity resolution would be an end-user-unauthenticated way into
+    // the same pipeline, which is exactly the hole the identity slice closes — adding a route here
+    // without adding it to this router is therefore a security regression, not a routing detail.
     let mut streaming = Router::new()
         .route("/agent/stream", post(handler::agent_stream))
         .route("/ss-chat/stream", post(handler::ss_chat_stream));
+    if let Some(limiter) = &actor_limiter {
+        let limiter = limiter.clone();
+        streaming = streaming.layer(middleware::from_fn(move |req, next| {
+            let limiter = limiter.clone();
+            async move { rate_limit::enforce_actor(limiter, ErrorFamily::Standard, req, next).await }
+        }));
+    }
+    streaming = streaming.layer(middleware::from_fn_with_state(
+        state.clone(),
+        identity::enforce,
+    ));
     if let Some(limiter) = &limiter {
         let limiter = limiter.clone();
         streaming = streaming.layer(middleware::from_fn(move |req, next| {
@@ -159,6 +182,17 @@ pub fn build_router(state: AppState) -> Router {
     // D6 contract for the standard endpoints above) is left untouched.
     let mut openai_routes =
         Router::new().route("/v1/chat/completions", post(handler::chat_completions));
+    if let Some(limiter) = &actor_limiter {
+        let limiter = limiter.clone();
+        openai_routes = openai_routes.layer(middleware::from_fn(move |req, next| {
+            let limiter = limiter.clone();
+            async move { rate_limit::enforce_actor(limiter, ErrorFamily::OpenAi, req, next).await }
+        }));
+    }
+    openai_routes = openai_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        identity::enforce,
+    ));
     if let Some(limiter) = &limiter {
         // Innermost layer: a 429 is an ordinary response, so it passes back through the
         // timeout/error stack untouched; auth still runs first (outermost).
@@ -390,6 +424,116 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn identity_layer_only_covers_prompt_routes_and_returns_distinct_codes() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::new([
+            Err(crate::server::falcon::PermissionsFailure::UnauthorizedTerminal),
+            Err(crate::server::falcon::PermissionsFailure::UnauthorizedTerminal),
+        ]);
+        let (mut state, _mcp) =
+            crate::test_support::app_state_with_provider(provider.clone()).await;
+        state.rate_limit = crate::config::RateLimitConfig::default();
+        let app = build_router(state);
+
+        let standard = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/stream")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"prompt":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(standard.status(), StatusCode::UNAUTHORIZED);
+        let standard_body = axum::body::to_bytes(standard.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let standard_json: serde_json::Value = serde_json::from_slice(&standard_body).unwrap();
+        assert_eq!(
+            standard_json["code"],
+            crate::server::codes::IDENTITY_HEADER_MISSING
+        );
+
+        let openai = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(openai.status(), StatusCode::UNAUTHORIZED);
+        let openai_body = axum::body::to_bytes(openai.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let openai_json: serde_json::Value = serde_json::from_slice(&openai_body).unwrap();
+        assert_eq!(
+            openai_json["error"]["code"],
+            crate::server::codes::IDENTITY_HEADER_MISSING
+        );
+
+        // Health remains available with only the service bearer and never consults Falcon.
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(provider.calls(), 0, "probe routes must not invoke identity");
+    }
+
+    #[tokio::test]
+    async fn a_valid_identity_reaches_prompt_handler_after_global_auth() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(123, &[]);
+        let (state, _mcp) = crate::test_support::app_state_with_provider(provider.clone()).await;
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/agent/stream")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .header("x-falcon-authorization", "Bearer user-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"prompt":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Identity succeeded; the fixture deliberately has no runtime, so the handler's own
+        // cutover guard is the next observable boundary.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(provider.calls(), 1);
+    }
+
     /// The same uniformity, generalised past the four retired paths.
     ///
     /// The fallback fix is not specific to them: before it, *any* unmatched path answered `401`
@@ -426,5 +570,80 @@ mod tests {
                  ({statuses:?}), which leaks whether a token is valid"
             );
         }
+    }
+
+    /// `/ss-chat/stream` is a prompt route, so it carries the identity layer and the SS
+    /// permission gate — through the **real** router, since the SS pipeline's own test is an
+    /// ignored live test that bypasses routing entirely. Three assertions: no identity header
+    /// → 401; identity without a startrade-power permission → the `authz.insufficient` refusal
+    /// (an SSE `refusal` frame, not a transport error); identity with one → past both gates.
+    #[tokio::test]
+    async fn ss_chat_route_requires_identity_and_a_startrade_permission() {
+        use crate::server::falcon::Permissions;
+
+        let starcharger_only = Permissions {
+            user_id: 7,
+            codes: ["hdrenewables/elecsvc/starcharger/finance".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let startrade = Permissions {
+            user_id: 8,
+            codes: ["hdrenewables/elecsvc/startrade-power/finance".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let provider = crate::test_support::ScriptedPermissionsProvider::new([
+            Ok(starcharger_only),
+            Ok(startrade),
+        ]);
+        let (state, _mcp) = crate::test_support::runtime_app_state(provider).await;
+        let app = build_router(state);
+
+        let request = |identity: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/ss-chat/stream")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                )
+                .header("content-type", "application/json");
+            if let Some(token) = identity {
+                builder = builder.header("x-falcon-authorization", format!("Bearer {token}"));
+            }
+            builder
+                .body(Body::from(r#"{"prompt":"星星電力儲能現況"}"#))
+                .unwrap()
+        };
+
+        // No identity header: refused by the identity layer before anything else.
+        let missing = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        // Identity resolves, but the permission set is starcharger-only: the SS gate refuses
+        // inside a 200 SSE stream with the machine-readable refusal frame.
+        let denied = app.clone().oneshot(request(Some("user-a"))).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::OK);
+        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let denied_text = String::from_utf8_lossy(&denied_body);
+        assert!(
+            denied_text.contains(crate::server::codes::AUTHZ_INSUFFICIENT),
+            "a starcharger-only user must hit the SS permission gate: {denied_text}"
+        );
+
+        // A startrade-power permission passes both gates: no 401, no refusal frame.
+        let allowed = app.oneshot(request(Some("user-b"))).await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let allowed_body = axum::body::to_bytes(allowed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let allowed_text = String::from_utf8_lossy(&allowed_body);
+        assert!(
+            !allowed_text.contains(crate::server::codes::AUTHZ_INSUFFICIENT),
+            "a startrade-power user must pass the SS gate: {allowed_text}"
+        );
     }
 }

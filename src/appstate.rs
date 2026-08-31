@@ -16,6 +16,7 @@
 //!
 //! This module also process ENV variables for the LLM and MCP server.
 
+use std::env::VarError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use async_openai::types::chat::ChatCompletionTool;
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, AuthzConfig, IdentityConfig, ReportGrants};
 use crate::mcp_client::McpHandle;
 use crate::model::{GenerationConfig, History};
 use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
@@ -34,6 +35,7 @@ use crate::runtime::input::pipeline::InputPipeline;
 use crate::runtime::llm_normalizer::LlmInputNormalizer;
 use crate::runtime::memory::store::SessionMemoryStore;
 use crate::runtime::registry::BuiltinRegistry;
+use crate::server::falcon::{FalconPermissionsClient, PermissionsProvider};
 
 /// Helper to parse optional env vars with a fallback.
 fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -41,6 +43,59 @@ fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// Resolve the Falcon base URL, allowing deployments to override the checked-in local default.
+///
+/// This is a deployment setting, not an identity feature flag: the identity layer remains
+/// unconditional and an empty or non-Unicode override fails boot rather than silently falling
+/// back to the manifest value.
+/// Both rate-limit layers are prerequisites of the identity layer, not preferences (AC-021,
+/// ERR-009).
+///
+/// The outer global bucket is the only thing bounding traffic whose identity never resolves —
+/// `ERR-002`/`ERR-003`/`ERR-004`/`ERR-008` all finish before the inner layer is reached — so a
+/// deployment with it switched off would let a caller cycling invalid tokens hammer Falcon
+/// unthrottled. Refusing to boot is the same treatment a missing pepper gets: a misconfiguration
+/// that silently removes a protection is worse than one that stops the service.
+///
+/// Extracted from the boot path so it can be tested without standing up MCP, the LLM client and
+/// the runtime.
+///
+/// # Errors
+///
+/// Returns `Err` when the outer limiter is disabled, or when the inner per-actor policy is absent.
+pub(crate) fn require_rate_limit_for_identity(
+    rate_limit: &crate::config::RateLimitConfig,
+) -> Result<()> {
+    if !rate_limit.enabled {
+        anyhow::bail!(
+            "config_error: [server.rate_limit].enabled must be true when the identity layer is enabled (ERR-009)"
+        );
+    }
+    if rate_limit.per_actor.is_none() {
+        anyhow::bail!(
+            "config_error: [server.rate_limit.per_actor] section is required when the identity layer is enabled"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_identity_config(config: &IdentityConfig) -> Result<IdentityConfig> {
+    match std::env::var("FALCON_API_BASE_URL") {
+        Ok(value) if value.trim().is_empty() => {
+            anyhow::bail!("env_error: FALCON_API_BASE_URL is empty")
+        }
+        Ok(value) => {
+            let mut resolved = config.clone();
+            resolved.base_url = value;
+            Ok(resolved)
+        }
+        Err(VarError::NotPresent) => Ok(config.clone()),
+        Err(VarError::NotUnicode(_)) => {
+            anyhow::bail!("env_error: FALCON_API_BASE_URL is not valid UTF-8")
+        }
+    }
 }
 
 /// LLM defaults sourced from the environment at startup.
@@ -194,6 +249,11 @@ pub struct AppState {
     ///
     /// Loaded once from `GLOBAL_TOKEN` at startup, never logged, and should rotate periodically (e.g. weekly).
     pub auth_token: Arc<String>,
+    /// HMAC pepper used to derive opaque actor keys from Falcon user ids.
+    pub actor_key_pepper: Arc<Vec<u8>>,
+    /// Falcon permissions provider. The concrete HTTP client owns the bounded positive/negative
+    /// cache; tests replace it with an in-process provider without changing the router seam.
+    pub permissions_provider: Arc<dyn PermissionsProvider>,
     /// Pre-generated greeting strings populated by background tasks at boot.
     ///
     /// `GET /greeting` picks one at random.
@@ -216,6 +276,10 @@ pub struct AppState {
     /// enabled, `build_router` attaches the global burst limiter to the
     /// expensive routes (S-RUNTIME-SEC-01 FR-005).
     pub rate_limit: crate::config::RateLimitConfig,
+    /// Boot-validated permission-to-tool and intent-to-tool mappings.
+    pub authz: AuthzConfig,
+    /// Boot-validated report-specific data grant.
+    pub report_grants: ReportGrants,
 }
 
 /// Runtime dependencies assembled at boot.
@@ -248,11 +312,47 @@ impl AppState {
         prompts: Arc<PromptBank>,
         auth_token: String,
     ) -> Result<Self> {
+        let actor_key_pepper = Arc::new(crate::server::actor::load_actor_key_pepper()?);
+        let identity_config = app_config
+            .identity
+            .as_ref()
+            .context("config_error: [identity] section is required")?;
+        let identity_config = resolve_identity_config(identity_config)?;
+        let permissions_provider: Arc<dyn PermissionsProvider> = Arc::new(
+            FalconPermissionsClient::from_config(&identity_config)
+                .context("build Falcon permissions provider")?,
+        );
         let http = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .context("build /ready probe http client")?;
         let runtime = build_runtime(app_config)?;
+
+        require_rate_limit_for_identity(&app_config.rate_limit)?;
+        let authz = app_config
+            .authz
+            .clone()
+            .context("config_error: [authz] section is required")?;
+        let report_grants = app_config
+            .report_grants
+            .clone()
+            .context("config_error: [report.grants] section is required")?;
+        let advertised: Vec<String> = tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        report_grants
+            .validate(&advertised)
+            .context("validate /report tool grants")?;
+        authz
+            .validate(
+                runtime
+                    .as_ref()
+                    .map(|runtime| runtime.config.intent_allowlist.as_slice())
+                    .unwrap_or(&[]),
+                &advertised,
+            )
+            .context("validate authorization mappings")?;
 
         // Fail fast at boot if a configured /insight tool grant names a tool the datacenter server
         // did not advertise (or an unknown built-in) — never a deferred first-request failure.
@@ -292,12 +392,16 @@ impl AppState {
             prompts,
             http,
             auth_token: Arc::new(auth_token),
+            actor_key_pepper,
+            permissions_provider,
             greetings: Arc::new(Mutex::new(Vec::new())),
             runtime,
             insight_grants: app_config.insight_grants.clone(),
             ss_chat_grants: app_config.ss_chat_grants.clone(),
             report_template: Arc::new(app_config.report_template.clone()),
             rate_limit: app_config.rate_limit.clone(),
+            authz,
+            report_grants,
         })
     }
 
@@ -447,6 +551,55 @@ pub fn load_mcp_url() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// AC-021: with the identity layer present, a disabled outer limiter must stop the boot
+    /// rather than quietly ship a deployment where identity-failing traffic is unthrottled.
+    #[test]
+    /// S-RUNTIME-SEC-02 AC-021
+    fn ac021_identity_layer_requires_both_rate_limit_layers() {
+        use crate::config::{PerActorRateLimitConfig, RateLimitConfig};
+        use std::num::{NonZeroU32, NonZeroU64};
+
+        let per_actor = PerActorRateLimitConfig {
+            burst_size: NonZeroU32::new(5).unwrap(),
+            refill_period_ms: NonZeroU64::new(1000).unwrap(),
+            max_tracked_actors: NonZeroU32::new(64).unwrap(),
+        };
+
+        // Both layers configured: boots.
+        let ok = RateLimitConfig {
+            enabled: true,
+            burst_size: NonZeroU32::new(20).unwrap(),
+            refill_period_ms: NonZeroU64::new(250).unwrap(),
+            per_actor: Some(per_actor.clone()),
+        };
+        require_rate_limit_for_identity(&ok).expect("a fully configured policy must boot");
+
+        // Outer disabled: refuses, and says which key is wrong.
+        let outer_off = RateLimitConfig {
+            enabled: false,
+            ..ok.clone()
+        };
+        let err = require_rate_limit_for_identity(&outer_off)
+            .expect_err("a disabled outer limiter must stop the boot");
+        assert!(
+            err.to_string().contains("[server.rate_limit].enabled"),
+            "the error must name the offending key, got: {err}"
+        );
+
+        // Inner absent: refuses too. Present-but-empty is not a valid state for the inner layer,
+        // because it has no opt-out.
+        let inner_missing = RateLimitConfig {
+            per_actor: None,
+            ..ok
+        };
+        let err = require_rate_limit_for_identity(&inner_missing)
+            .expect_err("a missing per-actor policy must stop the boot");
+        assert!(
+            err.to_string().contains("per_actor"),
+            "the error must name the offending section, got: {err}"
+        );
+    }
     use super::*;
 
     #[test]

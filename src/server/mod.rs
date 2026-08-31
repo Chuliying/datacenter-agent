@@ -33,11 +33,16 @@
 //! - [`greeting`] — the boot-time background task pre-generating greetings through the two-stage
 //!   greeting pipeline.
 
+pub mod actor;
 pub mod auth;
+pub mod authz;
+pub mod codes;
 pub mod dto;
 pub mod error;
+pub mod falcon;
 pub mod greeting;
 pub mod handler;
+pub mod identity;
 pub mod openai;
 pub mod rate_limit;
 pub mod route;

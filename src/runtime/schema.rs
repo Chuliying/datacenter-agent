@@ -21,6 +21,9 @@ pub struct AgentTurnInput {
     pub session_id: Option<String>,
     /// Optional frontend option id.
     pub option_id: Option<String>,
+    /// Verified Falcon identity. `None` is retained for non-HTTP runtime callers and legacy unit
+    /// tests; the identity-protected prompt routes always populate it before entering the runtime.
+    pub identity: Option<crate::server::identity::IdentityContext>,
 }
 
 /// Warning emitted by deterministic normalization or policy stages.
