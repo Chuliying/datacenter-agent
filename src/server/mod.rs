@@ -18,11 +18,11 @@
 //! The submodules are:
 //!
 //! - [`route`] — router + middleware assembly ([`route::build_router`]): two sub-routers
-//!   (standard 4 routes / OpenAI 1 route) each carrying their own timeout and auth layer, merged
+//!   (standard 5 routes / OpenAI 1 route) each carrying their own timeout and auth layer, merged
 //!   under a shared 64 KiB body cap, permissive CORS, trace/compression, and security headers,
 //!   with an explicit outer fallback answering a uniform `404`.
-//! - [`handler`] — the five handlers: `health` / `ready` / `greeting` / `agent_stream` /
-//!   `chat_completions`.
+//! - [`handler`] — the six handlers: `health` / `ready` / `greeting` / `agent_stream` /
+//!   `ss_chat_stream` / `chat_completions`.
 //! - [`openai`] — OpenAI-compatible DTOs and mapping (`ChatCompletionRequest`, `map_request`,
 //!   `error_type_for_status`, the error envelope).
 //! - [`dto`] — request/response types: `AgentRequest`, `StreamFrame` and its data payloads,

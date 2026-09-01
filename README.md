@@ -11,8 +11,13 @@ LLM against live data with the power of MCP server.
 
 ## Endpoints
 
-- `/agent/stream`: SSE stream — the native front door. Runs the runtime prelude, then routes
-  to the insight or report sub-agent pipeline by resolved intent.
+- `/agent/stream`: SSE stream — the native front door for the EV-charging (EOMC) tools. Runs the
+  runtime prelude, then routes to the insight or report sub-agent pipeline by resolved intent.
+- `/ss-chat/stream`: SSE stream — the same four-stage chat pipeline over the 星星電力 investor-platform
+  (`ss_*`) tools, with its own stage prompts and tool grant. Same request/frame contract as
+  `/agent/stream`; intent filtering is off (the intent pack is EV-charging-specific), prompt-injection
+  refusal and the rest of the prelude are unchanged. See
+  [ss-chat-stream](docs/reference/endpoints/ss-chat-stream.md).
 - `/v1/chat/completions`: OpenAI-compatible (agentgateway Path C), streaming and non-streaming.
 - `/greeting`: a random pre-generated, data-aware welcome message
 - `/health`: liveness probe

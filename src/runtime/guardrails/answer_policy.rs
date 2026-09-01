@@ -64,6 +64,35 @@ impl AnswerPolicy for RuleAnswerPolicy {
     }
 }
 
+/// The **intent-filtering-free** policy: answer every prompt, whatever its intent or confidence.
+///
+/// [`RuleAnswerPolicy`] refuses `unknown` / low-confidence input as `off_scope`, which is right for
+/// a front door whose intent pack covers its domain. `/ss-chat` has no such pack — the runtime's
+/// `intents.toml` is the EV-charging one, so every 星星電力 question ("這一季的日照條件怎麼樣？")
+/// classifies as `unknown` and would be refused before the pipeline ever ran. That endpoint
+/// therefore substitutes this policy: intent still resolves (and is still audited and emitted as
+/// `intent.resolved`), it just no longer gates the answer.
+///
+/// **Prompt injection is still refused.** That refusal is a security guardrail, not intent
+/// filtering, so it is kept verbatim from [`RuleAnswerPolicy`] — this policy relaxes scope, not
+/// safety, and the rest of the prelude (prompt-length validation, the injection detector, audit,
+/// memory) is unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AlwaysAnswerPolicy;
+
+impl AnswerPolicy for AlwaysAnswerPolicy {
+    fn decide(&self, input: &NormalizedInput) -> AnswerDecision {
+        if input
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "prompt_injection_detected")
+        {
+            return AnswerDecision::Refuse("prompt_injection".to_string());
+        }
+        AnswerDecision::Answer
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::runtime::schema::{NormalizedInput, NormalizedSlots, RuntimeWarning};
@@ -133,6 +162,43 @@ mod tests {
         assert_eq!(
             policy().decide(&normalized("revenue", 0.8, Vec::new())),
             AnswerDecision::Answer
+        );
+    }
+
+    #[test]
+    fn always_answer_policy_answers_unknown_and_low_confidence() {
+        // The exact two cases `RuleAnswerPolicy` refuses as `off_scope`. Every SS question lands
+        // here, because the runtime's intent pack is the EV-charging one.
+        assert_eq!(
+            AlwaysAnswerPolicy.decide(&normalized("unknown", 0.25, Vec::new())),
+            AnswerDecision::Answer
+        );
+        assert_eq!(
+            AlwaysAnswerPolicy.decide(&normalized("revenue", 0.3, Vec::new())),
+            AnswerDecision::Answer
+        );
+        // No low-confidence disclaimer either — there is no scope to be unsure about.
+        assert_eq!(
+            AlwaysAnswerPolicy.decide(&normalized("revenue", 0.6, Vec::new())),
+            AnswerDecision::Answer
+        );
+    }
+
+    #[test]
+    fn always_answer_policy_still_refuses_prompt_injection() {
+        // Relaxing scope must not relax safety: the injection refusal is kept verbatim.
+        let input = normalized(
+            "unknown",
+            0.25,
+            vec![RuntimeWarning {
+                code: "prompt_injection_detected".to_string(),
+                message: "matched injection heuristic".to_string(),
+            }],
+        );
+
+        assert_eq!(
+            AlwaysAnswerPolicy.decide(&input),
+            AnswerDecision::Refuse("prompt_injection".to_string())
         );
     }
 }

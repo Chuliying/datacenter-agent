@@ -41,9 +41,10 @@ use crate::agent::config::PipelineId;
 use crate::agent::engine::Orchestrator;
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
-use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id};
-use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline};
+use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id, ss_chat_pipeline_id};
+use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline, build_ss_chat_pipeline};
 use crate::runtime::audit::{hash_identifier, AuditCtx, AuditEvent, AuditWriter};
+use crate::runtime::guardrails::answer_policy::{AlwaysAnswerPolicy, AnswerPolicy};
 use crate::runtime::schema::{AgentTurnFrame, AgentTurnInput, NormalizedInput};
 use crate::runtime::turn::{
     append_memory_turn_if_enabled, plan_stream_turn, AgentPort, AgentTurnDeps, StreamPlan,
@@ -165,13 +166,17 @@ impl AgentPort for UnusedAgentPort {
 /// pipeline the resolved intent selects: the report pipeline when a report was
 /// asked for (see [`wants_report_pipeline`]), else the insight pipeline.
 ///
-/// This is the only native streaming front door. The retired `insight_stream` /
-/// `report_stream` handlers drove one fixed pipeline directly and bypassed the
+/// This is the only native streaming front door for the EV-charging (EOMC) tools. The retired
+/// `insight_stream` / `report_stream` handlers drove one fixed pipeline directly and bypassed the
 /// runtime; this one reuses the runtime's [`plan_stream_turn`] prelude verbatim (no
 /// duplicated guardrail/intent logic), then streams the chosen pipeline's rich stage
 /// frames through the `insight_frames` mapping — and replicates the runtime turn's
 /// two post-stream side effects
 /// (`ResponseCompleted` / `ResponseFailed` audit + session-memory append).
+///
+/// The streaming body is shared with [`ss_chat_stream`] through [`run_chat_stream`]; this handler
+/// contributes the route's own two decisions: the runtime's configured answer policy (so
+/// off-scope prompts are refused), and intent-driven pipeline selection.
 ///
 /// Requires the runtime to be enabled (`RUNTIME_ENABLED`, default on); rolled back,
 /// this returns `503`. There is no alternative path: the forced-pipeline endpoints that used to
@@ -183,18 +188,6 @@ pub async fn agent_stream(
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, AppError> {
     let Json(req) = req?;
-
-    let runtime = state
-        .runtime
-        .clone()
-        .filter(|rt| rt.enabled)
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "runtime disabled (RUNTIME_ENABLED=false); /agent/stream requires the runtime"
-                    .into(),
-            )
-        })?;
-
     let span = tracing::info_span!(
         "agent-stream",
         prompt_len = req.prompt.chars().count(),
@@ -202,220 +195,338 @@ pub async fn agent_stream(
         session_id = req.session_id.as_deref().unwrap_or(""),
         option_id = req.option_id.as_deref().unwrap_or(""),
     );
+    run_chat_stream(state, req, "/agent/stream", None, select_agent_pipeline)
+        .instrument(span)
+        .await
+}
 
-    async move {
-        // ── runtime prelude: audit, guardrails, intent, answer policy, memory ──
-        // Reuses the runtime turn's synchronous prelude verbatim. The dummy port +
-        // no-op emit are never exercised by `plan_stream_turn`; this handler owns
-        // the streaming itself.
-        let request_id = uuid::Uuid::new_v4();
-        let audit_ctx = AuditCtx {
-            request_id: request_id.to_string(),
-            session_id: req.session_id.clone(),
-            route: "/agent/stream".into(),
-            actor: None,
-        };
-        let input = AgentTurnInput {
-            request_id,
-            prompt: req.prompt.clone(),
-            raw_input: req.prompt.clone(),
-            history: req.history.clone(),
-            session_id: req.session_id.clone(),
-            option_id: req.option_id.clone(),
-        };
-        let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
-
-        let plan = {
-            let unused = UnusedAgentPort;
-            let emit_noop = |_event: TurnEvent| {};
-            let deps = AgentTurnDeps {
-                runtime_config: &runtime.config,
-                input_pipeline: &runtime.input_pipeline,
-                answer_policy: runtime.answer_policy.as_ref(),
-                llm_normalizer: runtime.llm_normalizer.as_deref(),
-                sessions: runtime.sessions.as_deref(),
-                agent: &unused,
-                audit: &audit,
-                emit: &emit_noop,
-            };
-            plan_stream_turn(input, &audit_ctx, deps)
-                .await
-                .map_err(|e| AppError::ServiceUnavailable(format!("runtime prelude: {e}")))?
-        };
-
-        // ── act on the plan ──
-        let (started, prefix, agent_input, normalized) = match plan {
-            StreamPlan::Error { code, status } => {
-                // Pre-stream validation error; audit already recorded it.
-                return Err(status_to_app_error(status, code));
-            }
-            StreamPlan::Refused { copy, .. } => {
-                // Guardrail refusal: audit + memory already written. Stream the
-                // refusal copy as the whole answer, then close.
-                let sse = async_stream::stream! {
-                    yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: copy }));
-                    yield Ok::<_, Infallible>(sse_event(StreamFrame::Done));
-                };
-                return Ok(Sse::new(sse)
-                    .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-                    .into_response());
-            }
-            StreamPlan::Proceed {
-                started,
-                prefix,
-                agent_input,
-                normalized,
-            } => (started, prefix, agent_input, *normalized),
-        };
-
-        // ── build the intent-selected pipeline (streaming) ──
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
-        let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
-        let resolved = state.llm.resolved();
-
-        let (orchestrator, pipeline_id) = if wants_report_pipeline(&normalized) {
-            let orch = build_report_pipeline(
-                state.mcp.clone(),
-                &state.tools,
-                state.instructions.as_deref(),
-                &state.prompts.fetcher_system,
-                &state.prompts.report_analyst_system,
-                &state.prompts.report_composer_system,
-                &state.insight_grants.fetcher,
-                &resolved,
-                state.report_template.clone(),
-                Some(sink.clone()),
-            )
-            .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-            (orch, report_pipeline_id())
-        } else {
-            let orch = build_insight_pipeline(
-                state.mcp.clone(),
-                &state.tools,
-                state.instructions.as_deref(),
-                &state.prompts.fetcher_system,
-                &state.prompts.analyst_system,
-                &state.prompts.charter_system,
-                &state.insight_grants.fetcher,
-                &state.insight_grants.charter,
-                &resolved,
-                Some(sink.clone()),
-            )
-            .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-            (orch, agent_pipeline_id())
-        };
-
-        // The memory-augmented prompt/history drive the pipeline; the full
-        // agent_input (raw_input preserved) is kept for the post-stream memory append.
-        let memory_input = agent_input.clone();
-        let initial = AgentPayload::Initial(InitialPrompt {
-            prompt: agent_input.prompt,
-            history: agent_input
-                .history
-                .into_iter()
-                .map(|turn| Exchange {
-                    user: turn.user_prompt,
-                    assistant: turn.model_response,
-                })
-                .collect(),
-            now: SystemClock::default().now(),
-        });
-
-        let run = tokio::spawn(async move {
-            orchestrator
-                .run_emitting(&pipeline_id, initial, &*sink)
-                .await
-        });
-
-        // State moved into the stream for the intent frame + post-stream side effects.
-        let intent = normalized.intent.clone();
-        let candidate_intents = normalized.candidate_intents.clone();
-        let sessions = runtime.sessions.clone();
-
-        let sse_stream = async_stream::stream! {
-            // `intent.resolved` first, mirroring the runtime turn's ordering.
-            yield Ok::<_, Infallible>(sse_event(StreamFrame::IntentResolved {
-                data: IntentResolvedData { intent, candidate_intents },
-            }));
-            // A disclaimer prefix, if the answer policy asked for one (transient — the
-            // pipeline's terminal `clear` supersedes it, exactly as the runtime turn does).
-            if !prefix.is_empty() {
-                yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: prefix }));
-            }
-
-            let mut response = String::new();
-            let mut failure: Option<String> = None;
-            let mut completed = false;
-
-            while let Some(event) = rx.recv().await {
-                match &event {
-                    AgentEvent::ContentDelta { text } => response.push_str(text),
-                    // The finalizer/renderer answer is the complete result; the
-                    // terminal `clear` in `insight_frames` resets the client preview.
-                    AgentEvent::Finished { assistant } => {
-                        response = assistant.clone();
-                        completed = true;
-                    }
-                    AgentEvent::Error { message } => failure = Some(message.clone()),
-                    _ => {}
-                }
-                for frame in insight_frames(event) {
-                    yield Ok::<_, Infallible>(sse_event(frame));
-                }
-            }
-
-            // Channel closed → the run finished. A stage failure already surfaced as
-            // an `error` frame during draining; only a task panic needs a fallback.
-            if let Err(join) = run.await {
-                yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                    data: format!("agent task failed: {join}"),
-                }));
-            }
-
-            // ── post-stream side effects (parity with the runtime turn) ──
-            let duration_ms = started.elapsed().as_millis() as u64;
-            if let Some(error_code) = failure {
-                if let Err(e) = audit
-                    .write(&audit_ctx, AuditEvent::ResponseFailed { error_code, duration_ms })
-                    .await
-                {
-                    warn!(error = %e, "agent-stream: audit ResponseFailed failed");
-                }
-            } else if completed {
-                if let Err(e) = append_memory_turn_if_enabled(
-                    &memory_input,
-                    sessions.as_deref(),
-                    &normalized,
-                    &response,
-                )
-                .await
-                {
-                    warn!(error = %e, "agent-stream: memory append failed");
-                }
-                if let Err(e) = audit
-                    .write(
-                        &audit_ctx,
-                        AuditEvent::ResponseCompleted {
-                            response_hash: hash_identifier(&response),
-                            response_chars: response.chars().count(),
-                            duration_ms,
-                            status: "completed".to_string(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(error = %e, "agent-stream: audit ResponseCompleted failed");
-                }
-            }
-            // else: aborted (no Finished/Error) — mirror `stream_agent_response` (no extra audit).
-        };
-
-        Ok(Sse::new(sse_stream)
-            .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-            .into_response())
-    }
+/// Server-Sent Events front door for the **星星電力 (SS) investor platform**: the same four-stage
+/// chat pipeline as [`agent_stream`]'s insight path, over the six `ss_*` tools.
+///
+/// Identical in wire contract to `/agent/stream` — same [`AgentRequest`] body, same
+/// [`StreamFrame`] SSE frames, same bearer gate, same opt-in burst limiter — and it runs the same
+/// [`plan_stream_turn`] prelude, so prompt-length validation, the injection guardrail, session
+/// memory and the audit trail all apply unchanged. Two things differ:
+///
+/// - **No intent filtering.** The runtime's intent pack (`config/runtime/intents.toml`) describes
+///   the EV-charging domain, so every SS question resolves to `unknown` and the configured
+///   [`RuleAnswerPolicy`](crate::runtime::guardrails::answer_policy::RuleAnswerPolicy) would refuse
+///   it as `off_scope` before the pipeline ever ran. This route substitutes
+///   [`AlwaysAnswerPolicy`], which keeps the prompt-injection refusal but drops the scope gate.
+///   Intent still resolves and is still emitted as `intent.resolved` / audited — it just no longer
+///   decides anything here.
+/// - **No pipeline routing.** There is one SS pipeline today; a report counterpart is a later
+///   step, so [`wants_report_pipeline`] is deliberately not consulted.
+///
+/// Requires the runtime to be enabled (`RUNTIME_ENABLED`, default on); rolled back, returns `503`.
+pub async fn ss_chat_stream(
+    State(state): State<AppState>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, AppError> {
+    let Json(req) = req?;
+    let span = tracing::info_span!(
+        "ss-chat-stream",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
+    );
+    run_chat_stream(
+        state,
+        req,
+        "/ss-chat/stream",
+        // Intent filtering off: see the doc comment above.
+        Some(&AlwaysAnswerPolicy),
+        select_ss_chat_pipeline,
+    )
     .instrument(span)
     .await
+}
+
+/// How a streaming front door turns a resolved turn into a runnable pipeline.
+///
+/// Taken as a plain `fn` pointer rather than a closure so each route's choice is a named,
+/// separately-testable function ([`select_agent_pipeline`] / [`select_ss_chat_pipeline`]) instead
+/// of an anonymous body buried in the handler.
+type PipelineSelector = fn(
+    &AppState,
+    &NormalizedInput,
+    Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError>;
+
+/// `/agent/stream`'s selector: the report pipeline when a report was asked for (see
+/// [`wants_report_pipeline`]), else the insight pipeline.
+fn select_agent_pipeline(
+    state: &AppState,
+    normalized: &NormalizedInput,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError> {
+    let resolved = state.llm.resolved();
+    if wants_report_pipeline(normalized) {
+        let orch = build_report_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.report_analyst_system,
+            &state.prompts.report_composer_system,
+            &state.insight_grants.fetcher,
+            &resolved,
+            state.report_template.clone(),
+            Some(sink),
+        )
+        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+        Ok((orch, report_pipeline_id()))
+    } else {
+        let orch = build_insight_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.analyst_system,
+            &state.prompts.charter_system,
+            &state.insight_grants.fetcher,
+            &state.insight_grants.charter,
+            &resolved,
+            Some(sink),
+        )
+        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+        Ok((orch, agent_pipeline_id()))
+    }
+}
+
+/// `/ss-chat/stream`'s selector: always the SS chat pipeline.
+///
+/// `normalized` is unused on purpose — this route does no intent routing (the SS report pipeline
+/// is a later step). Keeping the shared [`PipelineSelector`] shape means adding one later is a
+/// change here, not in the streaming body.
+fn select_ss_chat_pipeline(
+    state: &AppState,
+    _normalized: &NormalizedInput,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError> {
+    let orch = build_ss_chat_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.prompts.ss_fetcher_system,
+        &state.prompts.ss_analyst_system,
+        &state.prompts.ss_charter_system,
+        &state.ss_chat_grants.fetcher,
+        &state.ss_chat_grants.charter,
+        &state.llm.resolved(),
+        Some(sink),
+    )
+    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+    Ok((orch, ss_chat_pipeline_id()))
+}
+
+/// The streaming body shared by every SSE chat front door ([`agent_stream`], [`ss_chat_stream`]).
+///
+/// Runs the runtime prelude, acts on the resulting [`StreamPlan`], drives `select_pipeline`'s
+/// orchestrator on a [`ChannelSink`], maps its events into [`StreamFrame`]s, and replicates the
+/// runtime turn's two post-stream side effects (audit + session-memory append). A route
+/// contributes exactly three things:
+///
+/// - `route` — the audit `route` label, and the prefix on this handler's own warnings;
+/// - `answer_policy` — `None` uses the runtime's configured policy; `Some` overrides it (that is
+///   how `/ss-chat/stream` turns intent filtering off without touching the shared prelude);
+/// - `select_pipeline` — which pipeline the resolved turn runs.
+async fn run_chat_stream(
+    state: AppState,
+    req: AgentRequest,
+    route: &'static str,
+    answer_policy: Option<&(dyn AnswerPolicy + 'static)>,
+    select_pipeline: PipelineSelector,
+) -> Result<Response, AppError> {
+    let runtime = state
+        .runtime
+        .clone()
+        .filter(|rt| rt.enabled)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(format!(
+                "runtime disabled (RUNTIME_ENABLED=false); {route} requires the runtime"
+            ))
+        })?;
+
+    // ── runtime prelude: audit, guardrails, intent, answer policy, memory ──
+    // Reuses the runtime turn's synchronous prelude verbatim. The dummy port +
+    // no-op emit are never exercised by `plan_stream_turn`; this handler owns
+    // the streaming itself.
+    let request_id = uuid::Uuid::new_v4();
+    let audit_ctx = AuditCtx {
+        request_id: request_id.to_string(),
+        session_id: req.session_id.clone(),
+        route: route.into(),
+        actor: None,
+    };
+    let input = AgentTurnInput {
+        request_id,
+        prompt: req.prompt.clone(),
+        raw_input: req.prompt.clone(),
+        history: req.history.clone(),
+        session_id: req.session_id.clone(),
+        option_id: req.option_id.clone(),
+    };
+    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
+
+    let plan = {
+        let unused = UnusedAgentPort;
+        let emit_noop = |_event: TurnEvent| {};
+        let deps = AgentTurnDeps {
+            runtime_config: &runtime.config,
+            input_pipeline: &runtime.input_pipeline,
+            // The route's override, else the runtime's configured policy.
+            answer_policy: answer_policy.unwrap_or(runtime.answer_policy.as_ref()),
+            llm_normalizer: runtime.llm_normalizer.as_deref(),
+            sessions: runtime.sessions.as_deref(),
+            agent: &unused,
+            audit: &audit,
+            emit: &emit_noop,
+        };
+        plan_stream_turn(input, &audit_ctx, deps)
+            .await
+            .map_err(|e| AppError::ServiceUnavailable(format!("runtime prelude: {e}")))?
+    };
+
+    // ── act on the plan ──
+    let (started, prefix, agent_input, normalized) = match plan {
+        StreamPlan::Error { code, status } => {
+            // Pre-stream validation error; audit already recorded it.
+            return Err(status_to_app_error(status, code));
+        }
+        StreamPlan::Refused { copy, .. } => {
+            // Guardrail refusal: audit + memory already written. Stream the
+            // refusal copy as the whole answer, then close.
+            let sse = async_stream::stream! {
+                yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: copy }));
+                yield Ok::<_, Infallible>(sse_event(StreamFrame::Done));
+            };
+            return Ok(Sse::new(sse)
+                .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+                .into_response());
+        }
+        StreamPlan::Proceed {
+            started,
+            prefix,
+            agent_input,
+            normalized,
+        } => (started, prefix, agent_input, *normalized),
+    };
+
+    // ── build the route's pipeline (streaming) ──
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+    let (orchestrator, pipeline_id) = select_pipeline(&state, &normalized, sink.clone())?;
+
+    // The memory-augmented prompt/history drive the pipeline; the full
+    // agent_input (raw_input preserved) is kept for the post-stream memory append.
+    let memory_input = agent_input.clone();
+    let initial = AgentPayload::Initial(InitialPrompt {
+        prompt: agent_input.prompt,
+        history: agent_input
+            .history
+            .into_iter()
+            .map(|turn| Exchange {
+                user: turn.user_prompt,
+                assistant: turn.model_response,
+            })
+            .collect(),
+        now: SystemClock::default().now(),
+    });
+
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&pipeline_id, initial, &*sink)
+            .await
+    });
+
+    // State moved into the stream for the intent frame + post-stream side effects.
+    let intent = normalized.intent.clone();
+    let candidate_intents = normalized.candidate_intents.clone();
+    let sessions = runtime.sessions.clone();
+
+    let sse_stream = async_stream::stream! {
+        // `intent.resolved` first, mirroring the runtime turn's ordering.
+        yield Ok::<_, Infallible>(sse_event(StreamFrame::IntentResolved {
+            data: IntentResolvedData { intent, candidate_intents },
+        }));
+        // A disclaimer prefix, if the answer policy asked for one (transient — the
+        // pipeline's terminal `clear` supersedes it, exactly as the runtime turn does).
+        if !prefix.is_empty() {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: prefix }));
+        }
+
+        let mut response = String::new();
+        let mut failure: Option<String> = None;
+        let mut completed = false;
+
+        while let Some(event) = rx.recv().await {
+            match &event {
+                AgentEvent::ContentDelta { text } => response.push_str(text),
+                // The finalizer/renderer answer is the complete result; the
+                // terminal `clear` in `insight_frames` resets the client preview.
+                AgentEvent::Finished { assistant } => {
+                    response = assistant.clone();
+                    completed = true;
+                }
+                AgentEvent::Error { message } => failure = Some(message.clone()),
+                _ => {}
+            }
+            for frame in insight_frames(event) {
+                yield Ok::<_, Infallible>(sse_event(frame));
+            }
+        }
+
+        // Channel closed → the run finished. A stage failure already surfaced as
+        // an `error` frame during draining; only a task panic needs a fallback.
+        if let Err(join) = run.await {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
+                data: format!("agent task failed: {join}"),
+            }));
+        }
+
+        // ── post-stream side effects (parity with the runtime turn) ──
+        let duration_ms = started.elapsed().as_millis() as u64;
+        if let Some(error_code) = failure {
+            if let Err(e) = audit
+                .write(&audit_ctx, AuditEvent::ResponseFailed { error_code, duration_ms })
+                .await
+            {
+                warn!(error = %e, %route, "chat stream: audit ResponseFailed failed");
+            }
+        } else if completed {
+            if let Err(e) = append_memory_turn_if_enabled(
+                &memory_input,
+                sessions.as_deref(),
+                &normalized,
+                &response,
+            )
+            .await
+            {
+                warn!(error = %e, %route, "chat stream: memory append failed");
+            }
+            if let Err(e) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseCompleted {
+                        response_hash: hash_identifier(&response),
+                        response_chars: response.chars().count(),
+                        duration_ms,
+                        status: "completed".to_string(),
+                    },
+                )
+                .await
+            {
+                warn!(error = %e, %route, "chat stream: audit ResponseCompleted failed");
+            }
+        }
+        // else: aborted (no Finished/Error) — mirror `stream_agent_response` (no extra audit).
+    };
+
+    Ok(Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response())
 }
 
 /// Serialize a stream frame into an SSE event.

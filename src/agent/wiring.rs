@@ -69,7 +69,7 @@ use crate::agent::llm::{OpenAiLlm, StreamingOpenAiLlm};
 use crate::agent::payload::{ArtifactKey, LlmCapability, PayloadKind, Tool};
 use crate::agent::pipeline::{
     agent_pipeline_id, analyst_config, charter_config, fetcher_config, report_analyst_config,
-    report_composer_config, report_pipeline_id, Finalizer, Renderer,
+    report_composer_config, report_pipeline_id, ss_chat_pipeline_id, Finalizer, Renderer,
 };
 use crate::agent::tools::{emit_chart_tool, emit_report_tool, McpTool};
 use crate::mcp_client::McpHandle;
@@ -146,6 +146,88 @@ pub fn build_insight_pipeline(
     resolved: &ResolvedLlm,
     sink: Option<Arc<dyn EventSink>>,
 ) -> Result<Orchestrator> {
+    build_chat_pipeline(
+        agent_pipeline_id(),
+        mcp,
+        discovered,
+        mcp_instructions,
+        fetcher_instruction,
+        analyst_instruction,
+        charter_instruction,
+        fetcher_grant,
+        charter_grant,
+        resolved,
+        sink,
+    )
+}
+
+/// Builds the `/ss-chat` pipeline as a runnable [`Orchestrator`], registered under
+/// [`ss_chat_pipeline_id`].
+///
+/// The **same four-stage chat pipeline** as [`build_insight_pipeline`] — it shares the builder
+/// below, so the two cannot drift — over the 星星電力 investor-platform tools instead of the
+/// EV-charging ones. Everything that differs is an argument: the stage instructions
+/// (`ss_*_system` prompts) and the fetcher's grant (`[ss_chat.grants]`, the six `ss_*` tools).
+///
+/// # Arguments
+///
+/// As for [`build_insight_pipeline`], except `fetcher_grant` / `charter_grant` come from
+/// [`SsChatGrants`](crate::config::SsChatGrants) and the instructions from the `ss_*` prompt ids.
+///
+/// # Errors
+///
+/// As for [`build_insight_pipeline`]: a granted MCP tool absent from the server (normally already
+/// caught at boot by [`validate_ss_chat_grants`]), an LLM client that fails to build, or an
+/// unresolvable stage reference.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ss_chat_pipeline(
+    mcp: McpHandle,
+    discovered: &[ChatCompletionTool],
+    mcp_instructions: Option<&str>,
+    fetcher_instruction: &str,
+    analyst_instruction: &str,
+    charter_instruction: &str,
+    fetcher_grant: &[String],
+    charter_grant: &[String],
+    resolved: &ResolvedLlm,
+    sink: Option<Arc<dyn EventSink>>,
+) -> Result<Orchestrator> {
+    build_chat_pipeline(
+        ss_chat_pipeline_id(),
+        mcp,
+        discovered,
+        mcp_instructions,
+        fetcher_instruction,
+        analyst_instruction,
+        charter_instruction,
+        fetcher_grant,
+        charter_grant,
+        resolved,
+        sink,
+    )
+}
+
+/// The shared four-stage `fetcher → analyst → charter → finalizer` assembly behind both
+/// [`build_insight_pipeline`] and [`build_ss_chat_pipeline`].
+///
+/// The two front doors differ only in their `id`, their stage instructions, and the fetcher's tool
+/// grant — every structural decision (which stage gets the minimal-reasoning client, which stages
+/// are `Intermediate`, which is terminal) lives here once so a change to one pipeline's shape can
+/// never silently skip the other.
+#[allow(clippy::too_many_arguments)]
+fn build_chat_pipeline(
+    id: PipelineId,
+    mcp: McpHandle,
+    discovered: &[ChatCompletionTool],
+    mcp_instructions: Option<&str>,
+    fetcher_instruction: &str,
+    analyst_instruction: &str,
+    charter_instruction: &str,
+    fetcher_grant: &[String],
+    charter_grant: &[String],
+    resolved: &ResolvedLlm,
+    sink: Option<Arc<dyn EventSink>>,
+) -> Result<Orchestrator> {
     // ── resolve each stage's config grant into concrete tools ──
     let fetcher_tools = build_stage_tools("fetcher", fetcher_grant, &mcp, discovered)?;
     let charter_tools = build_stage_tools("charter", charter_grant, &mcp, discovered)?;
@@ -153,9 +235,9 @@ pub fn build_insight_pipeline(
     // ── two LLM clients (streaming or buffered per `sink`): the default for the reasoning stages,
     //    and a minimal-reasoning one for the mechanical `fetcher` (plan: cut the hidden reasoning
     //    budget that silently truncated tool-heavy stages) ──
-    let llm = build_stage_llm(resolved, &sink).context("build insight LLM")?;
+    let llm = build_stage_llm(resolved, &sink).context("build chat pipeline LLM")?;
     let llm_low = build_stage_llm(&resolved.with_reasoning_effort(MECHANICAL_REASONING), &sink)
-        .context("build minimal-reasoning insight LLM")?;
+        .context("build minimal-reasoning chat pipeline LLM")?;
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
     let mut fetcher_cfg = fetcher_config(fetcher_instruction);
@@ -192,7 +274,7 @@ pub fn build_insight_pipeline(
     .collect();
 
     let pipeline = PipelineConfig {
-        id: agent_pipeline_id(),
+        id,
         stages: vec![
             SubAgentId("fetcher".into()),
             SubAgentId("analyst".into()),
@@ -201,7 +283,7 @@ pub fn build_insight_pipeline(
         ],
     };
     let stages = resolve_pipeline(&pipeline, &agents)
-        .map_err(|e| anyhow!("resolve insight pipeline: {e}"))?;
+        .map_err(|e| anyhow!("resolve `{}` chat pipeline: {e}", pipeline.id.0))?;
 
     let mut orchestrator = Orchestrator::new();
     orchestrator.insert(pipeline.id, stages);
@@ -441,20 +523,51 @@ pub fn validate_insight_grants(
     fetcher_grant: &[String],
     charter_grant: &[String],
 ) -> Result<()> {
-    validate_grant("fetcher", fetcher_grant, discovered)?;
-    validate_grant("charter", charter_grant, discovered)?;
+    validate_pipeline_grants("insight", discovered, fetcher_grant, charter_grant)
+}
+
+/// Validates the `/ss-chat` tool grants against the discovered set — the same **fail-fast at boot**
+/// check as [`validate_insight_grants`], for the 星星電力 pipeline's `[ss_chat.grants]`.
+///
+/// # Errors
+///
+/// Returns `Err` naming the offending `(stage, tool)` when a granted name is neither the `"*"`
+/// wildcard, a built-in code-backed tool, nor a tool the server advertised — e.g. an `ss_*` tool
+/// this MCP server build does not offer.
+pub fn validate_ss_chat_grants(
+    discovered: &[ChatCompletionTool],
+    fetcher_grant: &[String],
+    charter_grant: &[String],
+) -> Result<()> {
+    validate_pipeline_grants("ss-chat", discovered, fetcher_grant, charter_grant)
+}
+
+/// Validates one chat pipeline's two stage grants, naming `pipeline` in any error.
+fn validate_pipeline_grants(
+    pipeline: &str,
+    discovered: &[ChatCompletionTool],
+    fetcher_grant: &[String],
+    charter_grant: &[String],
+) -> Result<()> {
+    validate_grant(pipeline, "fetcher", fetcher_grant, discovered)?;
+    validate_grant(pipeline, "charter", charter_grant, discovered)?;
     Ok(())
 }
 
 /// Checks every name in one stage's grant resolves to a real tool.
-fn validate_grant(stage: &str, grant: &[String], discovered: &[ChatCompletionTool]) -> Result<()> {
+fn validate_grant(
+    pipeline: &str,
+    stage: &str,
+    grant: &[String],
+    discovered: &[ChatCompletionTool],
+) -> Result<()> {
     for name in grant {
         let known = name == ALL_MCP_TOOLS
             || code_tool(name).is_some()
             || discovered.iter().any(|t| t.function.name == *name);
         if !known {
             bail!(
-                "insight `{stage}` grant names tool `{name}`, which the MCP server did not \
+                "{pipeline} `{stage}` grant names tool `{name}`, which the MCP server did not \
                  advertise and is not a built-in tool"
             );
         }
@@ -544,7 +657,7 @@ fn tool_schema(
         .iter()
         .find(|t| t.function.name == name)
         .ok_or_else(|| {
-            anyhow!("insight grant names MCP tool `{name}`, which the server did not advertise")
+            anyhow!("a grant names MCP tool `{name}`, which the server did not advertise")
         })?;
     let description = found.function.description.clone().unwrap_or_default();
     let parameters = found
@@ -595,12 +708,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_ss_chat_grants_names_the_pipeline_and_the_missing_ss_tool() {
+        // An `ss_*` tool this MCP server build does not advertise must abort boot with a message
+        // that names the pipeline, the stage and the tool — not fail on the first SS request.
+        let err = validate_ss_chat_grants(&[], &["ss_sunshine_hours".to_string()], &[])
+            .expect_err("an unadvertised ss_* tool must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ss-chat"),
+            "message should name the pipeline: {msg}"
+        );
+        assert!(
+            msg.contains("fetcher"),
+            "message should name the stage: {msg}"
+        );
+        assert!(
+            msg.contains("ss_sunshine_hours"),
+            "message should name the tool: {msg}"
+        );
+        // The charter's built-in sink resolves without the server advertising anything.
+        assert!(validate_ss_chat_grants(&[], &[], &["emit_chart".to_string()]).is_ok());
+    }
+
+    #[test]
     fn validate_grant_accepts_wildcard_and_code_tools_but_rejects_unknown_mcp_names() {
         // No discovered tools, yet these resolve without touching the server.
-        assert!(validate_grant("fetcher", &["*".to_string()], &[]).is_ok());
-        assert!(validate_grant("charter", &["emit_chart".to_string()], &[]).is_ok());
+        assert!(validate_grant("insight", "fetcher", &["*".to_string()], &[]).is_ok());
+        assert!(validate_grant("insight", "charter", &["emit_chart".to_string()], &[]).is_ok());
         // A concrete MCP name the server never advertised fails, naming the stage and tool.
-        let err = validate_grant("fetcher", &["ghost_tool".to_string()], &[])
+        let err = validate_grant("insight", "fetcher", &["ghost_tool".to_string()], &[])
             .expect_err("unknown MCP tool must fail validation");
         let msg = err.to_string();
         assert!(msg.contains("fetcher"));

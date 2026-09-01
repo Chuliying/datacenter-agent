@@ -128,6 +128,9 @@ struct Manifest {
     /// Optional `/insight` pipeline tool grants (defaults applied when absent).
     #[serde(default)]
     insight: Option<InsightManifest>,
+    /// Optional `/ss-chat` pipeline tool grants (defaults applied when absent).
+    #[serde(default)]
+    ss_chat: Option<SsChatManifest>,
     /// Optional `/report` pipeline assets (the HTML template; default path applied when absent).
     #[serde(default)]
     report: Option<ReportManifest>,
@@ -220,6 +223,50 @@ fn default_charter_grant() -> Vec<String> {
 fn default_insight_grants() -> InsightGrantsManifest {
     InsightGrantsManifest {
         fetcher: default_fetcher_grant(),
+        charter: default_charter_grant(),
+    }
+}
+
+/// Optional `[ss_chat]` section: per-sub-agent tool grants for the `/ss-chat` pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsChatManifest {
+    #[serde(default = "default_ss_chat_grants")]
+    grants: SsChatGrantsManifest,
+}
+
+/// `[ss_chat.grants]`: the tools each `/ss-chat` sub-agent exposes to its LLM, by wire name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsChatGrantsManifest {
+    #[serde(default = "default_ss_fetcher_grant")]
+    fetcher: Vec<String>,
+    #[serde(default = "default_charter_grant")]
+    charter: Vec<String>,
+}
+
+/// The six `ss_*` investor-platform tools, the SS fetcher's default grant.
+///
+/// Unlike the `/insight` fetcher this is an **explicit list, never `["*"]`**: the same MCP server
+/// advertises the EV-charging tools too, and a wildcard would hand the SS fetcher tools its prompt
+/// never describes. A new `ss_*` tool is therefore a one-line config edit, by design.
+const SS_FETCHER_TOOLS: [&str; 6] = [
+    "ss_sunshine_hours",
+    "ss_energy_storage",
+    "ss_power_wheeling",
+    "ss_power_pipeline",
+    "ss_btm_projects",
+    "ss_ftm_projects",
+];
+
+/// The SS fetcher's default grant: the six `ss_*` tools ([`SS_FETCHER_TOOLS`]).
+fn default_ss_fetcher_grant() -> Vec<String> {
+    SS_FETCHER_TOOLS.iter().map(|t| (*t).to_string()).collect()
+}
+
+fn default_ss_chat_grants() -> SsChatGrantsManifest {
+    SsChatGrantsManifest {
+        fetcher: default_ss_fetcher_grant(),
         charter: default_charter_grant(),
     }
 }
@@ -346,6 +393,8 @@ pub struct AppConfig {
     pub runtime: Option<RuntimeRefs>,
     /// Resolved `/insight` pipeline tool grants (defaults when `[insight]` is absent).
     pub insight_grants: InsightGrants,
+    /// Resolved `/ss-chat` pipeline tool grants (defaults when `[ss_chat]` is absent).
+    pub ss_chat_grants: SsChatGrants,
     /// The `/report` HTML template body, read at load from `[report].template` (or its default
     /// path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
     pub report_template: String,
@@ -370,6 +419,29 @@ impl Default for InsightGrants {
     fn default() -> Self {
         Self {
             fetcher: default_fetcher_grant(),
+            charter: default_charter_grant(),
+        }
+    }
+}
+
+/// Resolved `/ss-chat` pipeline tool grants — which tools each 星星電力 sub-agent exposes to its
+/// LLM.
+///
+/// Resolved and boot-validated exactly like [`InsightGrants`]; only the defaults differ. The
+/// fetcher's default is the six `ss_*` investor-platform tools ([`SS_FETCHER_TOOLS`]) rather than
+/// the `["*"]` wildcard, because the same MCP server also advertises the EV-charging tools.
+#[derive(Debug, Clone)]
+pub struct SsChatGrants {
+    /// The SS fetcher's granted data tools (MCP wire names; normally the six `ss_*` tools).
+    pub fetcher: Vec<String>,
+    /// The SS charter's granted tools (normally the built-in `emit_chart` sink).
+    pub charter: Vec<String>,
+}
+
+impl Default for SsChatGrants {
+    fn default() -> Self {
+        Self {
+            fetcher: default_ss_fetcher_grant(),
             charter: default_charter_grant(),
         }
     }
@@ -498,6 +570,14 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        let ss_chat_grants = manifest
+            .ss_chat
+            .map(|ss_chat| SsChatGrants {
+                fetcher: ss_chat.grants.fetcher,
+                charter: ss_chat.grants.charter,
+            })
+            .unwrap_or_default();
+
         let report_template = load_report_template(&root, manifest.report.as_ref())?;
 
         let rate_limit = manifest
@@ -517,6 +597,7 @@ impl AppConfig {
             prompts,
             runtime,
             insight_grants,
+            ss_chat_grants,
             report_template,
             rate_limit,
         })
@@ -613,5 +694,59 @@ mod tests {
         // MCP tool, so a minimal config keeps working.
         assert_eq!(InsightGrants::default().fetcher, ["*"]);
         assert_eq!(InsightGrants::default().charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn config_loads_ss_chat_grants() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        assert_eq!(cfg.ss_chat_grants.fetcher, SS_FETCHER_TOOLS);
+        assert_eq!(cfg.ss_chat_grants.charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn ss_chat_fetcher_grant_never_uses_the_wildcard() {
+        // The invariant that keeps the two chat pipelines apart: one MCP server advertises BOTH
+        // the EV-charging tools and the `ss_*` ones, so a `"*"` here would hand the SS fetcher
+        // datacenter tools its prompt never describes — and the SS analyst would then be asked to
+        // reason over EV-charging rows under 星星電力 branding. Checked on the shipped config and
+        // on the in-code default, since either could reintroduce it.
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        for (source, grant) in [
+            ("config/config.toml", &cfg.ss_chat_grants.fetcher),
+            ("SsChatGrants::default()", &SsChatGrants::default().fetcher),
+        ] {
+            assert!(
+                !grant.iter().any(|name| name == "*"),
+                "{source} grants the SS fetcher the `*` wildcard, which would expose the \
+                 EV-charging tools to the 星星電力 pipeline"
+            );
+            assert!(
+                grant.iter().all(|name| name.starts_with("ss_")),
+                "{source} grants the SS fetcher a non-`ss_` tool: {grant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_chat_grants_default_to_the_six_ss_tools_when_section_absent() {
+        assert_eq!(SsChatGrants::default().fetcher, SS_FETCHER_TOOLS);
+        assert_eq!(SsChatGrants::default().charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn config_loads_the_ss_stage_prompts() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        // Every id `PromptBank::from_app_config` requires for the /ss-chat pipeline must resolve,
+        // or boot fails — pin them here so a renamed file is caught without booting.
+        for id in [
+            "ss_fetcher_system",
+            "ss_analyst_system",
+            "ss_charter_system",
+        ] {
+            let body = cfg
+                .get_prompt_by_id(id)
+                .unwrap_or_else(|e| panic!("prompt `{id}` should load: {e}"));
+            assert!(!body.trim().is_empty(), "prompt `{id}` is empty");
+        }
     }
 }

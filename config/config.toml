@@ -33,6 +33,9 @@ version = 1
 #   * charter_system            — /insight pipeline: the chart selector (0–2 charts).
 #   * report_analyst_system     — /report pipeline: the insight-narrative analyst.
 #   * report_composer_system    — /report pipeline: the emit_report composer.
+#   * ss_fetcher_system         — /ss-chat pipeline: the 星星電力 data-fetch stage.
+#   * ss_analyst_system         — /ss-chat pipeline: the 星星電力 management analyst.
+#   * ss_charter_system         — /ss-chat pipeline: the 星星電力 chart selector (0–2 charts).
 #
 # All prompts are loaded dynamically at boot, so retuning a stage prompt is a config edit
 # (no recompile) — edit the Markdown file, or point an id at a different file below.
@@ -65,6 +68,16 @@ file = "prompt_guide/report_analyst_system.md"
 [prompts.report_composer_system]
 file = "prompt_guide/report_composer_system.md"
 
+# ── /ss-chat pipeline stage prompts (星星電力 investor platform) ──
+[prompts.ss_fetcher_system]
+file = "prompt_guide/ss_fetcher_system.md"
+
+[prompts.ss_analyst_system]
+file = "prompt_guide/ss_analyst_system.md"
+
+[prompts.ss_charter_system]
+file = "prompt_guide/ss_charter_system.md"
+
 
 # ──── Insight pipeline tool grants ───
 # Which tools each /insight sub-agent exposes to its LLM, by wire name.
@@ -90,6 +103,31 @@ fetcher = [
     "member_analysis",
     "business_metrics",
     "station_revenue_ranking",
+]
+charter = ["emit_chart"]
+
+
+# ──── SS chat pipeline tool grants ───
+# `/ss-chat/stream` runs the same four-stage chat pipeline as `/agent/stream`'s insight
+# pipeline (fetcher → analyst → charter → finalizer), but over the 星星電力 investor-platform
+# tools instead of the EV-charging ones, and with its own stage prompts (`ss_*_system`).
+#
+# The grant is deliberately an EXPLICIT list, not `"*"`: the MCP server advertises both the
+# EV-charging tools and the `ss_*` ones, so a wildcard here would hand the SS fetcher the
+# datacenter tools its prompt says nothing about. Names resolve exactly as `[insight.grants]`
+# does (boot-validated against the server's advertised set; `emit_chart` is the built-in sink).
+#
+# Omitting this whole section defaults `fetcher` to the six `ss_*` tools below and `charter`
+# to ["emit_chart"].
+
+[ss_chat.grants]
+fetcher = [
+    "ss_sunshine_hours",
+    "ss_energy_storage",
+    "ss_power_wheeling",
+    "ss_power_pipeline",
+    "ss_btm_projects",
+    "ss_ftm_projects",
 ]
 charter = ["emit_chart"]
 

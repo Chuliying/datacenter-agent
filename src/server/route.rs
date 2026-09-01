@@ -120,13 +120,21 @@ pub fn build_router(state: AppState) -> Router {
     // bypassed the runtime prelude (no guardrails, no audit). Callers use `/agent/stream`
     // (streaming) or `/v1/chat/completions` (non-streaming).
     //
-    // `/agent/stream` sits on its own nested router so the opt-in limiter can wrap it without
-    // touching `/health`, `/ready`, or `/greeting` (AC-009). Auth is layered after (= outside)
-    // the limiter, so a bad token is rejected before any admission capacity is consumed (AC-014).
-    let mut agent_stream = Router::new().route("/agent/stream", post(handler::agent_stream));
+    // The streaming prompt routes sit on their own nested router so the opt-in limiter can wrap
+    // them without touching `/health`, `/ready`, or `/greeting` (AC-009). Auth is layered after
+    // (= outside) the limiter, so a bad token is rejected before any admission capacity is
+    // consumed (AC-014).
+    //
+    // `/ss-chat/stream` is the 星星電力 (SS) investor-platform front door: the same four-stage chat
+    // pipeline over the `ss_*` tools, with intent filtering off (see `handler::ss_chat_stream`).
+    // It shares the limiter with `/agent/stream` — both drive the same LLM/MCP cost — so the two
+    // sit on one nested router.
+    let mut streaming = Router::new()
+        .route("/agent/stream", post(handler::agent_stream))
+        .route("/ss-chat/stream", post(handler::ss_chat_stream));
     if let Some(limiter) = &limiter {
         let limiter = limiter.clone();
-        agent_stream = agent_stream.layer(middleware::from_fn(move |req, next| {
+        streaming = streaming.layer(middleware::from_fn(move |req, next| {
             let limiter = limiter.clone();
             async move { rate_limit::enforce(limiter, ErrorFamily::Standard, req, next).await }
         }));
@@ -135,7 +143,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(handler::health))
         .route("/ready", get(handler::ready))
         .route("/greeting", get(handler::greeting))
-        .merge(agent_stream)
+        .merge(streaming)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,
@@ -354,6 +362,7 @@ mod tests {
             ("GET", "/ready"),
             ("GET", "/greeting"),
             ("POST", "/agent/stream"),
+            ("POST", "/ss-chat/stream"),
             ("POST", "/v1/chat/completions"),
         ] {
             let response = app

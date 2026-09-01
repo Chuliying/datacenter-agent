@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`POST /ss-chat/stream`** — a streaming front door for the 星星電力 (SS) investor platform. It
+  runs the same four-stage chat pipeline as `/agent/stream`'s insight path
+  (`fetcher → analyst → charter → finalizer`) over the six `ss_*` MCP tools, with its own stage
+  prompts (`ss_fetcher_system` / `ss_analyst_system` / `ss_charter_system`) and its own tool grant
+  (`[ss_chat.grants]`). Same `AgentRequest` body, same SSE frame contract, same bearer gate and
+  burst limiter as `/agent/stream`. The SS report pipeline is a later step.
+  - **No intent filtering.** The runtime intent pack is the EV-charging one, so SS questions
+    resolve to `unknown` and the configured `RuleAnswerPolicy` would refuse them as `off_scope`
+    before the pipeline ran. This route substitutes the new `AlwaysAnswerPolicy`, which keeps the
+    prompt-injection refusal but drops the scope gate. Intent still resolves, still emits
+    `intent.resolved`, and is still audited — it just no longer gates the answer. Prompt-length
+    validation, injection detection, session memory and audit are unchanged.
+  - The SS fetcher grant is an **explicit list, never `"*"`**: one MCP server advertises both the
+    EV-charging tools and the `ss_*` ones, so a wildcard would let the SS pipeline reach EV data
+    under 星星電力 branding. Pinned by a unit test over both the shipped config and the in-code
+    default, and by a tool assertion in the live test.
+- `tests/ss_chat_pipeline.rs` — live integration test driving the production
+  `build_ss_chat_pipeline` with the real config, over the seven manager-level questions from
+  `eomc-mcp/docs/ss_chatbot_agent_test.md`. `#[ignore]`d; selectable with `SS_CHAT_QUESTION`.
+
+### Changed
+
+- `build_insight_pipeline` and the new `build_ss_chat_pipeline` now share one private
+  `build_chat_pipeline` assembly, so a change to one chat pipeline's shape cannot silently skip the
+  other. `agent_stream` and `ss_chat_stream` likewise share one `run_chat_stream` streaming body;
+  each route supplies only its audit label, answer policy, and pipeline selector.
+
 ## [0.4.0] - 2026-08-19
 
 ### Fixed
