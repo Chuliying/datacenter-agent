@@ -47,7 +47,11 @@ Identity layer 只套在這條 `POST` 路由；缺失或格式錯誤的 Falcon h
 `error_code` 分為兩種：`auth.token_invalid` 回 `401 identity.token_refreshable`（消費端可花掉
 一次 silent-refresh 並重送一次），其餘任何 code、未知 code 或無 code 一律回
 `401 identity.token_terminal`（**不得**進 refresh 路徑）。timeout／連線失敗／5xx／畸形 `200` 回
-`503 identity.upstream_unavailable`。upstream 的 `error_code` 只作為 runtime 內部判定輸入，
+`503 identity.upstream_unavailable`。兩個**告警級**例外：`error_code` 為 `auth.invalid_platform`
+時對呼叫端仍回 `401 identity.token_terminal`，但 runtime 另發 `IdentityAlarm`（platform 允許
+名單金絲雀）；`400 auth.conflicting_credentials` 回 `500 identity.upstream_conflict` 並告警——
+runtime 只送 Bearer，這代表 runtime 端請求建構出錯，且該結果**不**寫入負向 cache。
+例行身份失敗記為一般 `IdentityRefused` 事件，不觸發告警。upstream 的 `error_code` 只作為 runtime 內部判定輸入，
 不會轉送給消費端——消費端一律依本服務自己的 `code` 分流，因此上游改名不影響此契約。非 `POST` 仍交給 method router，維持原本的 `405` 行為。
 
 ## Prelude 的三種結果

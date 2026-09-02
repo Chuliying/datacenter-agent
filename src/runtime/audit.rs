@@ -120,6 +120,15 @@ pub enum AuditEvent {
         omitted_topics: Vec<String>,
     },
     /// An identity failure that requires operational attention.
+    /// A routine identity failure (missing header, expired token, terminal token,
+    /// unavailable upstream). Ordinary evidence, not an alarm: paging on every 401 would
+    /// bury the two events that genuinely need eyes.
+    IdentityRefused {
+        /// Failure kind, e.g. `header_missing`, `token_refreshable`.
+        kind: String,
+    },
+    /// The two identity events that must page someone: `invalid_platform` (the browser-token
+    /// allowlist canary) and `upstream_conflict` (a runtime request-construction bug).
     IdentityAlarm {
         /// Stable alarm kind, without credentials or request content.
         kind: String,
@@ -379,7 +388,16 @@ impl AuditSink for TracingAuditSink {
                 omitted_topics = omitted_topics.len(),
                 "audit.permission_degraded"
             ),
-            AuditEvent::IdentityAlarm { kind } => info!(
+            AuditEvent::IdentityRefused { kind } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                actor_key,
+                kind = %kind,
+                "audit.identity_refused"
+            ),
+            AuditEvent::IdentityAlarm { kind } => tracing::error!(
                 request_id,
                 route,
                 seq,

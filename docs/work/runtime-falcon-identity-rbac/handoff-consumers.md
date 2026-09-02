@@ -44,6 +44,7 @@ namespace from the permissions endpoint's `auth.*`.
 | `identity.token_refreshable` | `401` | Spend at most one existing silent-refresh attempt, resend once, then stop and require login. |
 | `identity.token_terminal` | `401` | Terminal. **Do not refresh.** Require sign-in, or tell the user to contact an administrator — the account is deactivated, the token is revoked, or the user is unknown. |
 | `identity.upstream_unavailable` | `503` | Back off and retry according to the consumer's transient-failure policy. Do not treat as a token refresh signal. |
+| `identity.upstream_conflict` | `500` | A runtime-side bug, not your token. Report it; do not refresh, do not retry in a loop. |
 | `authz.insufficient` | `200` refusal (`x_refusal_code` for OpenAI; `refusal` SSE event) | Render the terminal refusal. Do not retry automatically. |
 | `rate_limit.global` | `429` + `Retry-After` | Wait for the advertised delay; avoid a tight retry loop. |
 | `rate_limit.actor` | `429` + `Retry-After` | Wait for the advertised delay for that actor. |

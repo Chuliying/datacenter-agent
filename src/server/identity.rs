@@ -49,7 +49,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         .and_then(parse_bearer)
         .map(str::to_owned)
     else {
-        audit_identity_failure(&state, req.uri().path().to_string(), "header_missing").await;
+        audit_identity_refused(&state, req.uri().path().to_string(), "header_missing").await;
         return identity_error(
             &req,
             StatusCode::UNAUTHORIZED,
@@ -61,7 +61,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
     let permissions = match state.permissions_provider.permissions(&token).await {
         Ok(permissions) => permissions,
         Err(PermissionsFailure::UnauthorizedRefreshable) => {
-            audit_identity_failure(&state, req.uri().path().to_string(), "token_refreshable").await;
+            audit_identity_refused(&state, req.uri().path().to_string(), "token_refreshable").await;
             return identity_error(
                 &req,
                 StatusCode::UNAUTHORIZED,
@@ -70,7 +70,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
             );
         }
         Err(PermissionsFailure::UnauthorizedTerminal) => {
-            audit_identity_failure(&state, req.uri().path().to_string(), "token_terminal").await;
+            audit_identity_refused(&state, req.uri().path().to_string(), "token_terminal").await;
             return identity_error(
                 &req,
                 StatusCode::UNAUTHORIZED,
@@ -78,8 +78,31 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
                 "Falcon access token cannot be used and refreshing will not help",
             );
         }
+        Err(PermissionsFailure::UnauthorizedPlatformCanary) => {
+            // Terminal for the caller, canary for us: the endpoint verifies the token's
+            // platform claim, and this design forwards browser-issued tokens on the strength
+            // of one ops confirmation. This code showing up means that allowlist changed.
+            audit_identity_alarm(&state, req.uri().path().to_string(), "invalid_platform").await;
+            return identity_error(
+                &req,
+                StatusCode::UNAUTHORIZED,
+                codes::IDENTITY_TOKEN_TERMINAL,
+                "Falcon access token cannot be used and refreshing will not help",
+            );
+        }
+        Err(PermissionsFailure::UpstreamConflict) => {
+            // We only ever send a Bearer header, so a conflicting-credentials report is a
+            // runtime request-construction bug — 500, alarmed, and never negative-cached.
+            audit_identity_alarm(&state, req.uri().path().to_string(), "upstream_conflict").await;
+            return identity_error(
+                &req,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                codes::IDENTITY_UPSTREAM_CONFLICT,
+                "identity verification failed on the runtime side",
+            );
+        }
         Err(PermissionsFailure::Unavailable) => {
-            audit_identity_failure(&state, req.uri().path().to_string(), "upstream_unavailable")
+            audit_identity_refused(&state, req.uri().path().to_string(), "upstream_unavailable")
                 .await;
             return identity_error(
                 &req,
@@ -96,7 +119,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
             // This is a boot-time invariant in production. Keep the request fail-closed if a
             // hand-built state violates it in a test or an embedding application.
             error!(error = %err, "identity: actor key derivation failed");
-            audit_identity_failure(
+            audit_identity_alarm(
                 &state,
                 req.uri().path().to_string(),
                 "actor_key_derivation_failed",
@@ -145,7 +168,15 @@ fn identity_error(req: &Request, status: StatusCode, code: &str, message: &str) 
     }
 }
 
-async fn audit_identity_failure(state: &AppState, route: String, kind: &str) {
+async fn audit_identity_refused(state: &AppState, route: String, kind: &str) {
+    audit_identity_event(state, route, kind, false).await;
+}
+
+async fn audit_identity_alarm(state: &AppState, route: String, kind: &str) {
+    audit_identity_event(state, route, kind, true).await;
+}
+
+async fn audit_identity_event(state: &AppState, route: String, kind: &str, alarm: bool) {
     let sink: std::sync::Arc<dyn AuditSink> = state
         .runtime
         .as_ref()
@@ -159,15 +190,16 @@ async fn audit_identity_failure(state: &AppState, route: String, kind: &str) {
         actor_key: None,
         actor: None,
     };
-    if let Err(err) = writer
-        .write(
-            &ctx,
-            AuditEvent::IdentityAlarm {
-                kind: kind.to_string(),
-            },
-        )
-        .await
-    {
+    let event = if alarm {
+        AuditEvent::IdentityAlarm {
+            kind: kind.to_string(),
+        }
+    } else {
+        AuditEvent::IdentityRefused {
+            kind: kind.to_string(),
+        }
+    };
+    if let Err(err) = writer.write(&ctx, event).await {
         error!(error = %err, "identity: alarm audit write failed");
     }
 }

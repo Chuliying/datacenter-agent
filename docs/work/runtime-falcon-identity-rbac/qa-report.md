@@ -178,3 +178,40 @@ Unverified scopes:
 - 依賴漏洞（未執行 audit，理由如上）。
 - 生產部署組態、secret manager 狀態、網路邊界（MCP server 是否對外暴露）。
 - 上述 auth review 是 AI 產出的 scoped attestation，**不是人工資安簽核**。
+
+---
+
+## 9. 本機整合測試（全本機拓樸，真實 binary + 真實 LLM）
+
+拓樸：`agent (127.0.0.1:18080) → datacenter-mcp (127.0.0.1:8088/mcp) → upstream stub (9099)`，
+身份來源為本機 Falcon permissions stub（8787，token 腳本化），LLM 為真實 OpenRouter。
+scratch config 將 `[ss_chat.grants].fetcher` 清空——見下方發現 F-INT-1。
+
+| 情境 | 結果 |
+|---|---|
+| S1 `/health`（帶 bearer） | 200 |
+| S2 無 service bearer | 418 + `auth.service_token_invalid` |
+| S3 有 bearer 無身份 header | 401 + `identity.header_missing` |
+| S4 垃圾 token | 401 + `identity.token_refreshable` |
+| S5 停用帳號（`auth.user_inactive`） | 401 + `identity.token_terminal` |
+| S6 財務使用者問會員 | 200 SSE + `refusal` frame `authz.insufficient`，未進 pipeline |
+| S7 財務使用者問營收 | 完整管線：49 frames、tool_call 僅 `bill_revenue` + `emit_chart`（未越權）、done |
+| S8b 同 session 帶關鍵字追問 | `used_turn_count=1`（S7 的 turn 成功重放） |
+| S9a SS 路由 × starcharger-only | `refusal` `authz.insufficient` |
+| S9b SS 路由 × startrade | 通過 gate，done |
+| S10 同 actor 連發 8 個 | `200×5 + 429×3`，429 帶 `rate_limit.actor` + `Retry-After: 1` + `no-store`；且桶跨兩條 prompt 路由共用（後續 `/v1` 立即吃到同一桶） |
+| S11 `/v1/chat/completions` | 完整非串流管線，真實 LLM 以 stub 資料算出正確答案（1,350,000 vs 1,200,000，+12.5%） |
+| S12–S14（修正後重測） | 例行 401 → `identity_refused`；`auth.invalid_platform` → 401 terminal + `IdentityAlarm`；`auth.conflicting_credentials` → 500 `identity.upstream_conflict` + alarm ×2（兩次都到 stub = 未寫負向 cache） |
+
+### 整合測試抓到並已修的三個問題
+
+| # | 發現 | 修法 |
+|---|---|---|
+| F-INT-1 | **binary 對不 advertise `ss_*` 的 MCP 直接 boot 失敗**。本機（與可能的現行生產）`datacenter-mcp` 只有六個 starcharger 工具，`validate_ss_chat_grants` 在 boot 就 abort——PR #13 的部署硬性耦合一個尚未確認存在於生產的 MCP 版本 | 未改碼（fail-fast 是刻意設計）；記為**部署前置條件**：生產 MCP 必須先升級到 advertise 全部六個 `ss_*` 工具，否則要先清空 `[ss_chat.grants].fetcher` 部署 |
+| F-INT-2 | **告警疲勞**：每種例行身份失敗（缺 header、過期、終端、上游不可用）都發 `IdentityAlarm`，金絲雀失效 | 拆成 `IdentityRefused`（例行，info）與 `IdentityAlarm`（error 級，只留 `invalid_platform`、`upstream_conflict`、`actor_key_derivation_failed`） |
+| F-INT-3 | **ERR-010 未實作**：`400 auth.conflicting_credentials` 被折進 `Unavailable` → 503 + 進負向 cache；`auth.invalid_platform` 金絲雀未區分 | `PermissionsFailure` 新增 `UpstreamConflict`（500 + `identity.upstream_conflict` + 告警 + **不**寫 cache）與 `UnauthorizedPlatformCanary`（對呼叫端 401 terminal + 告警）；附 wire 層測試 |
+
+### 觀察（未改，記錄）
+
+- off_scope 拒答的 turn 會以 `unknown` intent 存入 memory，之後永遠被重放過濾器丟棄（S8b 的 `dropped_turn_count=1`）。無害但佔 5 筆上限的名額，屬既有 runtime 行為。
+- 不帶 intent 關鍵字的追問（「那跟上上個月比呢」）在記憶注入**之前**就被 answer policy 以 off_scope 拒答——session memory 救不了 intent 分類。這是既有行為（/v1 過去的 fold-history 就是為此存在），與本刀無關，但 UX 上值得知道。

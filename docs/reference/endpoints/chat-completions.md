@@ -73,6 +73,7 @@ drain 出來的。answer policy 要求 disclaimer 時，disclaimer 會被 prepen
 | Falcon permissions 401，body `error_code` 為 `auth.token_invalid` | 401 | `invalid_request_error` / `identity.token_refreshable`（可花一次 refresh 並重送一次）|
 | Falcon permissions 401，其餘／未知／無 `error_code` | 401 | `invalid_request_error` / `identity.token_terminal`（**不得** refresh）|
 | Falcon timeout／連線失敗／5xx／畸形 200 | 503 | `server_error` / `identity.upstream_unavailable` |
+| Falcon 400 `auth.conflicting_credentials` | 500 | `server_error` / `identity.upstream_conflict`（runtime 端請求建構錯誤；告警且不寫負向 cache）|
 | `messages` 無 user message | 400 | `invalid_request_error` / `request.invalid` |
 | malformed JSON | 400 | `invalid_request_error` |
 | 缺少或錯誤 content-type | 415 | `invalid_request_error` |

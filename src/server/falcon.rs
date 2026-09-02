@@ -95,6 +95,15 @@ pub enum PermissionsFailure {
     /// A 401 that refreshing cannot resolve. Also the default for an unrecognised or
     /// absent `error_code`, because the codes are not covered by the integration guide.
     UnauthorizedTerminal,
+    /// A 401 carrying `auth.invalid_platform` — terminal for the caller, but also the
+    /// platform-allowlist **canary**: this design forwards browser-issued tokens on the
+    /// strength of one ops confirmation, so this code appearing in production means that
+    /// allowlist changed and must page someone, not blend into ordinary 401 noise.
+    UnauthorizedPlatformCanary,
+    /// A 400 carrying `auth.conflicting_credentials`. The runtime only ever sends a Bearer
+    /// header, so this is a runtime request-construction bug, never a property of the
+    /// token — it is answered 500, alarmed, and deliberately **not** negative-cached.
+    UpstreamConflict,
     /// The endpoint could not provide a usable permissions response.
     Unavailable,
 }
@@ -135,10 +144,10 @@ const REFRESHABLE_ERROR_CODE: &str = "auth.token_invalid";
 
 /// Classify a 401 from its `error_code`, defaulting to terminal.
 pub fn classify_unauthorized(error_code: Option<&str>) -> PermissionsFailure {
-    if error_code == Some(REFRESHABLE_ERROR_CODE) {
-        PermissionsFailure::UnauthorizedRefreshable
-    } else {
-        PermissionsFailure::UnauthorizedTerminal
+    match error_code {
+        Some(REFRESHABLE_ERROR_CODE) => PermissionsFailure::UnauthorizedRefreshable,
+        Some("auth.invalid_platform") => PermissionsFailure::UnauthorizedPlatformCanary,
+        _ => PermissionsFailure::UnauthorizedTerminal,
     }
 }
 
@@ -300,6 +309,19 @@ impl PermissionsProvider for FalconPermissionsClient {
                     .and_then(|body| error_code_of(&body));
                 Err(classify_unauthorized(code.as_deref()))
             }
+            Ok(response) if response.status() == StatusCode::BAD_REQUEST => {
+                // A 400 is only special when it names conflicting credentials.
+                let code = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| error_code_of(&body));
+                if code.as_deref() == Some("auth.conflicting_credentials") {
+                    Err(PermissionsFailure::UpstreamConflict)
+                } else {
+                    Err(PermissionsFailure::Unavailable)
+                }
+            }
             Ok(response) if response.status() != StatusCode::OK => {
                 Err(classify_status(response.status()))
             }
@@ -312,14 +334,20 @@ impl PermissionsProvider for FalconPermissionsClient {
             },
         };
 
-        let (value, ttl) = match &result {
-            Ok(permissions) => (CacheValue::Positive(permissions.clone()), self.positive_ttl),
-            Err(failure) => (CacheValue::Negative(*failure), self.negative_ttl),
+        let cache_entry = match &result {
+            Ok(permissions) => Some((CacheValue::Positive(permissions.clone()), self.positive_ttl)),
+            // A conflict is a runtime request-construction bug, not a property of this token:
+            // caching it would replay a stale bug verdict after the fix ships.
+            Err(PermissionsFailure::UpstreamConflict) => None,
+            Err(failure) => Some((CacheValue::Negative(*failure), self.negative_ttl)),
         };
-        self.cache
-            .lock()
-            .expect("cache lock poisoned")
-            .insert(key, value, Instant::now() + ttl);
+        if let Some((value, ttl)) = cache_entry {
+            self.cache.lock().expect("cache lock poisoned").insert(
+                key,
+                value,
+                Instant::now() + ttl,
+            );
+        }
         result
     }
 }
@@ -348,7 +376,6 @@ mod tests {
             "auth.token_revoked",
             "auth.user_not_found",
             "auth.user_inactive",
-            "auth.invalid_platform",
         ] {
             assert_eq!(
                 classify_unauthorized(Some(code)),
@@ -356,6 +383,13 @@ mod tests {
                 "`{code}` must not invite a refresh"
             );
         }
+
+        // `auth.invalid_platform` is terminal for the caller too, but classifies to its own
+        // variant so the middleware can raise the platform-allowlist canary alarm.
+        assert_eq!(
+            classify_unauthorized(Some("auth.invalid_platform")),
+            PermissionsFailure::UnauthorizedPlatformCanary
+        );
     }
 
     /// The `auth.*` codes are **not** documented in the integration guide (verified across
@@ -545,6 +579,36 @@ mod tests {
         assert_eq!(
             client.permissions("expired-token").await,
             Err(PermissionsFailure::UnauthorizedRefreshable)
+        );
+        server.join().expect("responder thread");
+    }
+
+    /// A 400 naming conflicting credentials is a runtime bug: surfaced as its own variant and
+    /// deliberately **not** negative-cached, so the very next request re-probes the upstream
+    /// instead of replaying a stale bug verdict for the cache window.
+    #[tokio::test]
+    async fn wire_400_conflict_is_not_cached_and_reprobes() {
+        let (base_url, server) = spawn_responder(
+            "400 Bad Request",
+            r#"{"detail":"憑證衝突","error_code":"auth.conflicting_credentials"}"#,
+            2,
+        );
+        let client = FalconPermissionsClient::new_with_client(
+            reqwest::Client::new(),
+            &base_url,
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            4,
+        );
+
+        assert_eq!(
+            client.permissions("same-token").await,
+            Err(PermissionsFailure::UpstreamConflict)
+        );
+        // Same token immediately again: the responder must be hit a second time.
+        assert_eq!(
+            client.permissions("same-token").await,
+            Err(PermissionsFailure::UpstreamConflict)
         );
         server.join().expect("responder thread");
     }
