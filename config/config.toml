@@ -93,14 +93,23 @@ file = "prompt_guide/ss_charter_system.md"
 # ["emit_chart"].
 
 [insight.grants]
-# The datacenter analytics tools the insight fetcher may call. The report fetcher
-# has its own six-tool ceiling below; see that section for the intentional difference.
+# The datacenter analytics tools the insight fetcher may call.
+#
+# This list is a *ceiling*, not a per-turn grant: every request narrows it by
+# `boot ∩ permission ∩ intent required` (see [authz] below). So the ceiling must cover
+# every tool any non-report intent requires, or that intent default-denies for every
+# user no matter what Falcon grants them — the strict rule is `omitted_tools.is_empty()`.
+# `bill_member_analysis` was historically excluded here because the pre-RBAC fetcher saw
+# the whole list at once; under per-turn narrowing that exclusion only produced a
+# permanent false deny for `member`, so the ceiling now matches [report.grants].fetcher.
+# `AuthzConfig::validate_intent_reachability` fails boot if this drifts again.
 fetcher = [
     "bill_revenue",
     "bill_charge",
     "member_analysis",
     "business_metrics",
     "station_revenue_ranking",
+    "bill_member_analysis",
 ]
 charter = ["emit_chart"]
 

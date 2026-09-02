@@ -219,6 +219,22 @@ impl PermissionCache {
     }
 }
 
+/// The HTTP client the identity path uses to reach Falcon.
+///
+/// Separate from `from_config` so a test can exercise the same transport policy the binary
+/// ships with, rather than a `reqwest::Client::new()` that happens to differ.
+pub fn build_http_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        // The end user's Falcon bearer goes to exactly one URL. reqwest's default policy would
+        // follow up to ten redirects, and a same-origin hop keeps the `Authorization` header —
+        // so anything in front of Falcon answering 302 could redirect a user's token onto a URL
+        // this runtime never intended to call. A 3xx therefore falls through to `classify_status`
+        // as an unavailable upstream.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// HTTP implementation of the permissions provider with positive and negative caching.
 pub struct FalconPermissionsClient {
     client: reqwest::Client,
@@ -230,9 +246,7 @@ pub struct FalconPermissionsClient {
 
 impl FalconPermissionsClient {
     pub fn from_config(config: &crate::config::ResolvedIdentityConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(config.request_timeout_ms.get()))
-            .build()?;
+        let client = build_http_client(Duration::from_millis(config.request_timeout_ms.get()))?;
         Ok(Self::new_with_client(
             client,
             &config.base_url,
@@ -261,6 +275,22 @@ impl FalconPermissionsClient {
     /// SHA-256 cache key. The clear-text token is never used as a key or value.
     pub fn cache_key(token: &str) -> String {
         format!("{:x}", Sha256::digest(token.as_bytes()))
+    }
+
+    /// Which cache entry, if any, a completed lookup earns — and for how long.
+    ///
+    /// A method rather than a free function taking two `Duration`s on purpose: the positive and
+    /// negative TTLs are the same type and mean opposite things, so an argument list is a place
+    /// where they can be silently transposed. Reading them off `self` removes that hazard and
+    /// leaves a seam that can be tested without a socket.
+    fn cache_plan(&self, result: &PermissionsResult) -> Option<(CacheValue, Duration)> {
+        match result {
+            Ok(permissions) => Some((CacheValue::Positive(permissions.clone()), self.positive_ttl)),
+            // A conflict is a runtime request-construction bug, not a property of this token:
+            // caching it would replay a stale bug verdict after the fix ships.
+            Err(PermissionsFailure::UpstreamConflict) => None,
+            Err(failure) => Some((CacheValue::Negative(*failure), self.negative_ttl)),
+        }
     }
 
     #[cfg(test)]
@@ -332,14 +362,7 @@ impl PermissionsProvider for FalconPermissionsClient {
             },
         };
 
-        let cache_entry = match &result {
-            Ok(permissions) => Some((CacheValue::Positive(permissions.clone()), self.positive_ttl)),
-            // A conflict is a runtime request-construction bug, not a property of this token:
-            // caching it would replay a stale bug verdict after the fix ships.
-            Err(PermissionsFailure::UpstreamConflict) => None,
-            Err(failure) => Some((CacheValue::Negative(*failure), self.negative_ttl)),
-        };
-        if let Some((value, ttl)) = cache_entry {
+        if let Some((value, ttl)) = self.cache_plan(&result) {
             self.cache.lock().expect("cache lock poisoned").insert(
                 key,
                 value,
@@ -352,6 +375,197 @@ impl PermissionsProvider for FalconPermissionsClient {
 
 #[cfg(test)]
 mod tests {
+
+    /// Spawns a listener that answers the first request with a same-origin redirect, then
+    /// reports whether anything followed it.
+    ///
+    /// The second accept is polled with a deadline rather than blocked on, so the passing case
+    /// (nothing follows) finishes instead of hanging the suite.
+    fn spawn_redirect_responder(
+        location: &'static str,
+    ) -> (String, Arc<Mutex<usize>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local listener");
+        let address = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let follows = Arc::new(Mutex::new(0_usize));
+        let counter = Arc::clone(&follows);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept first request");
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).expect("read first request");
+            let redirect = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(redirect.as_bytes())
+                .expect("write redirect");
+
+            listener
+                .set_nonblocking(true)
+                .expect("listener should go non-blocking");
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut followed, _)) => {
+                        *counter.lock().expect("follow counter") += 1;
+                        let mut request = [0_u8; 8192];
+                        let _ = followed.read(&mut request);
+                        let body = r#"{"user_id":1,"roles":[],"permissions":[]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = followed.write_all(response.as_bytes());
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+        });
+        (address, follows, handle)
+    }
+
+    /// The runtime must never carry the end user's Falcon token anywhere but the one endpoint
+    /// it was asked to call.
+    ///
+    /// reqwest's default policy follows up to 10 redirects and, crucially, *keeps* the
+    /// `Authorization` header when the hop stays on the same origin — so a 302 from anything
+    /// in front of Falcon would hand a user's bearer token to a URL nobody reviewed. The PRD
+    /// security section states outright that no such path exists; this pins it.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_and_the_user_token_goes_nowhere_else() {
+        let (base_url, follows, server) = spawn_redirect_responder("/api/auth/me/somewhere-else");
+        let client = FalconPermissionsClient::new_with_client(
+            build_http_client(Duration::from_secs(5)).expect("client should build"),
+            &base_url,
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            2,
+        );
+
+        assert_eq!(
+            client.permissions("user-token").await,
+            Err(PermissionsFailure::Unavailable),
+            "an unexpected 3xx is an unavailable upstream, not a hop to chase"
+        );
+        server.join().expect("redirect responder thread");
+        assert_eq!(
+            *follows.lock().expect("follow counter"),
+            0,
+            "the redirect must not be followed: the second hop would carry the user's bearer"
+        );
+    }
+
+    /// The TTL routing seam. Positive and negative TTLs are both `Duration` and mean opposite
+    /// things: 60 s of "this user may" versus 10 s of "Falcon said no / was down". Transposing
+    /// them either makes a revocation take 6x longer to bite or locks a valid user out for a
+    /// minute after one upstream blip, and no other test in this file would notice.
+    #[test]
+    fn cache_plan_routes_each_outcome_to_the_right_ttl() {
+        let client = FalconPermissionsClient::new_with_client(
+            reqwest::Client::new(),
+            "http://falcon.invalid",
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            4,
+        );
+        let granted = Permissions {
+            user_id: 7,
+            codes: ["hdrenewables/elecsvc/starcharger/finance".to_string()]
+                .into_iter()
+                .collect(),
+        };
+
+        let (value, ttl) = client
+            .cache_plan(&Ok(granted.clone()))
+            .expect("a successful lookup is cached");
+        assert!(matches!(value, CacheValue::Positive(p) if p == granted));
+        assert_eq!(
+            ttl,
+            Duration::from_secs(60),
+            "success uses the positive TTL"
+        );
+
+        for failure in [
+            PermissionsFailure::UnauthorizedRefreshable,
+            PermissionsFailure::UnauthorizedTerminal,
+            PermissionsFailure::UnauthorizedPlatformCanary,
+            PermissionsFailure::Unavailable,
+        ] {
+            let (value, ttl) = client
+                .cache_plan(&Err(failure))
+                .unwrap_or_else(|| panic!("{failure:?} is negative-cached"));
+            assert!(matches!(value, CacheValue::Negative(f) if f == failure));
+            assert_eq!(
+                ttl,
+                Duration::from_secs(10),
+                "{failure:?} must use the negative TTL"
+            );
+        }
+
+        assert!(
+            client
+                .cache_plan(&Err(PermissionsFailure::UpstreamConflict))
+                .is_none(),
+            "a request-construction bug is never cached"
+        );
+    }
+
+    /// The expiry branch of `PermissionCache::get`. Every other cache test finishes well inside
+    /// a 10 s TTL, so this branch never ran: the positive TTL is the upper bound on how long a
+    /// revoked permission keeps working, and nothing was pinning it.
+    #[test]
+    fn cache_entries_stop_being_served_once_their_ttl_passes() {
+        let mut cache = PermissionCache::new(4);
+        let now = Instant::now();
+        let granted = Permissions {
+            user_id: 7,
+            codes: std::collections::HashSet::new(),
+        };
+        cache.insert(
+            "positive".to_string(),
+            CacheValue::Positive(granted),
+            now + Duration::from_secs(60),
+        );
+        cache.insert(
+            "negative".to_string(),
+            CacheValue::Negative(PermissionsFailure::Unavailable),
+            now + Duration::from_secs(10),
+        );
+
+        assert!(cache
+            .get("positive", now + Duration::from_secs(59))
+            .is_some());
+        assert!(cache
+            .get("negative", now + Duration::from_secs(9))
+            .is_some());
+
+        // The negative entry lapses first: Falcon gets re-probed while the granted user is
+        // still being served from cache.
+        assert!(cache
+            .get("negative", now + Duration::from_secs(11))
+            .is_none());
+        assert!(cache
+            .get("positive", now + Duration::from_secs(11))
+            .is_some());
+
+        // An expired entry is evicted, not merely hidden, so a stale key cannot occupy
+        // capacity forever.
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache
+            .get("positive", now + Duration::from_secs(61))
+            .is_none());
+        assert!(cache.entries.is_empty());
+        assert!(
+            cache.lru.is_empty(),
+            "eviction must clear the LRU shadow too"
+        );
+    }
 
     /// Live evidence (2026-08-31, `https://dev.hdre-eomc.com/api/auth/me/permissions`,
     /// credential-free probes): the endpoint returns `401` with a body carrying an

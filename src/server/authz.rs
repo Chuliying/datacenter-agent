@@ -167,6 +167,19 @@ mod tests {
             .expect("shipped config declares authz")
     }
 
+    /// The real `[insight.grants].fetcher` ceiling, not `["*"]`.
+    ///
+    /// Every other test in this module passes a wildcard boot grant, which makes the boot
+    /// leg of the three-way intersection a no-op. A ceiling that fails to cover an intent's
+    /// required tools is therefore invisible to them; this helper exists so at least one
+    /// test spends the shipped ceiling.
+    fn shipped_insight_fetcher_grant() -> Vec<String> {
+        crate::config::AppConfig::load("config/config.toml")
+            .expect("shipped config should load")
+            .insight_grants
+            .fetcher
+    }
+
     fn advertised() -> Vec<String> {
         [
             "bill_revenue",
@@ -394,5 +407,38 @@ mod tests {
 
         assert!(!decision.allowed);
         assert!(decision.effective_data_grant.is_empty());
+    }
+    #[test]
+    /// S-RUNTIME-SEC-02 AC-007 / FR-004, under the shipped boot ceiling.
+    ///
+    /// PRD 表列 `member` -> {member_analysis, bill_member_analysis}，權限碼 bizdev 同樣解到
+    /// 兩個。非 report 路徑是嚴格規則（`omitted_tools` 必須為空），所以只要
+    /// `[insight.grants].fetcher` 少一個，持有正確權限的 bizdev 使用者就會被永久拒絕。
+    fn member_intent_is_allowed_for_bizdev_under_the_shipped_insight_ceiling() {
+        let decision = authorize_pipeline(
+            &config(),
+            &shipped_insight_fetcher_grant(),
+            &permissions(BIZDEV),
+            "member",
+            false,
+            &advertised(),
+            &["emit_chart".into()],
+            &["emit_report".into()],
+        );
+
+        assert!(
+            decision.omitted_tools.is_empty(),
+            "the shipped insight ceiling must cover every tool the `member` intent requires, \
+             otherwise a correctly-permissioned bizdev user is denied forever; omitted: {:?}",
+            decision.omitted_tools
+        );
+        assert!(decision.allowed);
+        assert_eq!(
+            decision.effective_data_grant,
+            vec![
+                "member_analysis".to_string(),
+                "bill_member_analysis".to_string()
+            ]
+        );
     }
 }

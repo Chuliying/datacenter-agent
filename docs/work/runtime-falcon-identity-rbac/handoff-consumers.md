@@ -26,10 +26,10 @@ namespace from the permissions endpoint's `auth.*`.
 | ID | Consumer location / concern | Required change | Verification |
 |---|---|---|---|
 | C1 | falcon-client API wrapper | Preserve the delegated access token and attach it as `X-Falcon-Authorization` when calling either prompt route. | Network inspection in a local/mock environment; never log the value. |
-| C2 | stream route / request builder | Forward the header on `/agent/stream`; do not substitute the service `Authorization` token. | Request fixture contains both distinct headers. |
+| C2 | stream route / request builder | Forward the header on `/agent/stream`; do not substitute the service `Authorization` token. **Where the consumer already knows the caller is signed in but holds no token to forward** (a browser BFF whose `access_token` cookie has expired), answer locally with the consumer's own refreshable signal instead of forwarding a header-less request — the runtime cannot tell that case apart from a request-construction bug. | Request fixture contains both distinct headers; a signed-in request with no token never reaches the runtime. |
 | C3 | `agentErrorInfo` or equivalent error parser | Read the runtime `code` field before choosing a retry or display path. | Fixture tests for every row in the matrix below. |
 | C4 | token refresh handler | **Only `identity.token_refreshable`** may spend the existing silent-refresh budget, and it may retry the original request once. `identity.token_terminal` must **never** enter the refresh path — refreshing returns a token for the same deactivated, revoked, or unknown account, which is how an infinite refresh loop is built. | Second `401` after a refresh is terminal and asks for sign-in; a `identity.token_terminal` response triggers zero refresh attempts. |
-| C5 | React/native SSE consumer | Parse `error.code` and `refusal.code`; handle `refusal` as a terminal policy answer, not transport failure. After `clear`, retain the following full `token` as authoritative. | SSE fixture covers refusal, report degradation, and final `done`. |
+| C5 | React/native SSE consumer | Parse `error.code` and `refusal.code`; handle `refusal` as a terminal policy answer, not transport failure. After `clear`, retain the following full `token` as authoritative. **Note the two error-frame shapes**: frames the runtime emits mid-stream carry the machine code in `code`, while a BFF that fails *before* opening the upstream stream may only have `data` to put it in (falcon-client emits `{ event: 'error', data: 'AGENT_IDENTITY_*' }`). Read both, or normalize in the BFF. | SSE fixture covers refusal, report degradation, final `done`, and both error-frame shapes. |
 | C6 | agentgateway `/v1/chat/completions` caller | Send both headers and preserve the OpenAI nested error `code`. | 401/503 mock responses route to the intended client state. |
 | C7 | generated schemas / DTOs | Add optional `code` to standard and OpenAI error types; add the native SSE `refusal` event. | Backward-compatible deserialization of old payloads remains green. |
 | C8 | telemetry / redaction | Keep Falcon access tokens out of logs, traces, audit, cache keys, and error bodies. Actor keys are opaque and may be used for correlation. | Secret scan plus a redaction assertion in consumer telemetry tests. |
@@ -40,7 +40,7 @@ namespace from the permissions endpoint's `auth.*`.
 | Runtime code | Status / shape | Consumer action |
 |---|---|---|
 | `auth.service_token_invalid` | Standard `418`; `/v1` `401` | Fix the service credential. Do not refresh the user token. |
-| `identity.header_missing` | `401` | Fix request construction. Do not refresh. |
+| `identity.header_missing` | `401` | Fix request construction. Do not refresh. **This code means the header never left the consumer** — so a browser consumer must not let an expired session reach the runtime as a missing header (see the note below), or an ordinary session expiry arrives here wearing a request-bug's clothes. |
 | `identity.token_refreshable` | `401` | Spend at most one existing silent-refresh attempt, resend once, then stop and require login. |
 | `identity.token_terminal` | `401` | Terminal. **Do not refresh.** Require sign-in, or tell the user to contact an administrator — the account is deactivated, the token is revoked, or the user is unknown. |
 | `identity.upstream_unavailable` | `503` | Back off and retry according to the consumer's transient-failure policy. Do not treat as a token refresh signal. |
@@ -60,6 +60,16 @@ data from an older transcript.
 C1–C4 are implemented in falcon-client (`src/lib/chief-of-staff/agent-client.ts`,
 `stream-route.ts`), with unit tests for token forwarding, cookie extraction, the runtime-`code`
 capture, and the refreshable/terminal branch. Ships in a separate falcon-client PR.
+
+**Review follow-up (2026-09-02).** The stream route now answers `401 AGENT_IDENTITY_REFRESHABLE`
+itself when the guard resolved an authenticated actor but no `access_token` cookie is present,
+rather than forwarding a header-less request. Reason: the cookie carries `Max-Age=900` and the
+refresh cookie is scoped to `/api/auth/refresh`, so the ordinary 15-minute session expiry shows up
+at this route as "signed in, no token" — forwarding it returned `identity.header_missing`, whose
+contract says *do not refresh*, and the user was pushed to a full re-login for something one silent
+refresh fixes. Anonymous actors (no `COS_REQUIRE_AUTH`) still forward unchanged, which is what the
+staged rollout depends on. The route wiring itself (cookie → `falconToken`) now has a test; before
+this round the whole line could be deleted with the suite still green.
 
 **Deferred (FU): the refresh consumer itself (C4's runtime side).** `agentErrorInfo` now produces
 `AGENT_IDENTITY_REFRESHABLE` vs `AGENT_IDENTITY_TERMINAL`, but `useChiefOfStaffStream` still

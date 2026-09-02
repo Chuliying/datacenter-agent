@@ -382,6 +382,13 @@ impl AppState {
         )
         .context("validate /insight tool grants")?;
 
+        // The insight ceiling and the intent table are two independent lists that must agree:
+        // a strict intent requiring a tool the ceiling omits is a permanent, user-visible
+        // "權限不足" for everyone, not a narrowing. Catch that drift at boot.
+        authz
+            .validate_intent_reachability(&app_config.insight_grants.fetcher, &advertised)
+            .context("validate intent reachability under the insight grant")?;
+
         // The same fail-fast for the /ss-chat grants: a typo, or an `ss_*` tool this MCP server
         // build does not advertise, aborts startup rather than failing the first SS request.
         crate::agent::wiring::validate_ss_chat_grants(

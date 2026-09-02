@@ -277,6 +277,10 @@ mod tests {
     #[tokio::test]
     /// S-RUNTIME-SEC-02 AC-010, AC-011
     async fn identity_middleware_distinguishes_missing_unauthorized_and_unavailable() {
+        // Every `PermissionsFailure` variant, not just the two the first round covered. The
+        // refreshable/terminal split is the one consumers branch on — mapping refreshable to
+        // terminal would force a full re-login on every ordinary token expiry, and nothing
+        // outside this test would notice.
         let cases = [
             (
                 None,
@@ -289,6 +293,21 @@ mod tests {
                 codes::IDENTITY_TOKEN_TERMINAL,
             ),
             (
+                Some("Bearer expired-token"),
+                StatusCode::UNAUTHORIZED,
+                codes::IDENTITY_TOKEN_REFRESHABLE,
+            ),
+            (
+                Some("Bearer wrong-platform"),
+                StatusCode::UNAUTHORIZED,
+                codes::IDENTITY_TOKEN_TERMINAL,
+            ),
+            (
+                Some("Bearer conflicting-credentials"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                codes::IDENTITY_UPSTREAM_CONFLICT,
+            ),
+            (
                 Some("Bearer falcon-down"),
                 StatusCode::SERVICE_UNAVAILABLE,
                 codes::IDENTITY_UPSTREAM_UNAVAILABLE,
@@ -296,6 +315,9 @@ mod tests {
         ];
         let provider = crate::test_support::ScriptedPermissionsProvider::new([
             Err(PermissionsFailure::UnauthorizedTerminal),
+            Err(PermissionsFailure::UnauthorizedRefreshable),
+            Err(PermissionsFailure::UnauthorizedPlatformCanary),
+            Err(PermissionsFailure::UpstreamConflict),
             Err(PermissionsFailure::Unavailable),
         ]);
         let (state, _mcp) = crate::test_support::runtime_app_state(provider.clone()).await;
@@ -314,7 +336,11 @@ mod tests {
             let body = response_json(response).await;
             assert_eq!(body["code"], code);
         }
-        assert_eq!(provider.calls(), 2, "missing header must not call Falcon");
+        assert_eq!(
+            provider.calls(),
+            5,
+            "missing header must not call Falcon; every other case must"
+        );
     }
 
     /// AC-002 (the tracing half): the end user's Falcon token must not reach the log stream.

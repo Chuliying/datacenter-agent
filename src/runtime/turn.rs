@@ -1012,6 +1012,102 @@ mod tests {
         }
     }
 
+    /// A report stored under a *topic* intent must be re-checked as a report.
+    ///
+    /// The report selector fires when `report` is merely a candidate, so a mixed-topic report
+    /// gets stored with `intent = "revenue"` and `report_pipeline = true`. Its answer summary is
+    /// the whole cross-topic report. If replay keyed the strict rule off the top intent alone,
+    /// that turn would be re-authorized as a plain revenue question — so a user who has since
+    /// lost their member permission would still get the member half of the old report replayed
+    /// into the model's context. Nothing else in the suite builds a `report_pipeline: true` turn,
+    /// which leaves `turn.report_pipeline ||` in `memory_turn_is_allowed` free to be deleted.
+    #[test]
+    fn a_report_stored_under_a_topic_intent_is_replayed_only_with_full_report_permission() {
+        let cfg = runtime_config();
+        let app = AppConfig::load("config/config.toml").expect("app config should load");
+        let authz = app.authz.clone().expect("shipped authz config should load");
+        let report_grant = app
+            .report_grants
+            .clone()
+            .expect("shipped config declares [report.grants]")
+            .fetcher;
+        let insight_grant = app.insight_grants.fetcher.clone();
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy::new(&cfg.thresholds.confidence);
+        let agent = FakeAgentPort {
+            frames: vec![],
+            calls: Arc::new(Mutex::new(0)),
+            last_input: Arc::new(Mutex::new(None)),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink, AuditFailurePolicy::FailClosed);
+        let advertised: Vec<String> = [
+            "bill_revenue",
+            "station_revenue_ranking",
+            "bill_charge",
+            "business_metrics",
+            "member_analysis",
+            "bill_member_analysis",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        let deps = AgentTurnDeps {
+            runtime_config: &cfg,
+            input_pipeline: &pipeline,
+            answer_policy: &policy,
+            llm_normalizer: None,
+            sessions: None,
+            agent: &agent,
+            audit: &audit,
+            emit: &|_event| {},
+            authz: Some(&authz),
+            advertised_tools: &advertised,
+            insight_grant: &insight_grant,
+            ss_grant: &[],
+            ss_route: false,
+            report_grant: &report_grant,
+        };
+
+        // Stored while the user still held every topic; the answer is a full cross-topic report.
+        let report_turn = SessionMemoryTurn {
+            report_pipeline: true,
+            ..memory_turn(false, "revenue")
+        };
+
+        // Finance alone: enough for a revenue question, not enough for the report the turn
+        // actually holds. The strict report rule drops it.
+        let finance_only = identity(123, &["hdrenewables/elecsvc/starcharger/finance"]);
+        assert!(
+            !memory_turn_is_allowed(&report_turn, Some(&finance_only), &deps),
+            "a report turn must not replay for a user who lost the other topics"
+        );
+
+        // The same turn without the report tag is an ordinary revenue turn, and finance covers
+        // it. This is the contrast that makes the assertion above about the tag, not the intent.
+        let revenue_turn = memory_turn(false, "revenue");
+        assert!(
+            memory_turn_is_allowed(&revenue_turn, Some(&finance_only), &deps),
+            "an ordinary revenue turn still replays for a finance user"
+        );
+
+        // Still holding every topic: the report turn replays, so the rule is not simply
+        // "report turns never replay".
+        let full = identity(
+            123,
+            &[
+                "hdrenewables/elecsvc/starcharger/finance",
+                "hdrenewables/elecsvc/starcharger/opperf",
+                "hdrenewables/elecsvc/starcharger/bizdev",
+            ],
+        );
+        assert!(
+            memory_turn_is_allowed(&report_turn, Some(&full), &deps),
+            "a report turn replays while the user still holds every topic it covered"
+        );
+    }
+
     #[test]
     fn memory_replay_is_route_family_scoped_between_ev_and_ss() {
         // The guard `turn.ss_pipeline != deps.ss_route` is mutation-survivable without a test that

@@ -1,8 +1,8 @@
 # Falcon 使用者身份與 RBAC 接進 runtime 請求路徑 技術規格
 
 **Story ID**: S-RUNTIME-SEC-02
-**Spec 版本**: v1.5.0
-**對應 PRD**: `docs/work/runtime-falcon-identity-rbac/prd.md` @ v1.9.0
+**Spec 版本**: v1.6.0
+**對應 PRD**: `docs/work/runtime-falcon-identity-rbac/prd.md` @ v2.0.0
 **Stage**: approved
 
 ## Capability Snapshot
@@ -23,6 +23,7 @@
 | v1.2.0 | 2026-08-27 14:00 | 依第二輪獨立審查修正 12 項 | 缺漏聲明改注入終端答案（原本掛在被終端 `Clear` 抹掉的 transient prefix，SSE 側 AC-009 無法成立）；`authz.insufficient` 新增拒答載體（三種帶 code 的信封都不在 200 出現）；`auth.rs` 補進 Files 與 S5（ERR-001 的 code 產生點）；report turn 記憶過濾改為要求權限全涵蓋；新增 S11a 身份載體接線與 S19 本機開發拓樸；identity middleware 明訂非 POST 直通；S17 補多輪 eval 模式；S10 補腳本化 LLM stub | PRD v1.7.0 | Chuliying |
 | v1.3.1 | 2026-08-27 17:30 | 依 QA plan 審查修正測試落點 | S16 從外部 `tests/identity_contract.rs` 改為 crate 內 `#[cfg(test)]` 模組：`test_support` 是 `#[cfg(test)] pub(crate)`（`src/lib.rs:27-28`），外部 test crate 不可達，原落點會讓 30 條 L4 測試全部編不過 | PRD v1.8.0 | Chuliying |
 | v1.3.0 | 2026-08-27 15:00 | 依使用者範圍縮減決定移出兩項 | 移出非逐字 summary 邊界（S14 縮減、S17 刪除）與 `/v1` 的 `session_id` 傳輸與 memory 接線（S12 刪除）；保留 report 降級產出。21 步 37h → 19 步 32h | PRD v1.8.0 | Chuliying |
+| v1.6.0 | 2026-09-02 16:30 | 對齊 PRD v2.0.0 與交付後審查發現 | 補上實作已落地但 spec 漏記的部分：`PermissionsFailure` 為五個 variant、ERR-010（`identity.upstream_conflict`）回到 Errors 表（v1.4.0 的「移除 ERR-010」已被 v1.7.0 的 Falcon 維運回覆推翻）、S16 的 router 層測試實際落在 `route.rs` 的 `#[cfg(test)]` 而非新檔；新增 D-018（insight 上界必須涵蓋嚴格 intent，開機檢查）與 D-019（外呼不跟隨 redirect） | PRD v2.0.0 | Chuliying |
 | v1.5.0 | 2026-08-31 09:30 | 依 dev 環境實測修訂 401 分類契約 | 指南三個版本皆無七列 `auth.*` 表（已查證），但免憑證探測證實端點確實回 `error_code`；D-016 由 D-017 取代，改為白名單分類（僅 `auth.token_invalid` 可續期，未知與缺漏皆終端）；`identity.token_refreshable` / `identity.token_terminal` 拆為 `identity.token_refreshable` 與 `identity.token_terminal`；ERR-003 拆出 ERR-008 | PRD v1.9.0 | Chuliying |
 | v1.4.0 | 2026-08-28 09:00 | 依使用者指定的 Falcon 指南 commit 重訂外呼失敗契約 | 採用指南明載的 Bearer transport、`200` response shape 與 permissions `401`；移除未被該 endpoint 承諾的七列 `auth.*`、ERR-008、ERR-010 與 upstream code parsing；`roles` 改為物件 shape；S0 改為已完成的來源核對 | PRD v1.9.0 | Chuliying |
 
@@ -79,7 +80,7 @@
 | `docs/reference/endpoints/agent-stream.md` | MODIFY | 新 header、`code` 列舉、三種身份失敗語義 |
 | `docs/reference/endpoints/chat-completions.md` | MODIFY | 同上，另更新 History 折入章節：明載授權模式下只採最後一則 `user` message、為單輪、**無 `session_id`**（PRD FU-006）|
 | `docs/work/runtime-falcon-identity-rbac/handoff-consumers.md` | NEW | C1–C9（九項）、permissions `401` 與 runtime internal code 的處置矩陣、三階段部署順序 |
-| `src/server/identity_contract_tests.rs` | NEW | router 層整合測試，以 `#[cfg(test)]` 模組掛在 crate 內。**不可放 `tests/`**：`src/lib.rs:27-28` 是 `#[cfg(test)] pub(crate) mod test_support;`，外部 test crate 編譯 lib 時沒有 `cfg(test)`、只看得到 `pub` 項目，因此 `test_support` 與 `rate_limit.rs` 的 seam helper 從 `tests/` 完全不可達 |
+| `src/server/route.rs`（原規劃為 `src/server/identity_contract_tests.rs` NEW） | MODIFY | router 層整合測試，以 `#[cfg(test)]` 模組掛在 crate 內。**不可放 `tests/`**：`src/lib.rs:27-28` 是 `#[cfg(test)] pub(crate) mod test_support;`，外部 test crate 編譯 lib 時沒有 `cfg(test)`、只看得到 `pub` 項目，因此 `test_support` 與 `rate_limit.rs` 的 seam helper 從 `tests/` 完全不可達。實作時併入 `route.rs` 既有的 `#[cfg(test)]` 模組（`identity_layer_only_covers_prompt_routes…`、`ss_chat_route_requires_identity…`），不另開檔 |
 
 ## Contracts
 
@@ -126,7 +127,7 @@ ERR-007（pepper）與 ERR-009（limiter 未啟用）是啟動失敗，無 HTTP 
 | `Permissions` | `src/server/falcon.rs` NEW | `{ user_id: i64, codes: HashSet<String> }`；只收 `can_read == true` 的 effective permissions | `cargo check` |
 | `PermissionItem` | `src/server/falcon.rs` NEW | `{ code, name, category, page_path: Option<String>, can_read, can_write }` | `cargo check`；指定版指南 |
 | `IdentityContext` | `src/server/identity.rs` NEW | `{ actor_key: ActorKey, permissions: Permissions }`；經 request extensions 傳遞 | `cargo check` |
-| `PermissionsFailure` | `src/server/falcon.rs` NEW | enum 僅表達 `Unauthorized`（upstream 401）與 `Unavailable`（transport、5xx、畸形 200）；不攜帶未承諾的 upstream code | `cargo check` |
+| `PermissionsFailure` | `src/server/falcon.rs` NEW | 五個 variant：`UnauthorizedRefreshable`（401 `auth.token_invalid`）、`UnauthorizedTerminal`（其餘 401，含未知與缺漏）、`UnauthorizedPlatformCanary`（401 `auth.invalid_platform`：對呼叫端終端、對我們是告警）、`UpstreamConflict`（400 `auth.conflicting_credentials`，ERR-010）、`Unavailable`（transport、5xx、畸形 200）。不攜帶 upstream code 原文 | `cargo check` |
 | `ErrorBody` / `OpenAiErrorBody` / `StreamFrame::Error` | `error.rs` / `openai.rs` / `dto.rs` MODIFY | 各新增 `code`，既有欄位不變 | `cargo check`；序列化測試 |
 | `AuditCtx` / `AuditRecord` | `src/runtime/audit.rs` MODIFY | 新增獨立 opaque actor 欄位；**不**併入 `AuditActor { ip, user_agent }` | `cargo check` |
 
@@ -248,6 +249,8 @@ request
 | ERR-005 | `effective` 為空 | 200 + `authz.insufficient` 拒答，指出缺哪一類權限。不呼叫 LLM/MCP、不寫 memory | 申請權限；生效延遲上界 60 秒 |
 | ERR-006 | 外層全域超限或內層 per-actor 超限 | 429 + 整數 `Retry-After` + `Cache-Control: no-store` + per-family 信封 + `rate_limit.global` 或 `rate_limit.actor`。恰好一筆標明拒絕層的 audit event；外層拒絕**無** `actor_key` | 依 `Retry-After` 退避 |
 | ERR-007 | 啟動時 `ACTOR_KEY_PEPPER` 缺失、為空或 < 32 bytes | 啟動失敗；錯誤指出變數名與長度下限，不含 pepper 內容 | 補設定後重啟 |
+| ERR-010 | 上游 400 且 `error_code == auth.conflicting_credentials` | 500 + `identity.upstream_conflict` + 告警。**不**寫 cache——這是 runtime 請求建構錯誤，不是這個 token 的屬性，快取它會在修好後仍重放舊判定 | 修正 runtime 外呼；使用者無需動作 |
+| ERR-011 | 啟動時某個嚴格 intent 的 required tools 不被 `[insight.grants].fetcher` 涵蓋 | 啟動失敗，錯誤指出 intent 與 tool 名。理由見 D-018 | 補 `[insight.grants].fetcher` 或改 `[authz.intent_tools]` |
 | ERR-009 | 啟動時 `[server.rate_limit].enabled` 為 false | 啟動失敗。身份層無條件生效，因此外層 limiter 是**必要**組態而非可選 | 啟用 `[server.rate_limit]` 後重啟 |
 | 邊界：cache 命中 | 同一 token hash 在 TTL 內重複請求 | 正向命中不打 Falcon；負向命中重放**原失敗類別**（同 status、同 code），不打 Falcon。正、負向 cache 都需有條目數上界與 LRU 淘汰——與 per-actor bucket 同理，僅靠外層 limiter 間接約束不足，換 token 灌可推高條目數 | N/A |
 | 邊界：父層權限 | 只有事業部父層權限 | `effective` 為空 → ERR-005 | 申請子頁權限 |
@@ -269,7 +272,7 @@ request
 | D-007 | `actor_key` 進 audit 用新增的獨立欄位 | `AuditActor` 只有 ip / user_agent，且 AC-013 禁止 audit 帶 IP | 塞進 `AuditActor` | 移除欄位 |
 | D-008 | 三種信封的 `code` 為加法式新增，常數集中於 `codes.rs` | 缺 header 與 upstream permissions 401 的 HTTP status 都是 401，沒有 internal `code` 就無法分流；既有消費端只讀 `error` / `data`，行為不變 | 改寫既有欄位語義 | 移除欄位 |
 | D-009 | `/v1` 授權模式下只採最後一則 `user` message，不折入 | 僅忽略 `history` 欄位無效——`map_request` 先映射成 history，`handler.rs` 再折回 `prompt` 與 `raw_input` | 只忽略 `history` 欄位 | 恢復折入 |
-| D-010 | report 取得獨立 grant 上界（六個 tool） | `[insight.grants].fetcher` 只有五個且註解排除 `bill_member_analysis`，而 `fetcher_system.md:20` 要求六個——第六個從未 advertise，是既存 bug | 沿用五個 | 改回共用 |
+| D-010 | report 取得獨立 grant 上界（六個 tool） | `[insight.grants].fetcher` 當時只有五個且註解排除 `bill_member_analysis`，而 `fetcher_system.md:20` 要求六個——第六個從未 advertise，是既存 bug。**v1.6.0 補述**：只補 report 這一側並不夠，見 D-018 | 沿用五個 | 改回共用 |
 | **D-011** | **身份層無條件生效，不提供任何啟用開關** | D3 明訂全面 fail-closed、無 feature flag。一個能讓交付後 binary 退回 legacy 模式的開關會使 AC-015 的「不可重跑」理由失效，也讓預設組態可能靜默關掉 RBAC。三階段部署的向前相容由舊 binary 提供 | `[identity].enabled` 設定開關（v1.0.0 曾誤採） | 需修改 D3 並取得使用者明確簽核 |
 | **D-012** | **`/v1` 在授權模式下為單輪；不新增 `session_id`、不接線 memory** | 2026-08-27 範圍縮減。`/agent/stream` 是原始需求的入口；agentgateway 的多輪不是。重要的是**不能**在 handoff 叫 agentgateway「改送 `session_id`」——`map_request` 寫死 `session_id: None`（`openai.rs:204`）、`handler.rs:583` 註明 memory inert，送了也無效 | 本刀新增 `session_id` 傳輸並接線 memory（v1.1.0 曾採） | 見 PRD FU-006 |
 | **D-013** | **收窄只作用於 fetcher / report 資料 grant；charter 與 composer 豁免；`"*"` 先以 `expand_grant` 展開再取交集** | `emit_chart` / `emit_report` 是 code-backed 輸出 tool，無 permission code 對應，納入交集會讓所有使用者失去圖表與報告產出；`default_fetcher_grant` 是 `["*"]`，字串層次取交集無意義 | 對所有 grant 一律取交集 | 調整收窄集合 |
@@ -277,6 +280,8 @@ request
 | **D-014** | **授權判定與 report grant 上界都以 `wants_report_pipeline` 為 predicate** | 該函式（`handler.rs:129-135`）以「report 為 top **或** candidate」路由，因此「營收報告」的 top intent 是 `revenue` 而仍走 report pipeline。若閘門改用 `intent == report`，這類請求會被 revenue 的嚴格判定擋下，與 FR-004 承諾的降級產出矛盾 | 閘門用 `intent == report` | 改回嚴格比較 |
 | ~~D-016~~ | **Superseded by D-017（v1.5.0）**。原內容：只以 200 shape 與 generic 401 分類，依 upstream `error_code` 白名單分類（僅 `auth.token_invalid` 可續期）。該決定對指南判讀正確——指南確實沒有那張表——但指南落後於實作 |
 | **D-017** | **依 `error_code` 區分可續期與終端，採白名單：僅 `auth.token_invalid` 為可續期，其餘一切（含未知與缺漏）為終端** | 論據不是「指南寫了」而是「API 實際提供了這個資訊，不用它就會做出無限 refresh 迴圈」：七種失敗中只有一種能靠 refresh 解決，收斂成單一 code 會讓前端對停用帳號一路重試。白名單而非黑名單，是因為這些 code **未被任何版本的指南承諾**，隨時可能新增或改名；最壞情況因此是多一次重新登入，而不是迴圈 | 黑名單（列舉終端 code，其餘視為可續期）：未知 code 會落進可續期，正好是要防的那一側 | 改回單一 `Unauthorized` 變體即可 |
+| **D-018** | **`[insight.grants].fetcher` 必須涵蓋每個嚴格 intent 的 required tools，並以開機檢查強制（ERR-011）** | D-010 只把第六個 tool 補進 report 上界，`[authz.intent_tools].member` 卻同時要求 `member_analysis` 與 `bill_member_analysis`。非 report 路徑的規則是 `omitted_tools.is_empty()`，所以少一個 tool 不是「收窄」而是**對每一位使用者的永久拒答**，而且外顯成「權限不足」——與真正的權限問題無從分辨。兩張表各自合法、合起來不成立，正是開機該擋的形狀 | 只在 review 時人工比對兩張表 | 移除 `validate_intent_reachability` |
+| **D-019** | **外呼 Falcon 的 HTTP client 設 `redirect::Policy::none()`，3xx 歸為 `Unavailable`** | reqwest 預設跟隨最多 10 跳，且**同 origin** 的轉址會保留 `Authorization` header——Falcon 前方任何一層回 302，就會把使用者的 bearer 送到一個沒有被審查過的 URL。PRD 安全欄明文承諾「程式層不存在把該 token 轉發到其他 URL 的路徑」，預設 policy 讓那句話不成立 | 依賴 Falcon 不會轉址 | 改回預設 policy |
 
 ## Steps
 

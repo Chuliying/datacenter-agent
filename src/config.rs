@@ -201,6 +201,44 @@ impl AuthzConfig {
         }
         Ok(())
     }
+
+    /// Boot-time check that the insight ceiling can actually satisfy every strict intent.
+    ///
+    /// The per-request gate is `boot ∩ permission ∩ intent required`, and every intent except
+    /// `report` is strict: it needs *all* of its required tools. So a required tool missing from
+    /// `[insight.grants].fetcher` is not a narrowing — it is a permanent refusal for that intent,
+    /// for every user, regardless of what Falcon grants them, and it surfaces to the user as
+    /// "權限不足". That is exactly what a permission bug looks like from the outside, which is why
+    /// it belongs at boot rather than in a support ticket. `report` is excluded: its gate is the
+    /// partial-grant exception, so an uncovered tool there degrades the report instead of denying.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` naming the first intent and tool the ceiling fails to cover.
+    pub fn validate_intent_reachability(
+        &self,
+        insight_fetcher_grant: &[String],
+        advertised: &[String],
+    ) -> Result<()> {
+        let ceiling = crate::agent::wiring::expand_grant(insight_fetcher_grant, advertised);
+        for (intent, tools) in &self.intent_tools {
+            if intent == "report" {
+                continue;
+            }
+            for tool in crate::agent::wiring::expand_grant(tools, advertised) {
+                if !ceiling.contains(&tool) {
+                    anyhow::bail!(
+                        "config_error: intent `{intent}` requires tool `{tool}`, but \
+                         [insight.grants].fetcher does not grant it; the strict intent gate \
+                         would deny every request for this intent regardless of the caller's \
+                         Falcon permissions. Add it to [insight.grants].fetcher, or drop it \
+                         from [authz.intent_tools].{intent}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `[identity]`: how the runtime reaches Falcon's permissions endpoint
@@ -328,10 +366,11 @@ struct ReportManifest {
 
 /// `[report.grants]`: the report pipeline's own tool ceiling.
 ///
-/// Separate from `[insight.grants].fetcher` on purpose. The shared grant lists five tools
-/// and its comment deliberately excludes `bill_member_analysis`, while the report prompt
-/// instructs the model to call six — so the sixth was never advertised to it. Giving the
-/// report its own ceiling fixes that mismatch without widening insight.
+/// Separate from `[insight.grants].fetcher` on purpose: the report gate is the partial-grant
+/// exception (a non-empty intersection is enough) while every other intent is strict, so the
+/// two ceilings must be able to move independently. They happen to list the same six tools
+/// today — `[insight.grants].fetcher` had to gain `bill_member_analysis` as well, because
+/// under per-turn narrowing its absence default-denied the `member` intent outright.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReportGrants {
@@ -870,6 +909,7 @@ mod tests {
                 "member_analysis",
                 "business_metrics",
                 "station_revenue_ranking",
+                "bill_member_analysis",
             ]
         );
         assert_eq!(cfg.insight_grants.charter, ["emit_chart"]);
@@ -1044,15 +1084,88 @@ request_timeout_ms = 5000
             report_grant
                 .fetcher
                 .contains(&"bill_member_analysis".to_string()),
-            "the report grant must include the tool the shared insight grant omits"
+            "the report grant must cover every topic the report prompt asks for"
         );
 
-        // The insight grant is untouched: narrowing report must not widen insight.
-        assert_eq!(cfg.insight_grants.fetcher.len(), 5);
-        assert!(!cfg
+        // Both ceilings now list the same six tools. They stay separate declarations because
+        // the report gate is the partial-grant exception and the insight gate is strict, so a
+        // future narrowing of one must not silently narrow the other.
+        assert_eq!(cfg.insight_grants.fetcher.len(), 6);
+        assert!(cfg
             .insight_grants
             .fetcher
             .contains(&"bill_member_analysis".to_string()));
+    }
+
+    /// The shipped ceiling must satisfy every strict intent; if it stops doing so, boot fails
+    /// rather than turning into a per-user "權限不足" that looks like a permission bug.
+    #[test]
+    fn shipped_insight_ceiling_covers_every_strict_intent() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg.authz.expect("shipped config declares authz");
+
+        authz
+            .validate_intent_reachability(&cfg.insight_grants.fetcher, &advertised_fixture())
+            .expect("shipped insight ceiling must cover every strict intent");
+    }
+
+    #[test]
+    fn intent_requiring_a_tool_outside_the_insight_ceiling_fails_boot() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg.authz.expect("shipped config declares authz");
+        // The ceiling as it shipped before this fix: `member` needs a sixth tool it lacks.
+        let narrowed: Vec<String> = cfg
+            .insight_grants
+            .fetcher
+            .iter()
+            .filter(|tool| *tool != "bill_member_analysis")
+            .cloned()
+            .collect();
+
+        let err = authz
+            .validate_intent_reachability(&narrowed, &advertised_fixture())
+            .expect_err("an unreachable strict intent must fail boot");
+        let message = format!("{err}");
+
+        assert!(
+            message.contains("member"),
+            "message names the intent: {message}"
+        );
+        assert!(
+            message.contains("bill_member_analysis"),
+            "message names the tool: {message}"
+        );
+    }
+
+    /// `report` is the partial-grant exception: an uncovered tool degrades the report rather
+    /// than denying it, so the reachability check must not fail boot over it.
+    #[test]
+    fn report_intent_is_exempt_from_the_reachability_check() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg.authz.expect("shipped config declares authz");
+        let revenue_only = vec!["bill_revenue".to_string()];
+
+        let err = authz
+            .validate_intent_reachability(&revenue_only, &advertised_fixture())
+            .expect_err("a strict intent is still unreachable under this ceiling");
+        assert!(
+            !format!("{err}").contains("intent `report`"),
+            "report must not be the intent that fails boot: {err}"
+        );
+    }
+
+    fn advertised_fixture() -> Vec<String> {
+        [
+            "bill_revenue",
+            "station_revenue_ranking",
+            "bill_charge",
+            "business_metrics",
+            "member_analysis",
+            "bill_member_analysis",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     }
 
     fn authz_fixture() -> AuthzConfig {

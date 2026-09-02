@@ -52,9 +52,14 @@ handler 層的 `validate_prompt` 與 `USER_PROMPT_LENGTH_CAP`。
 共通：scheme 名稱大小寫不敏感（RFC 6750）、token 用 `constant_time_eq` 比對（防 timing attack）。
 兩條 prompt route 另需 `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`；身份 middleware
 位於 service bearer／global limiter 之後、per-actor limiter 之前，並回傳
-`identity.header_missing`、`identity.token_refreshable` / `identity.token_terminal` 或 `identity.upstream_unavailable`。
+`identity.header_missing`、`identity.token_refreshable` / `identity.token_terminal`、
+`identity.upstream_unavailable`（503）或 `identity.upstream_conflict`（500，上游回 400
+`auth.conflicting_credentials`：這是 runtime 自己的請求建構錯誤，會告警且不進負向 cache）。
 permissions endpoint 未承諾的 upstream `error_code` 只作為 runtime 內部判定輸入，不轉送給消費端；非 `POST` 直通 method
 router，以保留既有 405。
+
+對 Falcon 的外呼固定 `redirect::Policy::none()`：reqwest 預設會跟隨轉址，而同 origin 的跳轉會保留
+`Authorization`，等於把使用者 token 送到未經審查的 URL。3xx 因此歸為 `identity.upstream_unavailable`。
 
 auth layer 套在**各自的 sub-router** 上，scope 明確。但在 `merge` 之後於外層新增 route 會
 **同時繞過兩個 auth layer**——新增端點必須有 Router-level auth test。
