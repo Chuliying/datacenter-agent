@@ -45,11 +45,6 @@ fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-/// Resolve the Falcon base URL, allowing deployments to override the checked-in local default.
-///
-/// This is a deployment setting, not an identity feature flag: the identity layer remains
-/// unconditional and an empty or non-Unicode override fails boot rather than silently falling
-/// back to the manifest value.
 /// Both rate-limit layers are prerequisites of the identity layer, not preferences (AC-021,
 /// ERR-009).
 ///
