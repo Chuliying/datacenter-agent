@@ -55,6 +55,21 @@ Partial report authorization is a successful response, not an error. The final r
 omitted topics; consumers should display that declaration and should not try to reconstruct omitted
 data from an older transcript.
 
+## falcon-client implementation status (2026-09-02)
+
+C1–C4 are implemented in falcon-client (`src/lib/chief-of-staff/agent-client.ts`,
+`stream-route.ts`), with unit tests for token forwarding, cookie extraction, the runtime-`code`
+capture, and the refreshable/terminal branch. Ships in a separate falcon-client PR.
+
+**Deferred (FU): the refresh consumer itself (C4's runtime side).** `agentErrorInfo` now produces
+`AGENT_IDENTITY_REFRESHABLE` vs `AGENT_IDENTITY_TERMINAL`, but `useChiefOfStaffStream` still
+collapses every error frame into one generic message, so a mid-session token expiry (the
+refreshable case) dead-ends in a generic error until an unrelated request refreshes the cookie.
+This is a UX gap, not a security one: the infinite-refresh loop is structurally impossible today
+(the runtime 401 reaches the browser as an SSE `error` frame at HTTP 200, so no generic refresh
+middleware fires), and the terminal case is correctly fenced for when a consumer does land. Wiring
+`AGENT_IDENTITY_REFRESHABLE` into the existing silent-refresh-and-resend-once flow is a follow-up.
+
 ## Three-stage rollout
 
 1. Deploy consumer changes that send `X-Falcon-Authorization`, parse `code`, and implement the
