@@ -486,6 +486,10 @@ pub(crate) async fn runtime_app_state_with_fixtures(
 pub(crate) struct ScriptedChatCompletions {
     pub(crate) base_url: String,
     requests: Arc<AtomicUsize>,
+    /// Every request body the stub served, in order. Lets a test assert *what* reached the
+    /// LLM — e.g. that a second turn's fetcher request carries the first turn's memory
+    /// context — rather than only how many calls happened.
+    bodies: Arc<StdMutex<Vec<serde_json::Value>>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -498,8 +502,10 @@ impl ScriptedChatCompletions {
             .expect("scripted listener should be nonblocking");
         let address = listener.local_addr().expect("scripted listener address");
         let requests = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_requests = requests.clone();
+        let thread_bodies = bodies.clone();
         let thread_stop = stop.clone();
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::SeqCst) {
@@ -509,7 +515,7 @@ impl ScriptedChatCompletions {
                         stream
                             .set_nonblocking(false)
                             .expect("scripted connection should be blocking");
-                        if let Err(err) = serve_scripted_completion(stream) {
+                        if let Err(err) = serve_scripted_completion(stream, &thread_bodies) {
                             eprintln!("scripted LLM listener failed: {err}");
                             break;
                         }
@@ -527,6 +533,7 @@ impl ScriptedChatCompletions {
         Self {
             base_url: format!("http://{address}/v1"),
             requests,
+            bodies,
             stop,
             thread: Some(thread),
         }
@@ -534,6 +541,16 @@ impl ScriptedChatCompletions {
 
     pub(crate) fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// Every request body served so far, serialized to one string per request.
+    pub(crate) fn request_bodies(&self) -> Vec<String> {
+        self.bodies
+            .lock()
+            .expect("scripted LLM body lock should not be poisoned")
+            .iter()
+            .map(|body| body.to_string())
+            .collect()
     }
 }
 
@@ -546,7 +563,10 @@ impl Drop for ScriptedChatCompletions {
     }
 }
 
-fn serve_scripted_completion(mut stream: TcpStream) -> std::io::Result<()> {
+fn serve_scripted_completion(
+    mut stream: TcpStream,
+    bodies: &StdMutex<Vec<serde_json::Value>>,
+) -> std::io::Result<()> {
     let body = read_http_body(&mut stream)?;
     let request: serde_json::Value = serde_json::from_slice(&body).map_err(|err| {
         std::io::Error::new(
@@ -554,6 +574,10 @@ fn serve_scripted_completion(mut stream: TcpStream) -> std::io::Result<()> {
             format!("invalid request: {err}"),
         )
     })?;
+    bodies
+        .lock()
+        .expect("scripted LLM body lock should not be poisoned")
+        .push(request.clone());
     let (kind, name, arguments, text) = scripted_reply(&request);
     let payload = match kind {
         ScriptedReply::Tool => tool_call_stream(&name, &arguments),
@@ -641,10 +665,15 @@ fn scripted_reply(request: &serde_json::Value) -> (ScriptedReply, String, String
                 String::new(),
             );
         }
-        if tool_names.iter().any(|name| *name != "emit_chart") {
+        // The first advertised data tool, whatever pipeline this is — hardcoding a name here
+        // silently pins the stub to the starcharger tool set and breaks any other pipeline.
+        if let Some(name) = tool_names
+            .iter()
+            .find(|name| **name != "emit_chart" && **name != "emit_report")
+        {
             return (
                 ScriptedReply::Tool,
-                "bill_revenue".into(),
+                (*name).to_string(),
                 "{}".into(),
                 String::new(),
             );

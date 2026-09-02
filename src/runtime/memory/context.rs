@@ -121,6 +121,7 @@ mod tests {
             option_id: None,
             created_at_ms: 1,
             report_pipeline: false,
+            ss_pipeline: false,
         }
     }
 

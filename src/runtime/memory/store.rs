@@ -34,6 +34,13 @@ pub struct SessionMemoryTurn {
     /// intent, so 「營收報告」 stores `intent = "revenue"` while producing a full mixed-topic
     /// report. The replay filter needs the pipeline that actually ran, not the top intent.
     pub report_pipeline: bool,
+    /// Whether this turn was answered by the **SS chat** pipeline (`/ss-chat/stream`).
+    ///
+    /// Also not derivable from `intent`: every SS prompt resolves to `unknown` under the
+    /// EV-charging intent pack, which is indistinguishable from a genuinely unclassifiable
+    /// EV question. Without this tag the replay filter would drop every SS turn (making the
+    /// route silently single-turn) and would replay EV turns into the SS pipeline.
+    pub ss_pipeline: bool,
     /// Metric id.
     pub metric: Option<String>,
     /// Asset id/name.
@@ -165,6 +172,7 @@ mod tests {
             option_id: None,
             created_at_ms: 1,
             report_pipeline: false,
+            ss_pipeline: false,
         }
     }
 

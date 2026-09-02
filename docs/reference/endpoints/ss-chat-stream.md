@@ -50,7 +50,11 @@ runtime 的 intent pack（[`config/runtime/intents.toml`](../../../config/runtim
 - **放寬** scope gate，`unknown` 與低信心都照常回答；
 - intent 仍然解析、仍然送出 `intent.resolved` frame、仍然寫入 audit——只是不再決定任何事。
 
-prelude 的其餘部分（prompt 長度上限、injection 偵測、session memory、audit）**完全不變**。
+prelude 的其餘部分（prompt 長度上限、injection 偵測、audit）**完全不變**。session memory
+的讀寫也走同一條路，但 SS turn 以 `ss_pipeline` 標記寫入：SS 的 intent 一律是 `unknown`
+（EV intent pack 沒有 SS 詞彙），沒有這個標記，重放過濾器會把每一筆 SS turn 當低信心
+turn 丟棄——端點會靜默變成單輪。重放是**路由族隔離**的：SS turn 只在本路由重放（授權依
+SS gate 判定），EV turn 不會滲入本路由，反之亦然。
 
 實測（2026-08-27，同一個問題）：
 
@@ -106,18 +110,18 @@ SS_CHAT_QUESTION=all cargo test --test ss_chat_pipeline -- --ignored --nocapture
 ### 已知限制：算術正確性取決於 model
 
 2026-08-27 以 `google/gemini-3.1-flash-lite`（`.env` 的 `OPENROUTER_MODEL`）實跑七題，
-Q1／Q2／Q4／Q6／Q7 正確——包含 Q7 兩項對抗性檢查（拒絕 kWh + kW 相加、主動把「星火50」更正為
-「星展50計畫」）。**Q3 與 Q5 出現加總錯誤**：
+五題正確——包含兩項對抗性檢查（拒絕 kWh + kW 相加、主動更正錯誤的計畫名稱）。**兩題出現
+加總錯誤**（實際數字略去——這份文件對所有 repo 讀者可見，而端點資料受 `[authz]`
+權限閘門保護，具體金額以權限內呼叫工具取得為準）：
 
-- Q3（73 列 Q1+Q2 累計）算出 185,555,762，實際為 **259,159,762**（直接呼叫工具核對）。
-- Q5 三筆款項列出正確，合計卻寫成 88,600,000，實際為 **87,620,000**。
+- 多列累計題：73 列的兩季累計加總錯誤，偏差約三成（以直接呼叫工具核對）。
+- 少列合計題：三筆款項逐列正確，合計卻與逐列相加不符。
 
-同一份 prompt 換成 `anthropic/claude-opus-5` 後 Q3 精確命中 259,159,762、前五大 85.4%、
-大福+茂泓 56.6%，與參考文件逐項相符。**這是 model 能力上限，不是 pipeline 或 prompt 的邏輯錯誤**；
-參考文件本身也是以 `claude-opus-5` 產生的。若本端點要對管理層提供可引用的數字，
-建議為它指定較強的 model。
+同一份 prompt 換成 `anthropic/claude-opus-5` 後兩題皆精確命中，與參考文件逐項相符。
+**這是 model 能力上限，不是 pipeline 或 prompt 的邏輯錯誤**；若本端點要對管理層提供
+可引用的數字，建議為它指定較強的 model。
 
 `ss_analyst_system` 已針對這兩類錯誤加上硬性規則（單一加總基準、合計必須等於列出的列相加、
 佔比分母唯一且不得超過 100%、逐列判斷逾期且未逐列檢查前不得寫「無逾期項目」）。這修正了
-`gemini-3.1-flash-lite` 原本在 Q5 誤報「無逾期項目」的問題（實際 匯聚_柳營1.5MW 已逾期 27 天），
-但無法補足大量列的加總能力。
+`gemini-3.1-flash-lite` 原本誤報「無逾期項目」的問題（實際有一筆已逾期案場），但無法補足
+大量列的加總能力。

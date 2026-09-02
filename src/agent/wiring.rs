@@ -589,6 +589,18 @@ pub fn validate_ss_chat_grants(
     fetcher_grant: &[String],
     charter_grant: &[String],
 ) -> Result<()> {
+    // The SS fetcher grant must be an explicit list, never the wildcard. Config is
+    // runtime-editable, so a deployed `fetcher = ["*"]` would boot cleanly through the generic
+    // validation — and then, post-authorization, intersect to an **empty** effective grant
+    // (`"*"` matches no advertised name literally), yielding an SS endpoint that answers
+    // ungrounded instead of failing at boot. Reject it here, where every other grant mistake
+    // already fails fast.
+    if fetcher_grant.iter().any(|name| name == ALL_MCP_TOOLS) {
+        anyhow::bail!(
+            "config_error: [ss_chat.grants].fetcher must list tools explicitly; \
+             the `*` wildcard is not valid for the ss-chat pipeline"
+        );
+    }
     validate_pipeline_grants("ss-chat", discovered, fetcher_grant, charter_grant)
 }
 
@@ -789,6 +801,12 @@ mod tests {
         );
         // The charter's built-in sink resolves without the server advertising anything.
         assert!(validate_ss_chat_grants(&[], &[], &["emit_chart".to_string()]).is_ok());
+
+        // The wildcard is rejected outright: a deployed `fetcher = ["*"]` would otherwise boot,
+        // then intersect to an empty effective grant and answer ungrounded.
+        let err = validate_ss_chat_grants(&[], &["*".to_string()], &[])
+            .expect_err("the wildcard must fail SS grant validation");
+        assert!(err.to_string().contains('*'), "got: {err}");
     }
 
     #[test]

@@ -156,6 +156,11 @@ pub struct AgentTurnDeps<'a> {
     pub advertised_tools: &'a [String],
     /// Boot data ceiling for the insight fetcher.
     pub insight_grant: &'a [String],
+    /// Boot data ceiling for the SS chat fetcher.
+    pub ss_grant: &'a [String],
+    /// Whether this turn is being served by the SS chat route. Memory replay is
+    /// route-family-scoped: SS turns replay only here, EV turns only elsewhere.
+    pub ss_route: bool,
     /// Boot data ceiling for the report fetcher.
     pub report_grant: &'a [String],
 }
@@ -315,8 +320,15 @@ pub async fn plan_stream_turn(
         AnswerDecision::Refuse(reason) => {
             let copy = refusal_copy(&reason);
             if reason != "prompt_injection" {
-                append_memory_turn_if_enabled(&input, deps.sessions, &normalized, &copy, false)
-                    .await?;
+                append_memory_turn_if_enabled(
+                    &input,
+                    deps.sessions,
+                    &normalized,
+                    &copy,
+                    false,
+                    false,
+                )
+                .await?;
             }
             deps.audit
                 .write(
@@ -413,6 +425,7 @@ async fn stream_agent_response(
                     deps.sessions,
                     normalized,
                     response,
+                    false,
                     false,
                 )
                 .await?;
@@ -558,6 +571,7 @@ pub(crate) async fn append_memory_turn_if_enabled(
     normalized: &NormalizedInput,
     response: &str,
     report_pipeline: bool,
+    ss_pipeline: bool,
 ) -> RuntimeResult<()> {
     let Some(session_id) = input.session_id.as_ref() else {
         return Ok(());
@@ -581,6 +595,7 @@ pub(crate) async fn append_memory_turn_if_enabled(
                 answer_summary: response.to_string(),
                 intent: Some(normalized.intent.clone()),
                 report_pipeline,
+                ss_pipeline,
                 metric: normalized.slots.metric.clone(),
                 asset: normalized.slots.asset.clone(),
                 time_range_label: normalized.slots.time_range.clone(),
@@ -606,6 +621,27 @@ fn memory_turn_is_allowed(
     let Some(authz) = deps.authz else {
         return true;
     };
+    // Memory replay is route-family-scoped. An SS turn never replays into the EV pipelines
+    // (its startrade-power material would surface under starcharger branding) and an EV turn
+    // never replays into the SS pipeline (Finding 2 of the SS review). Without the tag this
+    // could not be expressed at all: every SS turn stores intent `unknown` — the EV pack has
+    // no SS vocabulary — which the intent rule below would drop, silently making the SS route
+    // single-turn while its own prompts instruct the model to reuse earlier turns.
+    if turn.ss_pipeline != deps.ss_route {
+        return false;
+    }
+    if deps.ss_route {
+        // SS turns cannot be authorized through the intent table (their intent is always
+        // `unknown`); the route's actual permission model is the SS gate.
+        return crate::server::authz::authorize_ss_chat(
+            authz,
+            deps.ss_grant,
+            &identity.permissions.codes,
+            deps.advertised_tools,
+            &[],
+        )
+        .allowed;
+    }
     let Some(intent) = turn.intent.as_deref() else {
         return false;
     };
@@ -855,6 +891,8 @@ mod tests {
                 authz: None,
                 advertised_tools: &[],
                 insight_grant: &[],
+                ss_grant: &[],
+                ss_route: false,
                 report_grant: &[],
             },
         )
@@ -902,6 +940,8 @@ mod tests {
                 authz: None,
                 advertised_tools: &[],
                 insight_grant: &[],
+                ss_grant: &[],
+                ss_route: false,
                 report_grant: &[],
             },
         )
@@ -945,6 +985,8 @@ mod tests {
                 authz: None,
                 advertised_tools: &[],
                 insight_grant: &[],
+                ss_grant: &[],
+                ss_route: false,
                 report_grant: &[],
             },
         )
@@ -1024,6 +1066,8 @@ mod tests {
                 authz: Some(&authz),
                 advertised_tools: &advertised,
                 insight_grant: &insight_grant,
+                ss_grant: &[],
+                ss_route: false,
                 report_grant: &report_grant,
             },
         )
@@ -1320,6 +1364,7 @@ mod tests {
                     option_id: None,
                     created_at_ms: 1,
                     report_pipeline: false,
+                    ss_pipeline: false,
                 },
             )
             .await;
@@ -1405,6 +1450,7 @@ mod tests {
                         option_id: None,
                         created_at_ms: 1,
                         report_pipeline: false,
+                        ss_pipeline: false,
                     },
                 )
                 .await;
@@ -1471,6 +1517,7 @@ mod tests {
                     option_id: None,
                     created_at_ms: 1,
                     report_pipeline: false,
+                    ss_pipeline: false,
                 },
             )
             .await;
@@ -1513,6 +1560,8 @@ mod tests {
                 authz: None,
                 advertised_tools: &[],
                 insight_grant: &[],
+                ss_grant: &[],
+                ss_route: false,
                 report_grant: &[],
             },
         )
@@ -1583,6 +1632,8 @@ mod tests {
                 authz: None,
                 advertised_tools: &[],
                 insight_grant: &[],
+                ss_grant: &[],
+                ss_route: false,
                 report_grant: &[],
             },
         )

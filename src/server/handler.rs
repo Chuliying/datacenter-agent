@@ -493,6 +493,8 @@ async fn run_chat_stream(
             authz: Some(&state.authz),
             advertised_tools: &advertised,
             insight_grant: &state.insight_grants.fetcher,
+            ss_grant: &state.ss_chat_grants.fetcher,
+            ss_route: route == "/ss-chat/stream",
             report_grant: &state.report_grants.fetcher,
         };
         plan_stream_turn(input, &audit_ctx, deps)
@@ -573,6 +575,7 @@ async fn run_chat_stream(
     // The pipeline that actually ran, not the top intent: the memory replay filter keys its
     // stricter report rule off this (a mixed-topic report can be stored under a topic intent).
     let ran_report_pipeline = pipeline_id == report_pipeline_id();
+    let ran_ss_pipeline = pipeline_id == ss_chat_pipeline_id();
 
     // The memory-augmented prompt/history drive the pipeline; the full
     // agent_input (raw_input preserved) is kept for the post-stream memory append.
@@ -672,6 +675,7 @@ async fn run_chat_stream(
                 &normalized,
                 &response,
                 ran_report_pipeline,
+                ran_ss_pipeline,
             )
             .await
             {
@@ -941,6 +945,8 @@ pub async fn chat_completions(
             authz: Some(&state.authz),
             advertised_tools: &advertised,
             insight_grant: &state.insight_grants.fetcher,
+            ss_grant: &state.ss_chat_grants.fetcher,
+            ss_route: false,
             report_grant: &state.report_grants.fetcher,
         };
         match plan_stream_turn(input, &audit_ctx, deps).await {
@@ -1784,6 +1790,96 @@ mod tests {
         assert!(
             llm.requests() >= 5,
             "fetcher/analyst/composer calls should be scripted"
+        );
+    }
+
+    /// The SS route through the real router with its real grant: an `unknown`-intent prompt is
+    /// **answered**, only `ss_*` tools are exposed, and — the regression this test exists for —
+    /// the second turn of a session actually sees the first turn's memory.
+    ///
+    /// Every SS prompt resolves to intent `unknown` (the intent pack is EV-charging), so before
+    /// per-pipeline turn tagging the replay filter dropped every stored SS turn: the endpoint
+    /// answered, wrote memory, and then never read it back — silently single-turn, with the drop
+    /// mislabelled as a permission event. Asserting on the *LLM request body* of turn two is the
+    /// only observation point that proves the context genuinely reached the model.
+    #[tokio::test]
+    async fn ss_chat_two_turn_memory_survives_the_replay_filter() {
+        let llm = crate::test_support::ScriptedChatCompletions::start();
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            9,
+            &["hdrenewables/elecsvc/startrade-power/finance"],
+        );
+        let (state, mcp) = crate::test_support::runtime_app_state_with_fixtures(
+            provider,
+            llm.base_url.clone(),
+            &[
+                "ss_sunshine_hours",
+                "ss_energy_storage",
+                "ss_power_wheeling",
+                "ss_power_pipeline",
+                "ss_btm_projects",
+                "ss_ftm_projects",
+            ],
+        )
+        .await;
+        let app = crate::server::route::build_router(state);
+
+        let request = |prompt: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/ss-chat/stream")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                )
+                .header("x-falcon-authorization", "Bearer delegated-local-token")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"prompt": prompt, "session_id": "ss-session-1"}).to_string(),
+                ))
+                .unwrap()
+        };
+
+        // Turn one: an SS question. Intent resolves to `unknown`, and the substituted
+        // AlwaysAnswerPolicy must answer it rather than refuse it as off_scope.
+        const FIRST_PROMPT: &str = "太陽光電案場的日照時數狀況";
+        let first = app.clone().oneshot(request(FIRST_PROMPT)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_string(first).await;
+        assert!(
+            !first_body.contains(crate::server::codes::AUTHZ_INSUFFICIENT),
+            "a startrade-power user must pass the SS gate: {first_body}"
+        );
+        assert!(
+            first_body.contains("\"event\":\"done\""),
+            "turn one should stream to completion: {first_body}"
+        );
+        let turn_one_requests = llm.requests();
+        assert!(
+            turn_one_requests > 0,
+            "the pipeline must actually run — a refusal never reaches the LLM"
+        );
+        assert!(
+            mcp.tool_calls() >= 1,
+            "the fetcher should call an ss_* tool through the stub MCP"
+        );
+
+        // Turn two, same session: the memory context injected into the fetcher's LLM request
+        // must carry turn one's summary. This is exactly what the `unknown`-intent drop broke.
+        let second = app.oneshot(request("那儲能的部分呢")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = body_string(second).await;
+        assert!(!second_body.contains(crate::server::codes::AUTHZ_INSUFFICIENT));
+
+        let bodies = llm.request_bodies();
+        let turn_two_bodies = &bodies[turn_one_requests..];
+        assert!(
+            turn_two_bodies
+                .iter()
+                .any(|body| body.contains(FIRST_PROMPT)),
+            "turn two's LLM requests must carry turn one's memory context; \
+             got {} turn-two requests without it",
+            turn_two_bodies.len()
         );
     }
 

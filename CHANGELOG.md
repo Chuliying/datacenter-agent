@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Falcon end-user identity and RBAC on the prompt routes.** `/agent/stream`,
+  `/ss-chat/stream` and `/v1/chat/completions` now require `X-Falcon-Authorization: Bearer
+  <FALCON_ACCESS_TOKEN>` in addition to the service bearer; the runtime verifies it against
+  Falcon's permissions endpoint (positive/negative TTL cache, whitelist 401 classification:
+  only `auth.token_invalid` is refreshable), derives a pseudonymous `actor_key`
+  (HMAC-SHA256 over a boot-required pepper), narrows every pipeline's tool grant to
+  `boot ∩ permission ∩ intent-required` before any LLM/MCP call, filters session-memory
+  replay by the caller's *current* permissions, and adds an inner per-actor rate-limit
+  layer inside the (now mandatory) global one. Stable machine-readable `code` fields on
+  all three error envelopes. Client-supplied `history` is ignored on identity-protected
+  routes; `/v1/chat/completions` is single-turn.
 - **`POST /ss-chat/stream`** — a streaming front door for the 星星電力 (SS) investor platform. It
   runs the same four-stage chat pipeline as `/agent/stream`'s insight path
   (`fetcher → analyst → charter → finalizer`) over the six `ss_*` MCP tools, with its own stage
@@ -20,7 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before the pipeline ran. This route substitutes the new `AlwaysAnswerPolicy`, which keeps the
     prompt-injection refusal but drops the scope gate. Intent still resolves, still emits
     `intent.resolved`, and is still audited — it just no longer gates the answer. Prompt-length
-    validation, injection detection, session memory and audit are unchanged.
+    validation, injection detection and audit are unchanged. Session memory flows through the
+    same store, with SS turns tagged `ss_pipeline` so the identity slice's replay filter can
+    authorize them via the SS permission gate instead of dropping their always-`unknown` intent;
+    replay is route-family-scoped (SS turns replay only on this route, EV turns never do).
   - The SS fetcher grant is an **explicit list, never `"*"`**: one MCP server advertises both the
     EV-charging tools and the `ss_*` ones, so a wildcard would let the SS pipeline reach EV data
     under 星星電力 branding. Pinned by a unit test over both the shipped config and the in-code
