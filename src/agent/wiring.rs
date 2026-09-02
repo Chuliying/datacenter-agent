@@ -595,6 +595,12 @@ pub fn validate_ss_chat_grants(
     // (`"*"` matches no advertised name literally), yielding an SS endpoint that answers
     // ungrounded instead of failing at boot. Reject it here, where every other grant mistake
     // already fails fast.
+    if fetcher_grant.is_empty() {
+        anyhow::bail!(
+            "config_error: [ss_chat.grants].fetcher must not be empty; an empty grant boots a \
+             fetcher with no tools that answers ungrounded — reject it at boot, like the wildcard"
+        );
+    }
     if fetcher_grant.iter().any(|name| name == ALL_MCP_TOOLS) {
         anyhow::bail!(
             "config_error: [ss_chat.grants].fetcher must list tools explicitly; \
@@ -799,14 +805,26 @@ mod tests {
             msg.contains("ss_sunshine_hours"),
             "message should name the tool: {msg}"
         );
-        // The charter's built-in sink resolves without the server advertising anything.
-        assert!(validate_ss_chat_grants(&[], &[], &["emit_chart".to_string()]).is_ok());
+        // A fetcher grant naming an advertised tool, with the built-in charter sink, validates.
+        let discovered = vec![discovered_tool("ss_sunshine_hours")];
+        assert!(validate_ss_chat_grants(
+            &discovered,
+            &["ss_sunshine_hours".to_string()],
+            &["emit_chart".to_string()],
+        )
+        .is_ok());
 
         // The wildcard is rejected outright: a deployed `fetcher = ["*"]` would otherwise boot,
         // then intersect to an empty effective grant and answer ungrounded.
         let err = validate_ss_chat_grants(&[], &["*".to_string()], &[])
             .expect_err("the wildcard must fail SS grant validation");
         assert!(err.to_string().contains('*'), "got: {err}");
+
+        // An empty fetcher grant is rejected for the same reason as the wildcard: it boots a
+        // fetcher with no tools that answers ungrounded (finding #6).
+        let err = validate_ss_chat_grants(&[], &[], &["emit_chart".to_string()])
+            .expect_err("an empty SS fetcher grant must fail validation");
+        assert!(err.to_string().contains("empty"), "got: {err}");
     }
 
     #[test]

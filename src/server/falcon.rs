@@ -17,8 +17,6 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::IdentityConfig;
-
 /// Default upper bound for the combined positive and negative permission cache.
 pub const DEFAULT_CACHE_CAPACITY: usize = 1024;
 
@@ -231,7 +229,7 @@ pub struct FalconPermissionsClient {
 }
 
 impl FalconPermissionsClient {
-    pub fn from_config(config: &IdentityConfig) -> Result<Self> {
+    pub fn from_config(config: &crate::config::ResolvedIdentityConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(config.request_timeout_ms.get()))
             .build()?;

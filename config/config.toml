@@ -237,7 +237,11 @@ report = [
 # revocation takes to take effect. negative_ttl_ms bounds the amplification from a
 # consumer stuck resending one dead token; it must not exceed positive_ttl_ms.
 [identity]
-base_url = "https://dev.hdre-eomc.com"
+# base_url has NO checked-in default on purpose (finding #1): a shipped default would let a
+# deployment that forgets FALCON_API_BASE_URL silently verify production users' tokens against
+# whatever host the repo carried. Set FALCON_API_BASE_URL in every environment; boot fails if
+# neither the env var nor a base_url here is present.
+# base_url = "https://falcon.example.com"   # or supply via FALCON_API_BASE_URL
 positive_ttl_ms = 60000     # successful lookup reuse window
 negative_ttl_ms = 10000     # failed lookup replay window
 request_timeout_ms = 5000   # per-request timeout for the permissions call

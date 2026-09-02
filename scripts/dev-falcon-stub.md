@@ -33,7 +33,7 @@ by the permissions contract:
   ],
   "permissions": [
     {
-      "code": "starcharger.finance",
+      "code": "hdrenewables/elecsvc/starcharger/finance",
       "name": "Finance",
       "category": "starcharger",
       "page_path": "/finance",
@@ -93,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
                 ],
                 "permissions": [
                     {
-                        "code": "starcharger.finance",
+                        "code": "hdrenewables/elecsvc/starcharger/finance",
                         "name": "Finance",
                         "category": "starcharger",
                         "page_path": "/finance",

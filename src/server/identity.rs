@@ -15,7 +15,7 @@ use super::actor::ActorKey;
 use super::codes;
 use super::error::ErrorBody;
 use super::falcon::{Permissions, PermissionsFailure};
-use super::openai::{OpenAiErrorBody, ERR_INVALID_REQUEST};
+use super::openai::{error_type_for_status, OpenAiErrorBody};
 use super::AppState;
 use crate::runtime::audit::{
     AuditCtx, AuditEvent, AuditFailurePolicy, AuditSink, AuditWriter, TracingAuditSink,
@@ -154,11 +154,15 @@ fn parse_bearer(value: &HeaderValue) -> Option<&str> {
 
 fn identity_error(req: &Request, status: StatusCode, code: &str, message: &str) -> Response {
     if req.uri().path().starts_with("/v1/") {
+        // The OpenAI envelope's `type` must track the status, not be hardcoded: an
+        // agentgateway-style client branches on `type`, so a 503/500 sent as
+        // `invalid_request_error` reads as a non-retryable client error rather than the
+        // transient upstream failure it is (finding #2).
         (
             status,
             Json(OpenAiErrorBody::with_code(
                 code,
-                ERR_INVALID_REQUEST,
+                error_type_for_status(status.as_u16()),
                 message,
             )),
         )
@@ -434,7 +438,30 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], ERR_INVALID_REQUEST);
+        assert_eq!(
+            body["error"]["type"],
+            crate::server::openai::ERR_INVALID_REQUEST
+        );
         assert_eq!(body["error"]["code"], codes::IDENTITY_TOKEN_TERMINAL);
+    }
+
+    /// Finding #2: a 5xx identity failure on `/v1` must carry OpenAI `type: server_error`, not
+    /// `invalid_request_error` — an agentgateway-style client branches on `type`, and a transient
+    /// Falcon outage sent as a client error would not be retried.
+    #[tokio::test]
+    async fn v1_upstream_unavailable_uses_server_error_type() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::new([Err(
+            PermissionsFailure::Unavailable,
+        )]);
+        let app = identity_app(provider).await;
+        let response = app
+            .oneshot(request("/v1/prompt", Some("Bearer whatever")))
+            .await
+            .expect("identity request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], crate::server::openai::ERR_SERVER);
+        assert_eq!(body["error"]["code"], codes::IDENTITY_UPSTREAM_UNAVAILABLE);
     }
 }

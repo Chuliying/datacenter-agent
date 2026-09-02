@@ -786,14 +786,15 @@ mod tests {
 
     #[test]
     fn tracing_capture_observes_output_from_a_spawned_task() {
+        // Must NOT clear() the buffer (finding #7): TRACING_CAPTURE is process-global and shared
+        // with every other test, including AC-002 which asserts the *absence* of a secret in it.
+        // A clear() landing between AC-002's request and its read would mask a real leak. This
+        // canary instead emits a unique marker and only checks that marker is present.
         let buffer = install_tracing_capture();
-        buffer
-            .lock()
-            .expect("tracing capture lock should not be poisoned")
-            .clear();
+        let marker = "ss-canary-marker-7f3a-spawned";
 
-        std::thread::spawn(|| {
-            tracing::info!(target: "test_support", fixture_marker = "spawned", "fixture event");
+        std::thread::spawn(move || {
+            tracing::info!(target: "test_support", fixture_marker = marker, "fixture event");
         })
         .join()
         .expect("spawned tracing task should finish");
@@ -805,7 +806,9 @@ mod tests {
                 .clone(),
         )
         .expect("captured tracing output should be UTF-8");
-        assert!(output.contains("fixture event"));
-        assert!(output.contains("fixture_marker=\"spawned\""));
+        assert!(
+            output.contains(marker),
+            "the spawned task's marker must reach the process-global capture buffer"
+        );
     }
 }

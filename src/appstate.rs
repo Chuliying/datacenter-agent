@@ -25,7 +25,7 @@ use async_openai::types::chat::ChatCompletionTool;
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use crate::config::{AppConfig, AuthzConfig, IdentityConfig, ReportGrants};
+use crate::config::{AppConfig, AuthzConfig, IdentityConfig, ReportGrants, ResolvedIdentityConfig};
 use crate::mcp_client::McpHandle;
 use crate::model::{GenerationConfig, History};
 use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
@@ -81,21 +81,30 @@ pub(crate) fn require_rate_limit_for_identity(
     Ok(())
 }
 
-fn resolve_identity_config(config: &IdentityConfig) -> Result<IdentityConfig> {
-    match std::env::var("FALCON_API_BASE_URL") {
+/// Resolve the Falcon base URL: `FALCON_API_BASE_URL` env wins, else `[identity].base_url` from
+/// config, else boot fails. There is no checked-in default host (finding #1) — a forgotten
+/// override must stop the service, never silently point production tokens at the wrong Falcon.
+fn resolve_identity_config(config: &IdentityConfig) -> Result<ResolvedIdentityConfig> {
+    let base_url = match std::env::var("FALCON_API_BASE_URL") {
         Ok(value) if value.trim().is_empty() => {
             anyhow::bail!("env_error: FALCON_API_BASE_URL is empty")
         }
-        Ok(value) => {
-            let mut resolved = config.clone();
-            resolved.base_url = value;
-            Ok(resolved)
-        }
-        Err(VarError::NotPresent) => Ok(config.clone()),
+        Ok(value) => value,
         Err(VarError::NotUnicode(_)) => {
             anyhow::bail!("env_error: FALCON_API_BASE_URL is not valid UTF-8")
         }
-    }
+        Err(VarError::NotPresent) => config.base_url.clone().filter(|v| !v.trim().is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "config_error: Falcon base URL is required — set FALCON_API_BASE_URL or                  [identity].base_url; there is no default host so production tokens are never                  sent to an unintended Falcon"
+            )
+        })?,
+    };
+    Ok(ResolvedIdentityConfig {
+        base_url,
+        positive_ttl_ms: config.positive_ttl_ms,
+        negative_ttl_ms: config.negative_ttl_ms,
+        request_timeout_ms: config.request_timeout_ms,
+    })
 }
 
 /// LLM defaults sourced from the environment at startup.

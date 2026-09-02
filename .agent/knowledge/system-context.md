@@ -20,19 +20,22 @@ main / AppState
   └─ optional AppRuntime (built only when runtime routing is active)
 
 axum Router
-  ├─ all five routes require bearer; standard family fails 418, /v1 family fails 401
+  ├─ all six routes require bearer; standard family fails 418, /v1 family fails 401
   ├─ trace + very-permissive CORS + compression
   ├─ 120s handler-future timeout + security headers + 64KiB body limit
-  ├─ opt-in process-local global burst limiter on the two expensive routes,
-  │    inside each family's bearer layer (default off)
+  ├─ identity layer on the two prompt routes: X-Falcon-Authorization -> Falcon permissions ->
+  │    actor_key; unconditional (no flag). Global burst limiter is boot-mandatory when it is on.
+  │    Inner per-actor limiter keyed by actor_key sits after identity.
   ├─ /health, /ready, /greeting
   ├─ /agent/stream (SSE) — runtime-routed
   │    ├─ plan_stream_turn prelude (audit/guardrails/intent/answer-policy/memory),
   │    │    then the handler drives the sub-agent pipeline itself (no-op AgentPort)
   │    └─ requires runtime; 503 when RUNTIME_ENABLED=false
+  ├─ /ss-chat/stream (SSE) — 星星電力 (SS) front door, same pipeline over ss_* tools, intent
+  │    filtering off; shares the identity layer + per-actor limiter with /agent/stream
   └─ /v1/chat/completions (buffered, OpenAI-compatible) — also runtime-routed
-       └─ maps OpenAI messages onto AgentRequest, folds prior turns into the prompt
-            before the prelude, then drives the same pipeline
+       └─ maps OpenAI messages onto AgentRequest, single-turn (prior turns discarded, no
+            fold) under the identity layer, then drives the same pipeline
 ```
 
 The runtime is partial, not a completed config-only platform. Current wiring and maturity are maintained in the [reference root](../../docs/reference/index.md#8-runtime-成熟度總覽).
@@ -46,7 +49,7 @@ The runtime is partial, not a completed config-only platform. Current wiring and
 | MCP | rmcp 0.17.0 HTTP client |
 | LLM | async-openai 0.40.3 / OpenRouter |
 | HTTP client | reqwest 0.13.4 |
-| Middleware | tower / tower-http: trace, CORS, compression, timeout, headers, body limit; plus an **opt-in process-local global burst limiter** (`governor`) on `/agent/stream` and `/v1/chat/completions`, default off |
+| Middleware | tower / tower-http: trace, CORS, compression, timeout, headers, body limit; an **identity layer** (Falcon token → permissions → actor_key) on the prompt routes; a **two-layer `governor` limiter** (global + per-actor), boot-mandatory when the identity layer is on |
 | Config | TOML + dotenvy |
 | Logging | tracing / tracing-subscriber |
 

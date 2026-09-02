@@ -216,7 +216,14 @@ impl AuthzConfig {
 pub struct IdentityConfig {
     /// Base URL of the Falcon API, e.g. `https://falcon.example.com`. The runtime only
     /// ever appends `/api/auth/me/permissions` to it.
-    pub base_url: String,
+    ///
+    /// Deliberately **optional and without a checked-in default**: a shipped default would let a
+    /// deployment that forgets `FALCON_API_BASE_URL` silently verify production users' tokens
+    /// against whatever host the repo happened to carry. It must be supplied by config here or by
+    /// the `FALCON_API_BASE_URL` env var; absence is a boot failure (finding #1), the same
+    /// treatment a missing pepper gets.
+    #[serde(default)]
+    pub base_url: Option<String>,
     /// How long a successful permission lookup is reused, in milliseconds. Also the upper
     /// bound on how long a Falcon-side permission revocation takes to take effect.
     pub positive_ttl_ms: std::num::NonZeroU64,
@@ -224,6 +231,20 @@ pub struct IdentityConfig {
     /// amplification from a consumer stuck resending one dead token.
     pub negative_ttl_ms: std::num::NonZeroU64,
     /// Per-request timeout for the permissions call, in milliseconds.
+    pub request_timeout_ms: std::num::NonZeroU64,
+}
+
+/// `IdentityConfig` after boot resolution: `base_url` is guaranteed present (env or config,
+/// else boot already failed), so nothing downstream has to handle its absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentityConfig {
+    /// Resolved Falcon API base URL.
+    pub base_url: String,
+    /// See [`IdentityConfig::positive_ttl_ms`].
+    pub positive_ttl_ms: std::num::NonZeroU64,
+    /// See [`IdentityConfig::negative_ttl_ms`].
+    pub negative_ttl_ms: std::num::NonZeroU64,
+    /// See [`IdentityConfig::request_timeout_ms`].
     pub request_timeout_ms: std::num::NonZeroU64,
 }
 
@@ -884,7 +905,10 @@ request_timeout_ms = 5000
         let identity = manifest
             .identity
             .expect("inline manifest declares the section");
-        assert_eq!(identity.base_url, "https://falcon.example.com");
+        assert_eq!(
+            identity.base_url.as_deref(),
+            Some("https://falcon.example.com")
+        );
         assert_eq!(identity.positive_ttl_ms.get(), 60_000);
         assert_eq!(identity.negative_ttl_ms.get(), 10_000);
         assert_eq!(identity.request_timeout_ms.get(), 5_000);
@@ -918,7 +942,8 @@ request_timeout_ms = 5000
             .identity
             .expect("config/config.toml must declare an [identity] section");
 
-        assert!(!identity.base_url.is_empty());
+        // No checked-in default (finding #1): base_url comes from FALCON_API_BASE_URL at boot.
+        assert_eq!(identity.base_url, None);
         assert_eq!(identity.positive_ttl_ms.get(), 60_000);
         assert_eq!(identity.negative_ttl_ms.get(), 10_000);
         assert_eq!(identity.request_timeout_ms.get(), 5_000);
