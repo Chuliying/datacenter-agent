@@ -995,6 +995,80 @@ mod tests {
         (outcome, calls)
     }
 
+    /// Build a stored turn with just the fields the replay filter reads; the rest are filler.
+    fn memory_turn(ss_pipeline: bool, intent: &str) -> SessionMemoryTurn {
+        SessionMemoryTurn {
+            turn_id: "t1".into(),
+            user_summary: "q".into(),
+            answer_summary: "a".into(),
+            intent: Some(intent.to_string()),
+            report_pipeline: false,
+            ss_pipeline,
+            metric: None,
+            asset: None,
+            time_range_label: None,
+            option_id: None,
+            created_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn memory_replay_is_route_family_scoped_between_ev_and_ss() {
+        // The guard `turn.ss_pipeline != deps.ss_route` is mutation-survivable without a test that
+        // exercises the EV→SS direction: SS→EV stays blocked by the unknown-intent rule, so only
+        // this asserts an EV-tagged turn is dropped on the SS route (else startrade-power material
+        // would replay under starcharger branding). The identity carries a startrade-power code so
+        // the SS gate itself *would* allow — meaning deleting the guard flips the EV assertion.
+        let cfg = runtime_config();
+        let authz = AppConfig::load("config/config.toml")
+            .expect("app config should load")
+            .authz
+            .expect("shipped authz config should load");
+        let pipeline = InputPipeline::default();
+        let policy = RuleAnswerPolicy::new(&cfg.thresholds.confidence);
+        let agent = FakeAgentPort {
+            frames: vec![],
+            calls: Arc::new(Mutex::new(0)),
+            last_input: Arc::new(Mutex::new(None)),
+        };
+        let audit_sink = Arc::new(CapturingAuditSink::default());
+        let audit = AuditWriter::new(audit_sink, AuditFailurePolicy::FailClosed);
+        let advertised = vec!["business_metrics".to_string()];
+        let ss_grant = vec!["ss_sunshine_hours".to_string()];
+        let id = identity(123, &["hdrenewables/elecsvc/startrade-power/finance"]);
+
+        let ss_deps = AgentTurnDeps {
+            runtime_config: &cfg,
+            input_pipeline: &pipeline,
+            answer_policy: &policy,
+            llm_normalizer: None,
+            sessions: None,
+            agent: &agent,
+            audit: &audit,
+            emit: &|_event| {},
+            authz: Some(&authz),
+            advertised_tools: &advertised,
+            insight_grant: &[],
+            ss_grant: &ss_grant,
+            ss_route: true,
+            report_grant: &[],
+        };
+
+        // EV-tagged turn on the SS route: dropped by the family guard, even though the SS gate
+        // would otherwise authorize this identity. Deleting the guard makes this assertion fail.
+        let ev_turn = memory_turn(false, "revenue");
+        assert!(
+            !memory_turn_is_allowed(&ev_turn, Some(&id), &ss_deps),
+            "an EV turn must not replay on the SS route"
+        );
+        // SS-tagged turn on the SS route: passes the guard and the SS gate.
+        let ss_turn = memory_turn(true, "unknown");
+        assert!(
+            memory_turn_is_allowed(&ss_turn, Some(&id), &ss_deps),
+            "an SS turn should replay on the SS route when the SS gate allows"
+        );
+    }
+
     fn identity(user_id: i64, permission_codes: &[&str]) -> IdentityContext {
         IdentityContext {
             actor_key: ActorKey::derive(user_id, b"0123456789abcdef0123456789abcdef")

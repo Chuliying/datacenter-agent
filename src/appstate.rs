@@ -85,26 +85,41 @@ pub(crate) fn require_rate_limit_for_identity(
 /// config, else boot fails. There is no checked-in default host (finding #1) — a forgotten
 /// override must stop the service, never silently point production tokens at the wrong Falcon.
 fn resolve_identity_config(config: &IdentityConfig) -> Result<ResolvedIdentityConfig> {
-    let base_url = match std::env::var("FALCON_API_BASE_URL") {
-        Ok(value) if value.trim().is_empty() => {
-            anyhow::bail!("env_error: FALCON_API_BASE_URL is empty")
-        }
-        Ok(value) => value,
+    let env = match std::env::var("FALCON_API_BASE_URL") {
+        Ok(value) => Some(value),
         Err(VarError::NotUnicode(_)) => {
             anyhow::bail!("env_error: FALCON_API_BASE_URL is not valid UTF-8")
         }
-        Err(VarError::NotPresent) => config.base_url.clone().filter(|v| !v.trim().is_empty()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "config_error: Falcon base URL is required — set FALCON_API_BASE_URL or                  [identity].base_url; there is no default host so production tokens are never                  sent to an unintended Falcon"
-            )
-        })?,
+        Err(VarError::NotPresent) => None,
     };
+    let base_url = resolve_identity_base_url(env.as_deref(), config.base_url.as_deref())?;
     Ok(ResolvedIdentityConfig {
         base_url,
         positive_ttl_ms: config.positive_ttl_ms,
         negative_ttl_ms: config.negative_ttl_ms,
         request_timeout_ms: config.request_timeout_ms,
     })
+}
+
+/// Pure resolution seam for the Falcon base URL, split out so the precedence can be unit-tested
+/// without touching the process environment: the env override wins, else `[identity].base_url`,
+/// else boot fails. A set-but-empty env override is a deliberate mistake (error), while an empty
+/// config value is treated as absent (falls through). There is no checked-in default host — a
+/// forgotten override must stop the service, never silently point production tokens at the wrong
+/// Falcon.
+fn resolve_identity_base_url(env: Option<&str>, config: Option<&str>) -> Result<String> {
+    if let Some(value) = env {
+        if value.trim().is_empty() {
+            anyhow::bail!("env_error: FALCON_API_BASE_URL is empty");
+        }
+        return Ok(value.to_string());
+    }
+    match config {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => anyhow::bail!(
+            "config_error: Falcon base URL is required — set FALCON_API_BASE_URL or [identity].base_url; there is no default host, so production tokens are never sent to an unintended Falcon"
+        ),
+    }
 }
 
 /// LLM defaults sourced from the environment at startup.
@@ -610,6 +625,40 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn resolve_identity_base_url_prefers_env_then_config_then_fails() {
+        // Env override wins over config.
+        assert_eq!(
+            resolve_identity_base_url(Some("https://env.example"), Some("https://config.example"))
+                .expect("env should resolve"),
+            "https://env.example"
+        );
+        // Env absent: config is used.
+        assert_eq!(
+            resolve_identity_base_url(None, Some("https://config.example"))
+                .expect("config should resolve"),
+            "https://config.example"
+        );
+        // Both absent: boot fails, and the message points at both knobs.
+        let err = resolve_identity_base_url(None, None)
+            .expect_err("a missing base URL must stop the boot");
+        assert!(
+            err.to_string().contains("FALCON_API_BASE_URL")
+                && err.to_string().contains("[identity].base_url"),
+            "the error must name both override knobs, got: {err}"
+        );
+        // A set-but-empty env override is a deliberate mistake, not a fallback to config.
+        let err = resolve_identity_base_url(Some("   "), Some("https://config.example"))
+            .expect_err("an empty env override must stop the boot");
+        assert!(
+            err.to_string().contains("empty"),
+            "the empty-env error must say so, got: {err}"
+        );
+        // An empty config value is treated as absent, so both-absent still fails (no default host).
+        resolve_identity_base_url(None, Some("  "))
+            .expect_err("an empty config value must not resolve to a host");
+    }
 
     #[test]
     fn runtime_enabled_env_defaults_on_with_explicit_rollback() {
