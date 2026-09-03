@@ -116,6 +116,9 @@ fn prompt_bank() -> PromptBank {
         charter_system: String::new(),
         report_analyst_system: String::new(),
         report_composer_system: String::new(),
+        ss_fetcher_system: String::new(),
+        ss_analyst_system: String::new(),
+        ss_charter_system: String::new(),
     }
 }
 
@@ -141,6 +144,7 @@ pub(crate) async fn app_state() -> (AppState, StubMcpSession) {
         greetings: Arc::new(Mutex::new(Vec::new())),
         runtime: None,
         insight_grants: InsightGrants::default(),
+        ss_chat_grants: crate::config::SsChatGrants::default(),
         report_template: Arc::new(String::new()),
         rate_limit: crate::config::RateLimitConfig::default(),
     };

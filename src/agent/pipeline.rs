@@ -146,6 +146,18 @@ pub fn agent_pipeline_id() -> PipelineId {
     PipelineId("agent".into())
 }
 
+/// The pipeline id that selects the `/ss-chat` pipeline in the
+/// [`Orchestrator`](crate::agent::engine::Orchestrator).
+///
+/// Structurally identical to [`agent_pipeline_id`]'s insight pipeline (`fetcher → analyst →
+/// charter → finalizer`, same stage ids); only the stage prompts and the fetcher's tool grant
+/// differ (星星電力 investor-platform tools instead of the EV-charging ones). It gets its own id
+/// so an [`Orchestrator`](crate::agent::engine::Orchestrator) could hold both at once, and so
+/// stage traces name the pipeline that actually ran.
+pub fn ss_chat_pipeline_id() -> PipelineId {
+    PipelineId("ss-chat".into())
+}
+
 // ===========================================================================
 // Report stage configs — the `/report` pipeline's LLM-driven stages
 // ===========================================================================
@@ -956,5 +968,14 @@ mod tests {
             }
             other => panic!("expected Final, got {:?}", other.kind()),
         }
+    }
+
+    #[test]
+    fn the_two_chat_pipelines_have_distinct_ids() {
+        // `/ss-chat` reuses the insight pipeline's stage ids (`fetcher`/`analyst`/`charter`/
+        // `finalizer`) but must register under its own pipeline id, so one `Orchestrator` could
+        // hold both and a stage trace names the pipeline that actually ran.
+        assert_ne!(ss_chat_pipeline_id(), agent_pipeline_id());
+        assert_eq!(ss_chat_pipeline_id().0, "ss-chat");
     }
 }

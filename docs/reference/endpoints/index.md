@@ -5,9 +5,9 @@
 
 ## 路由表
 
-Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth layer。**共 5 條。**
+Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth layer。**共 6 條。**
 
-### Standard group（4 條，120 s timeout，`require_bearer` → 418）
+### Standard group（5 條，120 s timeout，`require_bearer` → 418）
 
 | Method | Path | Handler | Runtime prelude | Detail |
 |---|---|---|---|---|
@@ -15,6 +15,7 @@ Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth
 | GET | `/ready` | `ready` | — | [ready](./ready.md) |
 | GET | `/greeting` | `greeting` | — | [greeting](./greeting.md) |
 | POST | `/agent/stream` | `agent_stream` | ✅ | [agent-stream](./agent-stream.md) |
+| POST | `/ss-chat/stream` | `ss_chat_stream` | ✅（answer policy 覆寫） | [ss-chat-stream](./ss-chat-stream.md) |
 
 ### OpenAI group（1 條，600 s timeout，`require_bearer_openai` → 401）
 
@@ -48,7 +49,7 @@ token 有效性；它不服務任何真實端點。）
 
 | Group | Middleware | 失敗 status | 失敗 body |
 |---|---|---|---|
-| Standard（4 條） | `require_bearer` | `418 I'm a teapot` | 專案 JSON error body |
+| Standard（5 條） | `require_bearer` | `418 I'm a teapot` | 專案 JSON error body |
 | `/v1/chat/completions` | `require_bearer_openai` | `401 Unauthorized` | OpenAI error envelope `{"error":{"message","type"}}` |
 
 `/v1` 走 401 是為了讓 agentgateway 這類 OpenAI-compatible client 能正確辨識認證失敗；
@@ -87,20 +88,26 @@ timeout 砍掉。
 兩個 group 各自帶 timeout 而非共用，是因為 `merge` 會保留各 sub-router 自己的 layer；
 `route.rs` 有 `per_group_timeout_layers_survive_a_merge` test 固定這個行為。
 
-## 兩條 agent 執行路徑
+## 三條 agent 執行路徑
 
-兩者都經過 runtime prelude（`plan_stream_turn`：guardrails → intent → answer policy → memory
-→ audit），差別只在對外形狀與 pipeline 選擇方式：
+三者都經過 runtime prelude（`plan_stream_turn`：guardrails → intent → answer policy → memory
+→ audit），差別在對外形狀、pipeline 選擇方式，以及 answer policy：
 
 | 路徑 | 端點 | Pipeline 選擇 | 對外形狀 |
 |---|---|---|---|
-| 原生串流 | `/agent/stream` | 依 resolved intent 路由（`wants_report_pipeline`） | 專案 SSE frame（含 `stage` / `usage` / `intent.resolved`） |
-| OpenAI 相容 | `/v1/chat/completions` | 同上 | `chat.completion` 或偽串流 `chat.completion.chunk` |
+| 原生串流（EOMC） | `/agent/stream` | 依 resolved intent 路由（`wants_report_pipeline`） | 專案 SSE frame（含 `stage` / `usage` / `intent.resolved`） |
+| 原生串流（星星電力） | `/ss-chat/stream` | 固定 SS chat pipeline，不做 intent routing | 同上（同一段 `run_chat_stream`） |
+| OpenAI 相容 | `/v1/chat/completions` | 同 `/agent/stream` | `chat.completion` 或偽串流 `chat.completion.chunk` |
+
+`/ss-chat/stream` 是唯一覆寫 answer policy 的端點：它用 `AlwaysAnswerPolicy` 取代配置的
+`RuleAnswerPolicy`，因為 runtime 的 intent pack 是 EV 充電領域的，SS 問題會被當成 `off_scope`
+拒答。prompt injection 拒答仍然保留，prelude 其餘部分不變。詳見
+[ss-chat-stream](./ss-chat-stream.md#與-agentstream-的兩點差異)。
 
 > 過去存在第三類「直接驅動 pipeline、繞過 runtime」的端點（`/insight`、`/report` 系列），
 > 已於本次退役。**現在所有接受 user prompt 的端點都經過 prelude**，不存在無防護入口。
 
-兩者都需要 runtime 啟用（`RUNTIME_ENABLED`，預設 on）；rollback 時回 `503`。
+三者都需要 runtime 啟用（`RUNTIME_ENABLED`，預設 on）；rollback 時回 `503`。
 `RUNTIME_ENABLED=false` 下只有 `/health`、`/ready`、`/greeting` 可用——該 flag 已不具備
 「切換到無 runtime 的替代路徑」的意義，存廢見 work item 的 FU-003。
 
@@ -124,7 +131,7 @@ Target policy 與決策狀態見 [PRD FR-011](../prd.md)。
 2026-08-19 起 `src/test_support.rs` 提供 Router 層 fixture（記憶體內 stub MCP server，`AppState`
 不再需要 live 連線），已用它固定「未命中路徑一律 404 且不因 Authorization 而異」。仍未固定：
 
-- 4 條 standard route 的 auth scope、418 body/header，以及 `/v1` 的 401 envelope。
+- 5 條 standard route 的 auth scope、418 body/header，以及 `/v1` 的 401 envelope。
 - malformed/missing JSON 與 >64 KiB status。
 - timeout 與 SSE body lifetime（120 s / 600 s 兩組）。
 - CORS allowlist/credential behavior。

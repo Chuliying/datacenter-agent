@@ -131,6 +131,12 @@ pub struct PromptBank {
     pub report_analyst_system: String,
     /// `/report` pipeline — the composer stage's system prompt (maps data into `emit_report`).
     pub report_composer_system: String,
+    /// `/ss-chat` pipeline — the 星星電力 data-fetch stage's system prompt (the six `ss_*` tools).
+    pub ss_fetcher_system: String,
+    /// `/ss-chat` pipeline — the analyst stage's system prompt (writes the management answer).
+    pub ss_analyst_system: String,
+    /// `/ss-chat` pipeline — the charter stage's system prompt (decides 0–2 charts).
+    pub ss_charter_system: String,
 }
 
 impl PromptBank {
@@ -140,7 +146,9 @@ impl PromptBank {
     ///
     /// Returns `Err` if any required prompt id — `agent_system`, the `greeting_*` ids, or the
     /// `/insight` + `/report` stage prompts (`fetcher_system`, `analyst_system`, `charter_system`,
-    /// `report_analyst_system`, `report_composer_system`) — is missing from the loaded config.
+    /// `report_analyst_system`, `report_composer_system`), or the `/ss-chat` stage prompts
+    /// (`ss_fetcher_system`, `ss_analyst_system`, `ss_charter_system`) — is missing from the
+    /// loaded config.
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
@@ -152,6 +160,9 @@ impl PromptBank {
             charter_system: cfg.get_prompt_by_id("charter_system")?.to_string(),
             report_analyst_system: cfg.get_prompt_by_id("report_analyst_system")?.to_string(),
             report_composer_system: cfg.get_prompt_by_id("report_composer_system")?.to_string(),
+            ss_fetcher_system: cfg.get_prompt_by_id("ss_fetcher_system")?.to_string(),
+            ss_analyst_system: cfg.get_prompt_by_id("ss_analyst_system")?.to_string(),
+            ss_charter_system: cfg.get_prompt_by_id("ss_charter_system")?.to_string(),
         })
     }
 }
@@ -194,6 +205,10 @@ pub struct AppState {
     /// Resolved insight-pipeline tool grants (from `[insight.grants]`), validated against the
     /// discovered MCP tool set at boot.
     pub insight_grants: crate::config::InsightGrants,
+    /// Resolved `/ss-chat` pipeline tool grants (from `[ss_chat.grants]`), validated against the
+    /// discovered MCP tool set at boot. Explicit `ss_*` names, not the `["*"]` wildcard — the same
+    /// server also advertises the EV-charging tools.
+    pub ss_chat_grants: crate::config::SsChatGrants,
     /// The `/report` HTML template body (from `[report].template`), shared read-only. Its
     /// `__REPORT_DATA_JSON__` placeholder is validated present at boot; the `renderer` fills it.
     pub report_template: Arc<String>,
@@ -248,6 +263,15 @@ impl AppState {
         )
         .context("validate /insight tool grants")?;
 
+        // The same fail-fast for the /ss-chat grants: a typo, or an `ss_*` tool this MCP server
+        // build does not advertise, aborts startup rather than failing the first SS request.
+        crate::agent::wiring::validate_ss_chat_grants(
+            &tools,
+            &app_config.ss_chat_grants.fetcher,
+            &app_config.ss_chat_grants.charter,
+        )
+        .context("validate /ss-chat tool grants")?;
+
         // Fail fast at boot if the /report template can never be filled — a template without the
         // data placeholder would render an empty report on every request.
         if !app_config
@@ -271,6 +295,7 @@ impl AppState {
             greetings: Arc::new(Mutex::new(Vec::new())),
             runtime,
             insight_grants: app_config.insight_grants.clone(),
+            ss_chat_grants: app_config.ss_chat_grants.clone(),
             report_template: Arc::new(app_config.report_template.clone()),
             rate_limit: app_config.rate_limit.clone(),
         })
