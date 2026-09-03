@@ -10,10 +10,11 @@ greeting 背景任務。是 runtime 核心與 sub-agent 層對外的唯一接觸
 
 ## 結構
 
-子檔案分工見 [`src/server/mod.rs`](../../../src/server/mod.rs) 的 `//!`（route／handler／openai／dto／auth／error／greeting 七個子模組）。本頁只記 doc comment 沒說的部分：
+子檔案分工見 [`src/server/mod.rs`](../../../src/server/mod.rs) 的 `//!`（route／handler／openai／dto／auth／error／greeting，加上身份與授權新增的 actor／authz／codes／falcon／identity，共十二個子模組）。本頁只記 doc comment 沒說的部分：
 
 - `dto.rs` 的 `AgentResponse` 隨非串流端點退役一併**移除**（0.4.0 breaking）。
 - <a id="auth"></a><a id="greeting"></a>greeting 由開機背景 task 跑兩階段 pipeline（fetcher → analyst）填 `AppState::greetings`。
+- <a id="identity"></a>身份與授權的四個新模組：`falcon.rs`（permissions client 與正/負向 cache）、`identity.rs`（middleware）、`actor.rs`（pepper HMAC 假名）、`authz.rs`（三方交集判定）；`codes.rs` 是三種信封共用的穩定 `code` 常數。
 
 ## 兩條 agent 執行路徑
 
@@ -30,7 +31,7 @@ greeting 背景任務。是 runtime 核心與 sub-agent 層對外的唯一接觸
 handler 層的 `validate_prompt` 與 `USER_PROMPT_LENGTH_CAP`。
 
 共用 helper：`insight_frames`（`AgentEvent` → `StreamFrame`）、`wants_report_pipeline`、
-`status_to_app_error`、`fold_history_into_prompt`、`with_prefix`、`UnusedAgentPort`、
+`status_to_app_error`、`with_prefix`、`UnusedAgentPort`、
 `INSIGHT_STREAM_BUFFER`。
 
 > 命名註記：`insight_frames` 與 `INSIGHT_STREAM_BUFFER` 保留了 `insight` 字樣，
@@ -42,13 +43,23 @@ handler 層的 `validate_prompt` 與 `USER_PROMPT_LENGTH_CAP`。
 
 | Middleware | 套用範圍 | 失敗 status | 失敗 body |
 |---|---|---|---|
-| `require_bearer` | standard sub-router（4 條，含 `/health`、`/ready`） | `418 I'm a teapot` | 茶壺訊息 |
-| `require_bearer_openai` | `/v1/chat/completions` | `401 Unauthorized` | OpenAI envelope `{"error":{"message","type"}}` |
+| `require_bearer` | standard sub-router（4 條，含 `/health`、`/ready`） | `418 I'm a teapot` | 茶壺訊息 + `auth.service_token_invalid` |
+| `require_bearer_openai` | `/v1/chat/completions` | `401 Unauthorized` | OpenAI envelope `{"error":{"message","type","code"}}` |
 
 `/v1` 走 401 是為了讓 agentgateway 這類 OpenAI-compatible client 正確辨識認證失敗；
-其餘 4 條維持既有 418 契約。
+其餘 standard routes 維持既有 418 契約。
 
 共通：scheme 名稱大小寫不敏感（RFC 6750）、token 用 `constant_time_eq` 比對（防 timing attack）。
+兩條 prompt route 另需 `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`；身份 middleware
+位於 service bearer／global limiter 之後、per-actor limiter 之前，並回傳
+`identity.header_missing`、`identity.token_refreshable` / `identity.token_terminal`、
+`identity.upstream_unavailable`（503）或 `identity.upstream_conflict`（500，上游回 400
+`auth.conflicting_credentials`：這是 runtime 自己的請求建構錯誤，會告警且不進負向 cache）。
+permissions endpoint 未承諾的 upstream `error_code` 只作為 runtime 內部判定輸入，不轉送給消費端；非 `POST` 直通 method
+router，以保留既有 405。
+
+對 Falcon 的外呼固定 `redirect::Policy::none()`：reqwest 預設會跟隨轉址，而同 origin 的跳轉會保留
+`Authorization`，等於把使用者 token 送到未經審查的 URL。3xx 因此歸為 `identity.upstream_unavailable`。
 
 auth layer 套在**各自的 sub-router** 上，scope 明確。但在 `merge` 之後於外層新增 route 會
 **同時繞過兩個 auth layer**——新增端點必須有 Router-level auth test。

@@ -16,7 +16,8 @@ LLM against live data with the power of MCP server.
 - `/ss-chat/stream`: SSE stream — the same four-stage chat pipeline over the 星星電力 investor-platform
   (`ss_*`) tools, with its own stage prompts and tool grant. Same request/frame contract as
   `/agent/stream`; intent filtering is off (the intent pack is EV-charging-specific), prompt-injection
-  refusal and the rest of the prelude are unchanged. See
+  refusal, audit and prompt caps are unchanged; session memory is written with a per-pipeline
+  tag so multi-turn context survives the identity slice's replay filter. See
   [ss-chat-stream](docs/reference/endpoints/ss-chat-stream.md).
 - `/v1/chat/completions`: OpenAI-compatible (agentgateway Path C), streaming and non-streaming.
 - `/greeting`: a random pre-generated, data-aware welcome message

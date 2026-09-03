@@ -41,7 +41,13 @@
 - **async-openai 版本**：`llm.rs` 刻意鎖 **0.40**。contract 的參考 adapter 釘 0.41.1，
   但本 crate 與 production 迴圈都在 0.40，避免為此做 crate-wide bump。
 - **tool grant 來自 config，不是 code**：`config/config.toml` 的 `[insight.grants]`；
-  report pipeline 重用同一份 `fetcher` grant；改 grant 不需重新編譯。
+  report pipeline 有自己的上界 `[report.grants].fetcher`（兩者目前都是同樣六個 tool，
+  但分開宣告：report 閘是部分授權例外，其餘 intent 是嚴格判定，兩邊必須能各自調整）；
+  改 grant 不需重新編譯。
+- **兩張表必須合得起來**：`[insight.grants].fetcher` 是上界，`[authz.intent_tools]` 是每個
+  intent 的必要 tool。嚴格 intent 少一個 tool 不是收窄而是**對所有使用者的永久拒答**，且外顯成
+  「權限不足」。`AuthzConfig::validate_intent_reachability`（AppState 組裝時）因此讓這種漂移
+  開機即失敗，`report` 除外——它是部分授權例外，缺 tool 只會降級。
 - **報告模板固定**：chart / big-number 標題寫死在模板，動態化見上游
   [issue #8](https://github.com/h-alice/datacenter-agent/issues/8)。
 

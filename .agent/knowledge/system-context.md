@@ -20,16 +20,22 @@ main / AppState
   └─ optional AppRuntime (built only when runtime routing is active)
 
 axum Router
-  ├─ all eight routes require bearer; failure is 418
+  ├─ all six routes require bearer; standard family fails 418, /v1 family fails 401
   ├─ trace + very-permissive CORS + compression
   ├─ 120s handler-future timeout + security headers + 64KiB body limit
+  ├─ identity layer on the two prompt routes: X-Falcon-Authorization -> Falcon permissions ->
+  │    actor_key; unconditional (no flag). Global burst limiter is boot-mandatory when it is on.
+  │    Inner per-actor limiter keyed by actor_key sits after identity.
   ├─ /health, /ready, /greeting
-  ├─ /insight + /report (buffered) and /insight/stream + /report/stream (SSE)
-  │    └─ drive build_{insight,report}_pipeline directly, bypassing the runtime
-  └─ /agent/stream (SSE) — the only runtime-routed production path
-       ├─ plan_stream_turn prelude (audit/guardrails/intent/answer-policy/memory),
-       │    then the handler drives the sub-agent pipeline itself (no-op AgentPort)
-       └─ requires runtime; 503 when RUNTIME_ENABLED=false (use /insight|/report stream)
+  ├─ /agent/stream (SSE) — runtime-routed
+  │    ├─ plan_stream_turn prelude (audit/guardrails/intent/answer-policy/memory),
+  │    │    then the handler drives the sub-agent pipeline itself (no-op AgentPort)
+  │    └─ requires runtime; 503 when RUNTIME_ENABLED=false
+  ├─ /ss-chat/stream (SSE) — 星星電力 (SS) front door, same pipeline over ss_* tools, intent
+  │    filtering off; shares the identity layer + per-actor limiter with /agent/stream
+  └─ /v1/chat/completions (buffered, OpenAI-compatible) — also runtime-routed
+       └─ maps OpenAI messages onto AgentRequest, single-turn (prior turns discarded, no
+            fold) under the identity layer, then drives the same pipeline
 ```
 
 The runtime is partial, not a completed config-only platform. Current wiring and maturity are maintained in the [reference root](../../docs/reference/index.md#8-runtime-成熟度總覽).
@@ -43,14 +49,14 @@ The runtime is partial, not a completed config-only platform. Current wiring and
 | MCP | rmcp 0.17.0 HTTP client |
 | LLM | async-openai 0.40.3 / OpenRouter |
 | HTTP client | reqwest 0.13.4 |
-| Middleware | tower / tower-http: trace, CORS, compression, timeout, headers, body limit; **no rate-limit middleware** |
+| Middleware | tower / tower-http: trace, CORS, compression, timeout, headers, body limit; an **identity layer** (Falcon token → permissions → actor_key) on the prompt routes; a **two-layer `governor` limiter** (global + per-actor), boot-mandatory when the identity layer is on |
 | Config | TOML + dotenvy |
 | Logging | tracing / tracing-subscriber |
 
 ## Important current facts
 
-- All eight routes (`/health`, `/ready`, `/greeting`, `/insight`[`/stream`], `/report`[`/stream`], `/agent/stream`) require bearer via `require_bearer`; no path exemption.
-- `/agent/stream` runs the `plan_stream_turn` prelude then drives the sub-agent pipeline itself; the aggregated `run_agent_turn` exists but is not wired to any route (tests only). `/insight` and `/report` bypass the runtime entirely.
+- All five routes (`/health`, `/ready`, `/greeting`, `/agent/stream`, `/v1/chat/completions`) require a bearer token; no path exemption. The standard family uses `require_bearer` (418 on failure); `/v1/chat/completions` uses `require_bearer_openai` (401 + OpenAI error envelope). The `/insight` and `/report` families were retired in 0.4.0.
+- Both prompt entrypoints (`/agent/stream`, `/v1/chat/completions`) run the `plan_stream_turn` prelude then drive the sub-agent pipeline themselves; the aggregated `run_agent_turn` exists but is not wired to any route (tests only). There is no un-guardrailed prompt entrypoint.
 - Legacy prompt cap is 2000 chars; runtime EV-pack cap is 4000.
 - Runtime SSE validates inside a spawned task, so structural errors are HTTP 200 + SSE error frame.
 - `InputPipeline` hard-codes normalize→injection→intent→slots and does not dispatch `input_stages`.

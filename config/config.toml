@@ -28,7 +28,7 @@ version = 1
 #   * greeting_fetcher_system   — greeting pipeline: the data-fetch stage.
 #   * greeting_analyst_system   — greeting pipeline: the C-suite greeting writer (terminal).
 #   * greeting_user             — greeting pipeline: the boot-time request prompt.
-#   * fetcher_system            — /insight + /report pipelines: the shared data-fetch stage.
+#   * fetcher_system            — insight/report pipelines: the shared data-fetch stage.
 #   * analyst_system            — /insight pipeline: the markdown-report analyst.
 #   * charter_system            — /insight pipeline: the chart selector (0–2 charts).
 #   * report_analyst_system     — /report pipeline: the insight-narrative analyst.
@@ -93,16 +93,23 @@ file = "prompt_guide/ss_charter_system.md"
 # ["emit_chart"].
 
 [insight.grants]
-# The datacenter analytics tools the fetcher may call. These are the tools the
-# agent prompts are written around; see config/mcp-config.toml for the server's
-# full endpoint map (it also exposes "bill_member_analysis", omitted here as no
-# prompt references it — add it if you want the fetcher to reach it).
+# The datacenter analytics tools the insight fetcher may call.
+#
+# This list is a *ceiling*, not a per-turn grant: every request narrows it by
+# `boot ∩ permission ∩ intent required` (see [authz] below). So the ceiling must cover
+# every tool any non-report intent requires, or that intent default-denies for every
+# user no matter what Falcon grants them — the strict rule is `omitted_tools.is_empty()`.
+# `bill_member_analysis` was historically excluded here because the pre-RBAC fetcher saw
+# the whole list at once; under per-turn narrowing that exclusion only produced a
+# permanent false deny for `member`, so the ceiling now matches [report.grants].fetcher.
+# `AuthzConfig::validate_intent_reachability` fails boot if this drifts again.
 fetcher = [
     "bill_revenue",
     "bill_charge",
     "member_analysis",
     "business_metrics",
     "station_revenue_ranking",
+    "bill_member_analysis",
 ]
 charter = ["emit_chart"]
 
@@ -144,6 +151,110 @@ charter = ["emit_chart"]
 [report]
 template = "report_template/report.html"
 
+# The report pipeline's own tool ceiling, separate from `[insight.grants].fetcher` on
+# purpose. Reports may use the full six-tool snapshot without widening insight's
+# five-tool grant.
+#
+# It is a ceiling, not a guarantee: per-request narrowing intersects it with the caller's
+# permissions, and a report with only some topics permitted degrades rather than refusing.
+[report.grants]
+fetcher = [
+    "bill_revenue",
+    "station_revenue_ranking",
+    "bill_charge",
+    "business_metrics",
+    "member_analysis",
+    "bill_member_analysis",
+]
+
+
+# ──── Authorization mapping ───
+# The gate is `boot grant ∩ permission grant ∩ intent required tools`, with anything
+# either table fails to cover denied. Intersecting all three is the point: a finance-only
+# user asking a member question still holds a non-empty narrowed set (their finance
+# tools), so a "narrowed set is non-empty" rule would wave them through.
+#
+# CONFIRM-FU-001: every row below was derived from `config/runtime/intents.toml` and the
+# frontend's permission codes, not from an authoritative mapping document. Each row needs
+# an explicit sign-off from the domain owner during PR review. The two rows most open to
+# argument are marked CONFIRM? — `business_metrics` (operations or finance?) and
+# `station_revenue_ranking` (finance or operations?).
+
+[authz]
+# Falcon permission codes any one of which unlocks the SS chat pipeline (/ss-chat/stream).
+# CONFIRM-FU-001: the four startrade-power sub-pages are listed on the same reasoning as the
+# starcharger rows above — the SS tools serve 星星電力 data, and Falcon's permission tree has
+# exactly these sub-pages for that business unit. Whether all four should unlock the full SS
+# tool set (rather than a finer per-sub-page split) needs the domain owner's sign-off at PR
+# review. The parent page alone deliberately unlocks nothing (AC-008's rule).
+ss_chat_permissions = [
+    "hdrenewables/elecsvc/startrade-power/finance",
+    "hdrenewables/elecsvc/startrade-power/opperf",
+    "hdrenewables/elecsvc/startrade-power/engproj",
+    "hdrenewables/elecsvc/startrade-power/bizdev",
+]
+
+# Falcon permission code -> the MCP data tools it unlocks.
+[authz.permission_tools]
+# 財務
+"hdrenewables/elecsvc/starcharger/finance" = ["bill_revenue", "station_revenue_ranking"]  # CONFIRM? station_revenue_ranking
+# 營運績效
+"hdrenewables/elecsvc/starcharger/opperf" = ["bill_charge", "business_metrics"]           # CONFIRM? business_metrics
+# 業務發展
+"hdrenewables/elecsvc/starcharger/bizdev" = ["member_analysis", "bill_member_analysis"]
+# 工程專案 — no MCP endpoint serves engineering-project data yet, so this permission
+# unlocks nothing. Deliberately present rather than omitted: an absent row and an
+# empty row must not be confused.
+"hdrenewables/elecsvc/starcharger/engproj" = []
+
+# Runtime intent -> the tools that intent requires. Must cover the whole
+# `intent_allowlist` in config/runtime/intents.toml; an uncovered intent fails startup.
+[authz.intent_tools]
+# Low confidence or unrecognised: no tools, so it always lands on the refusal branch,
+# matching the existing "don't answer when unsure" behavior.
+unknown = []
+revenue = ["bill_revenue", "station_revenue_ranking"]
+charging = ["bill_charge", "business_metrics"]
+member = ["member_analysis", "bill_member_analysis"]
+# No engineering-project endpoint yet, so this intent always refuses (FU-003).
+site-build = []
+# A full report spans every topic. Its gate is the one exception to the strict rule:
+# a non-empty intersection is enough, and the report degrades to the permitted topics
+# rather than refusing outright.
+report = [
+    "bill_revenue",
+    "station_revenue_ranking",
+    "bill_charge",
+    "business_metrics",
+    "member_analysis",
+    "bill_member_analysis",
+]
+
+
+# ──── Falcon identity ───
+# Where the runtime verifies the end user's Falcon access token, forwarded by the BFF in
+# `X-Falcon-Authorization` (S-RUNTIME-SEC-02 FR-001). The runtime only ever appends
+# `/api/auth/me/permissions` to `base_url`; it holds no external client API key and never
+# calls `/external-login` or `/external-refresh`.
+#
+# There is deliberately NO `enabled` switch: the identity layer is unconditional in this
+# binary. Rollout compatibility comes from the *previous* binary ignoring the unknown
+# header, not from a flag here — a flag would let a default-config deploy silently ship
+# with RBAC off.
+#
+# positive_ttl_ms doubles as the upper bound on how long a Falcon-side permission
+# revocation takes to take effect. negative_ttl_ms bounds the amplification from a
+# consumer stuck resending one dead token; it must not exceed positive_ttl_ms.
+[identity]
+# base_url has NO checked-in default on purpose (finding #1): a shipped default would let a
+# deployment that forgets FALCON_API_BASE_URL silently verify production users' tokens against
+# whatever host the repo carried. Set FALCON_API_BASE_URL in every environment; boot fails if
+# neither the env var nor a base_url here is present.
+# base_url = "https://falcon.example.com"   # or supply via FALCON_API_BASE_URL
+positive_ttl_ms = 60000     # successful lookup reuse window
+negative_ttl_ms = 10000     # failed lookup replay window
+request_timeout_ms = 5000   # per-request timeout for the permissions call
+
 
 # ──── Server ingress policy ───
 # Opt-in process-local global burst limiter for the expensive routes
@@ -157,15 +268,32 @@ template = "report_template/report.html"
 # resets on restart: this is short-window admission control, not a durable
 # quota (see docs/work/runtime-user-session-rate-limit/runbook.md).
 #
-# [server.rate_limit]
-# enabled = true
-# burst_size = 5           # admissions available at once
-# refill_period_ms = 1000  # one admission refills every second
+# Two layers, and their positions are not interchangeable. The outer global bucket stays
+# where it is — after the service bearer gate, BEFORE identity resolution — because it is
+# the only thing bounding traffic whose identity never resolves (a caller cycling distinct
+# invalid tokens finishes at the identity layer and never reaches the inner bucket). The
+# inner per-actor bucket necessarily sits after identity resolution, since it needs the
+# `actor_key`.
+#
+# Enabling the outer layer is a prerequisite, not a preference: with the identity layer
+# present, startup fails if it is disabled (ERR-009), for the same reason a missing pepper
+# fails startup. The inner layer has no `enabled` switch at all — an opt-out would be a
+# bypass of the fail-closed decision.
+[server.rate_limit]
+enabled = true
+burst_size = 20          # whole-service admissions available at once
+refill_period_ms = 250   # one admission refills every 250ms
+
+[server.rate_limit.per_actor]
+burst_size = 5             # per-user admissions available at once
+refill_period_ms = 1000    # one admission refills every second, per user
+max_tracked_actors = 4096  # bucket cardinality bound; least-recently-used is evicted
 
 
 # ──── Runtime capability pack section ───
-# These refs are parsed at boot but not wired into AppState until the
-# runtime route flag work begins.
+# These refs are parsed and wired into AppState at boot. The runtime route is
+# unconditional in the shipped configuration; identity-protected prompt routes
+# fail closed if the runtime cannot be assembled.
 
 [runtime]
 intents = "runtime/intents.toml"

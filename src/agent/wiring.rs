@@ -16,12 +16,12 @@
 //! tools + the environment's LLM defaults + the **config-driven tool grants** into a runnable
 //! [`Orchestrator`].
 //!
-//! This is the **direct** wiring the server handlers use today: it builds the four-stage
-//! `fetcher → analyst → charter → finalizer` pipeline ([`crate::agent::pipeline`]) from live
-//! parts and hands back an [`Orchestrator`] ready to [`run`](Orchestrator::run) (buffered) or
-//! [`run_emitting`](Orchestrator::run_emitting) (streaming). It deliberately **bypasses the
-//! runtime turn** (guardrails / intent / memory / audit) — routing the pipeline *behind* the
-//! runtime `AgentPort` is the plan's §9 step, reserved for after the pipeline is proven by hand.
+//! This is the wiring the server handlers use after the runtime prelude has completed: it builds
+//! the four-stage `fetcher → analyst → charter → finalizer` pipeline
+//! ([`crate::agent::pipeline`]) from live parts and hands back an [`Orchestrator`] ready to
+//! [`run`](Orchestrator::run) (buffered) or [`run_emitting`](Orchestrator::run_emitting)
+//! (streaming). The handlers own the runtime `plan_stream_turn` prelude and pass this module the
+//! already-authorized per-turn data grant.
 //!
 //! **Tool grants come from config, not code** (`[insight.grants]` in `config.toml`, see
 //! [`InsightGrants`](crate::config::InsightGrants)). Each stage's grant is a list of wire names,
@@ -50,7 +50,7 @@
 //! # References
 //!
 //! - Sub-agent plan §4 — the closed/config tool layer (grants resolved at boot, fail-fast)
-//! - Sub-agent plan §9 — the eventual `PipelineAgentPort` behind the runtime (not yet wired)
+//! - Sub-agent plan §9 — the pipeline builders used by the runtime-protected handlers
 //! - Sub-agent plan §10 — the endpoint pipelines (the `/agent` → `/insight` conversion)
 
 use std::collections::{HashMap, HashSet};
@@ -241,7 +241,12 @@ fn build_chat_pipeline(
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
     let mut fetcher_cfg = fetcher_config(fetcher_instruction);
-    fetcher_cfg.instruction = compose_with_mcp(&fetcher_cfg.instruction, mcp_instructions);
+    fetcher_cfg.instruction = compose_fetcher_instruction(
+        &fetcher_cfg.instruction,
+        fetcher_grant,
+        discovered,
+        mcp_instructions,
+    );
 
     // ── the four stages; upstream shapes are Intermediate, the finalizer is the terminal Final ──
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
@@ -294,7 +299,7 @@ fn build_chat_pipeline(
 /// [`report_pipeline_id`].
 ///
 /// A four-stage `fetcher → analyst → composer → renderer` chain. The `fetcher` pulls the datacenter
-/// data (its config grant, shared with `/insight`), the `analyst` writes the executive insight
+/// data using the caller-provided report grant, the `analyst` writes the executive insight
 /// narrative, the `composer` maps the data + narrative into a schema-validated
 /// [`ReportData`](crate::agent::report::ReportData) via its built-in `emit_report` sink, and the
 /// **terminal** pure-logic [`Renderer`] injects that `report.data` into the boot-loaded HTML
@@ -309,8 +314,8 @@ fn build_chat_pipeline(
 /// - `mcp` / `discovered` / `mcp_instructions`: as for [`build_insight_pipeline`].
 /// - `fetcher_instruction` / `analyst_instruction` / `composer_instruction`: the three LLM stages'
 ///   system prompts, resolved at boot from `config.toml`'s `[prompts.*]` section.
-/// - `fetcher_grant`: the datacenter tools the report fetcher may call (shares the `/insight`
-///   fetcher's grant — the same broad snapshot).
+/// - `fetcher_grant`: the datacenter tools the report fetcher may call after the report-specific
+///   boot ceiling and the caller's permission intersection have been applied.
 /// - `resolved`: the fully-resolved LLM every LLM stage runs on.
 /// - `template`: the boot-loaded HTML template the renderer fills (its `__REPORT_DATA_JSON__`
 ///   placeholder is validated present at boot, see [`AppState::new`](crate::appstate::AppState)).
@@ -349,7 +354,12 @@ pub fn build_report_pipeline(
 
     // ── the fetcher instruction, composed with the MCP server's conventions when present ──
     let mut fetcher_cfg = fetcher_config(fetcher_instruction);
-    fetcher_cfg.instruction = compose_with_mcp(&fetcher_cfg.instruction, mcp_instructions);
+    fetcher_cfg.instruction = compose_fetcher_instruction(
+        &fetcher_cfg.instruction,
+        fetcher_grant,
+        discovered,
+        mcp_instructions,
+    );
 
     // ── the four stages; upstream shapes are Intermediate, the renderer is the terminal Final ──
     let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
@@ -421,8 +431,8 @@ pub fn greeting_pipeline_id() -> PipelineId {
 /// # Arguments
 ///
 /// - `mcp` / `discovered` / `mcp_instructions`: as for [`build_insight_pipeline`].
-/// - `fetcher_grant`: the datacenter tools the greeting fetcher may call (shares the `/insight`
-///   fetcher's grant — the same broad snapshot).
+/// - `fetcher_grant`: the datacenter tools the boot-time greeting fetcher may call. Greeting is a
+///   separate boot-time path and is intentionally not identity-scoped by this slice.
 /// - `fetcher_instruction` / `analyst_instruction`: the two greeting stage prompts.
 /// - `resolved`: the fully-resolved LLM both stages run on.
 ///
@@ -451,7 +461,12 @@ pub fn build_greeting_pipeline(
 
     let fetcher_cfg = SubAgentConfig {
         id: SubAgentId("fetcher".into()),
-        instruction: compose_with_mcp(fetcher_instruction, mcp_instructions),
+        instruction: compose_fetcher_instruction(
+            fetcher_instruction,
+            fetcher_grant,
+            discovered,
+            mcp_instructions,
+        ),
         llm: None,
         tools: vec![],
         accepts: vec![PayloadKind::Initial],
@@ -511,6 +526,41 @@ fn compose_with_mcp(instruction: &str, mcp_instructions: Option<&str>) -> String
     }
 }
 
+/// Append the concrete per-pipeline data-tool grant to the fetcher's instruction.
+///
+/// The checked-in prompt deliberately contains no closed list of tool names: `/report` may be
+/// narrowed per request and the same builder is also used by the greeting pipeline. Resolving the
+/// wildcard against the boot-advertised set here keeps the model's instructions aligned with the
+/// tools actually exposed by `build_stage_tools`.
+fn compose_fetcher_instruction(
+    instruction: &str,
+    grant: &[String],
+    discovered: &[ChatCompletionTool],
+    mcp_instructions: Option<&str>,
+) -> String {
+    let advertised = discovered
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    let granted = expand_grant(grant, &advertised);
+    let grant_text = if granted.is_empty() {
+        "No data tools are granted for this turn. Do not make a tool call.".to_string()
+    } else {
+        format!(
+            "For this turn you may call only these granted data tools: {}. For a report request, call every listed tool that is relevant to the requested date range; never call a tool that is not listed.",
+            granted
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    compose_with_mcp(
+        &format!("{instruction}\n\n## Per-turn tool grant\n{grant_text}"),
+        mcp_instructions,
+    )
+}
+
 /// Validates the `/insight` tool grants against the discovered set — the **fail-fast at boot**
 /// check (plan §4/§2.2) so a typo or an unavailable tool aborts startup, not a live request.
 ///
@@ -539,6 +589,24 @@ pub fn validate_ss_chat_grants(
     fetcher_grant: &[String],
     charter_grant: &[String],
 ) -> Result<()> {
+    // The SS fetcher grant must be an explicit list, never the wildcard. Config is
+    // runtime-editable, so a deployed `fetcher = ["*"]` would boot cleanly through the generic
+    // validation — and then, post-authorization, intersect to an **empty** effective grant
+    // (`"*"` matches no advertised name literally), yielding an SS endpoint that answers
+    // ungrounded instead of failing at boot. Reject it here, where every other grant mistake
+    // already fails fast.
+    if fetcher_grant.is_empty() {
+        anyhow::bail!(
+            "config_error: [ss_chat.grants].fetcher must not be empty; an empty grant boots a \
+             fetcher with no tools that answers ungrounded — reject it at boot, like the wildcard"
+        );
+    }
+    if fetcher_grant.iter().any(|name| name == ALL_MCP_TOOLS) {
+        anyhow::bail!(
+            "config_error: [ss_chat.grants].fetcher must list tools explicitly; \
+             the `*` wildcard is not valid for the ss-chat pipeline"
+        );
+    }
     validate_pipeline_grants("ss-chat", discovered, fetcher_grant, charter_grant)
 }
 
@@ -594,7 +662,7 @@ fn build_stage_tools(
 
 /// Expands the `"*"` wildcard into every advertised MCP tool name, passing other names through,
 /// de-duplicated in first-seen order.
-fn expand_grant(grant: &[String], advertised: &[String]) -> Vec<String> {
+pub(crate) fn expand_grant(grant: &[String], advertised: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     grant
         .iter()
@@ -671,6 +739,17 @@ fn tool_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::chat::FunctionObjectArgs;
+
+    fn discovered_tool(name: &str) -> ChatCompletionTool {
+        let function = FunctionObjectArgs::default()
+            .name(name)
+            .description(format!("{name} description"))
+            .parameters(serde_json::json!({"type": "object", "properties": {}}))
+            .build()
+            .expect("test tool schema should build");
+        ChatCompletionTool { function }
+    }
 
     #[test]
     fn tool_schema_fails_fast_when_the_tool_is_absent() {
@@ -726,8 +805,48 @@ mod tests {
             msg.contains("ss_sunshine_hours"),
             "message should name the tool: {msg}"
         );
-        // The charter's built-in sink resolves without the server advertising anything.
-        assert!(validate_ss_chat_grants(&[], &[], &["emit_chart".to_string()]).is_ok());
+        // A fetcher grant naming an advertised tool, with the built-in charter sink, validates.
+        let discovered = vec![discovered_tool("ss_sunshine_hours")];
+        assert!(validate_ss_chat_grants(
+            &discovered,
+            &["ss_sunshine_hours".to_string()],
+            &["emit_chart".to_string()],
+        )
+        .is_ok());
+
+        // The wildcard is rejected outright: a deployed `fetcher = ["*"]` would otherwise boot,
+        // then intersect to an empty effective grant and answer ungrounded.
+        let err = validate_ss_chat_grants(&[], &["*".to_string()], &[])
+            .expect_err("the wildcard must fail SS grant validation");
+        assert!(err.to_string().contains('*'), "got: {err}");
+
+        // An empty fetcher grant is rejected for the same reason as the wildcard: it boots a
+        // fetcher with no tools that answers ungrounded (finding #6).
+        let err = validate_ss_chat_grants(&[], &[], &["emit_chart".to_string()])
+            .expect_err("an empty SS fetcher grant must fail validation");
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn fetcher_instruction_lists_only_the_effective_grant() {
+        let discovered = vec![
+            discovered_tool("bill_revenue"),
+            discovered_tool("member_analysis"),
+        ];
+
+        let narrowed = compose_fetcher_instruction(
+            "base instruction",
+            &["bill_revenue".to_string()],
+            &discovered,
+            None,
+        );
+        assert!(narrowed.contains("`bill_revenue`"));
+        assert!(!narrowed.contains("`member_analysis`"));
+
+        let expanded =
+            compose_fetcher_instruction("base instruction", &["*".to_string()], &discovered, None);
+        assert!(expanded.contains("`bill_revenue`"));
+        assert!(expanded.contains("`member_analysis`"));
     }
 
     #[test]

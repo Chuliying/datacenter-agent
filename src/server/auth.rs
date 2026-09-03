@@ -27,6 +27,7 @@ use axum::Json;
 use constant_time_eq::constant_time_eq;
 use tracing::debug;
 
+use super::codes::AUTH_SERVICE_TOKEN_INVALID;
 use super::error::ErrorBody;
 use super::openai::{OpenAiErrorBody, ERR_INVALID_REQUEST};
 use super::AppState;
@@ -56,7 +57,10 @@ pub async fn require_bearer(State(state): State<AppState>, req: Request, next: N
         // Reject with 418 I'm a teapot and teapot message
         (
             StatusCode::IM_A_TEAPOT,
-            Json(ErrorBody::new(TEAPOT_MESSAGE)),
+            Json(ErrorBody::with_code(
+                AUTH_SERVICE_TOKEN_INVALID,
+                TEAPOT_MESSAGE,
+            )),
         )
             .into_response()
     }
@@ -94,7 +98,8 @@ pub async fn require_bearer_openai(
 fn openai_unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(OpenAiErrorBody::new(
+        Json(OpenAiErrorBody::with_code(
+            AUTH_SERVICE_TOKEN_INVALID,
             ERR_INVALID_REQUEST,
             "missing or invalid bearer token",
         )),
@@ -116,9 +121,11 @@ fn check(state: &AppState, req: &Request) -> bool {
 
     // `Bearer ` is case-insensitive on the scheme name per RFC 6750.
     let Some(token) = raw.strip_prefix("Bearer ").or_else(|| {
-        if raw.len() >= 7 && raw[..6].eq_ignore_ascii_case("Bearer") && raw.as_bytes()[6] == b' ' {
-            // Crop "Bearer " (7 characters) from the raw header value
-            Some(&raw[7..])
+        let bytes = raw.as_bytes();
+        if bytes.len() >= 7 && bytes[..6].eq_ignore_ascii_case(b"Bearer") && bytes[6] == b' ' {
+            // Crop "Bearer " (7 bytes) from the raw header value. Header values are UTF-8 here,
+            // but byte checks avoid slicing at a non-character boundary for malformed input.
+            raw.get(7..)
         } else {
             None
         }
@@ -146,6 +153,7 @@ mod tests {
             .expect("read body");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
         assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], AUTH_SERVICE_TOKEN_INVALID);
         assert!(
             v["error"]["message"].is_string(),
             "envelope must carry a message"

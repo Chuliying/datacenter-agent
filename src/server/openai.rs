@@ -22,7 +22,6 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::model::History;
 use crate::server::dto::{AgentRequest, UsageData};
 
 /// One OpenAI chat message (`{role, content}`).
@@ -105,101 +104,31 @@ pub struct StreamOptions {
 
 /// Why an OpenAI `messages` list could not be mapped onto an [`AgentRequest`].
 ///
-/// All variants surface to the client as HTTP 400 `invalid_request_error`.
+/// The authorization-mode endpoint is single-turn, so the only mapping failure is the absence
+/// of any user message to serve as the prompt. It surfaces as HTTP 400 `invalid_request_error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MapError {
     /// No messages, or no `user` message to use as the prompt.
     NoUserMessage,
-    /// The conversation has messages but no trailing `user` turn to serve as the prompt
-    /// (e.g. it ends with an `assistant` turn).
-    BadShape(String),
-}
-
-/// Whether a message role is dropped before shaping the conversation. Only `user` / `assistant`
-/// carry a conversational turn; every other role is ignored rather than folded into one — `system`
-/// / `developer` (the pipeline has no system slot, each stage carries its own designed
-/// instruction), and any other role such as `tool` / `function` (this endpoint advertises no
-/// tools). Dropping unknown roles means replaying a transcript that carries tool messages never
-/// pollutes the user/assistant history.
-fn is_ignored_role(role: &str) -> bool {
-    role != "user" && role != "assistant"
 }
 
 /// Map an OpenAI `messages` list onto the internal [`AgentRequest`].
 ///
-/// The mapping is lenient about turn structure so a real OpenAI client is not rejected for a
-/// non-strictly-alternating history:
-///
-/// - Non-conversational roles (`system` / `developer` / `tool` / …) are dropped (see [`is_ignored_role`]).
-/// - Consecutive messages of the **same** role are merged into one turn, their content joined with
-///   `\n` (two `user` messages in a row become one; likewise `assistant`).
-/// - After merging, the trailing `user` turn becomes `prompt`; the earlier turns fold into
-///   `history`. A conversation that opens with an `assistant` turn pairs it with an empty
-///   `user_prompt` rather than failing.
-/// - There must still be a trailing `user` turn to serve as the prompt: an empty list (or one made
-///   empty by dropping system/developer) is [`MapError::NoUserMessage`]; a list that ends on an
-///   `assistant` turn is [`MapError::BadShape`]. Both surface as HTTP 400.
-///
-/// `session_id` / `option_id` have no OpenAI equivalent and are left `None`.
+/// The authorization-mode contract is deliberately single-turn: scan from the end, take only the
+/// last `user` message, and discard every earlier message (including assistant, system, developer,
+/// tool, and function messages). This prevents caller-supplied transcript text from becoming a
+/// permission or memory bypass. `session_id` / `option_id` have no OpenAI equivalent and remain
+/// `None`.
 pub fn map_request(messages: Vec<ChatMessage>) -> Result<AgentRequest, MapError> {
-    // Drop system/developer, then collapse runs of the same role into one turn so the remainder is
-    // strictly alternating regardless of how the client batched its messages.
-    let mut merged: Vec<ChatMessage> = Vec::with_capacity(messages.len());
-    for msg in messages.into_iter().filter(|m| !is_ignored_role(&m.role)) {
-        match merged.last_mut() {
-            Some(prev) if prev.role == msg.role => {
-                prev.content.push('\n');
-                prev.content.push_str(&msg.content);
-            }
-            _ => merged.push(msg),
-        }
-    }
-
-    // The current user turn (the last merged message) is the prompt.
-    let Some((last, earlier)) = merged.split_last() else {
-        return Err(MapError::NoUserMessage);
-    };
-    if last.role != "user" {
-        return Err(MapError::BadShape(format!(
-            "conversation must end with a `user` turn to use as the prompt, got role={}",
-            last.role
-        )));
-    }
-    let prompt = last.content.clone();
-
-    // Fold the earlier (already-alternating) turns into history pairs. A leading `assistant` turn
-    // pairs with an empty `user_prompt`; every `user` turn pairs with the `assistant` turn that
-    // follows it (or an empty response if none does).
-    let mut history = Vec::with_capacity(earlier.len().div_ceil(2));
-    let mut i = 0;
-    while i < earlier.len() {
-        let turn = &earlier[i];
-        if turn.role == "assistant" {
-            history.push(History {
-                user_prompt: String::new(),
-                model_response: turn.content.clone(),
-            });
-            i += 1;
-        } else {
-            let model_response = match earlier.get(i + 1) {
-                Some(next) if next.role == "assistant" => {
-                    i += 2;
-                    next.content.clone()
-                }
-                _ => {
-                    i += 1;
-                    String::new()
-                }
-            };
-            history.push(History {
-                user_prompt: turn.content.clone(),
-                model_response,
-            });
-        }
-    }
+    let prompt = messages
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content)
+        .ok_or(MapError::NoUserMessage)?;
 
     Ok(AgentRequest {
-        history,
+        history: Vec::new(),
         prompt,
         session_id: None,
         option_id: None,
@@ -385,6 +314,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<Choice>,
     pub usage: Usage,
+    /// Runtime authorization refusal code, present only for a `200` refusal response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_refusal_code: Option<String>,
     /// OpenAI `system_fingerprint`. We compute none, so it serializes as `null` (present, matching
     /// the OpenAI envelope) rather than being omitted.
     pub system_fingerprint: Option<String>,
@@ -431,6 +363,7 @@ pub fn build_response(
         }],
         usage,
         system_fingerprint: None,
+        x_refusal_code: None,
     }
 }
 
@@ -460,17 +393,33 @@ pub struct OpenAiError {
     pub message: String,
     #[serde(rename = "type")]
     pub error_type: String,
+    pub code: String,
 }
 
 impl OpenAiErrorBody {
     /// Build an error envelope from an OpenAI `type` and a human message.
     pub fn new(error_type: &str, message: impl Into<String>) -> Self {
+        Self::with_code(default_code_for_error_type(error_type), error_type, message)
+    }
+
+    /// Build an error envelope with the runtime's stable machine-readable code.
+    pub fn with_code(code: &str, error_type: &str, message: impl Into<String>) -> Self {
         Self {
             error: OpenAiError {
                 message: message.into(),
                 error_type: error_type.to_string(),
+                code: code.to_string(),
             },
         }
+    }
+}
+
+fn default_code_for_error_type(error_type: &str) -> &'static str {
+    match error_type {
+        ERR_INVALID_REQUEST => crate::server::codes::REQUEST_INVALID,
+        ERR_UPSTREAM => crate::server::codes::UPSTREAM_ERROR,
+        ERR_RATE_LIMIT => crate::server::codes::RATE_LIMIT_GLOBAL,
+        _ => crate::server::codes::SERVER_UNAVAILABLE,
     }
 }
 
@@ -485,7 +434,6 @@ impl MapError {
                 ERR_INVALID_REQUEST,
                 "`messages` must contain at least one `user` message".to_string(),
             ),
-            MapError::BadShape(reason) => (400, ERR_INVALID_REQUEST, reason.clone()),
         }
     }
 }
@@ -521,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn pairs_earlier_turns_into_history() {
+    fn discards_earlier_turns_under_the_single_turn_contract() {
         let req = map_request(vec![
             msg("user", "A"),
             msg("assistant", "a"),
@@ -529,13 +477,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(req.prompt, "B");
-        assert_eq!(
-            req.history,
-            vec![History {
-                user_prompt: "A".into(),
-                model_response: "a".into(),
-            }]
-        );
+        assert!(req.history.is_empty());
     }
 
     #[test]
@@ -558,13 +500,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(req.prompt, "B");
-        assert_eq!(
-            req.history,
-            vec![History {
-                user_prompt: "A".into(),
-                model_response: "a".into(),
-            }]
-        );
+        assert!(req.history.is_empty());
     }
 
     #[test]
@@ -581,18 +517,15 @@ mod tests {
     }
 
     #[test]
-    fn merges_adjacent_same_role_user_turns_into_one_prompt() {
-        // Relaxed mapping (was a 400): two adjacent `user` turns are no longer rejected — they
-        // fold into a single prompt, their content joined with `\n`.
+    fn keeps_only_the_last_user_turn_when_users_are_adjacent() {
         let req = map_request(vec![msg("user", "A"), msg("user", "B")]).unwrap();
-        assert_eq!(req.prompt, "A\nB");
+        assert_eq!(req.prompt, "B");
         assert!(req.history.is_empty());
     }
 
     #[test]
-    fn merges_adjacent_same_role_in_history() {
-        // `[user:A1, user:A2, assistant:b, user:C]`: the two leading users merge into one history
-        // turn (`A1\nA2`), paired with `b`; `C` is the current prompt.
+    /// S-RUNTIME-SEC-02 AC-026
+    fn discards_all_prior_turns_even_when_they_are_well_formed() {
         let req = map_request(vec![
             msg("user", "A1"),
             msg("user", "A2"),
@@ -601,28 +534,14 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(req.prompt, "C");
-        assert_eq!(
-            req.history,
-            vec![History {
-                user_prompt: "A1\nA2".into(),
-                model_response: "b".into(),
-            }]
-        );
+        assert!(req.history.is_empty());
     }
 
     #[test]
-    fn leading_assistant_pairs_with_an_empty_user_prompt() {
-        // A conversation that opens with an assistant turn: pair it with an empty `user_prompt`
-        // rather than rejecting the shape.
+    fn leading_assistant_is_discarded() {
         let req = map_request(vec![msg("assistant", "a"), msg("user", "B")]).unwrap();
         assert_eq!(req.prompt, "B");
-        assert_eq!(
-            req.history,
-            vec![History {
-                user_prompt: String::new(),
-                model_response: "a".into(),
-            }]
-        );
+        assert!(req.history.is_empty());
     }
 
     #[test]
@@ -785,11 +704,6 @@ mod tests {
         let (status, etype, _msg) = MapError::NoUserMessage.to_openai();
         assert_eq!(status, 400);
         assert_eq!(etype, ERR_INVALID_REQUEST);
-        // ERR2: bad conversation shape carries its own diagnostic message through.
-        let (status, etype, msg) = MapError::BadShape("adjacent user turns".into()).to_openai();
-        assert_eq!(status, 400);
-        assert_eq!(etype, ERR_INVALID_REQUEST);
-        assert_eq!(msg, "adjacent user turns");
     }
 
     #[test]
@@ -805,7 +719,7 @@ mod tests {
         let body = OpenAiErrorBody::new(ERR_INVALID_REQUEST, "bad");
         assert_eq!(
             serde_json::to_value(&body).unwrap(),
-            serde_json::json!({"error": {"message": "bad", "type": "invalid_request_error"}})
+            serde_json::json!({"error": {"message": "bad", "type": "invalid_request_error", "code": "request.invalid"}})
         );
     }
 

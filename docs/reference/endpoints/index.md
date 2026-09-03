@@ -117,8 +117,9 @@ timeout 砍掉。
 由 prelude 的 `runtime::guardrails::input_guard::validate_prompt` 執行。
 handler 層過去的 2 000-char cap（`USER_PROMPT_LENGTH_CAP`）已隨退役端點一併移除。
 
-`/v1/chat/completions` 會先把 `messages` 的 history 折入 prompt **再**過 prelude，
-因此折入後的長度一併受 4 000 cap 約束（見 [chat-completions](./chat-completions.md)）。
+`/v1/chat/completions` 只取 `messages` 尾端最後一個 `user` 的文字，再送入 prelude；更早的
+transcript 不會折入，因此只選中的文字受 4 000 cap 約束（見
+[chat-completions](./chat-completions.md)）。
 
 ## Probe 現況
 

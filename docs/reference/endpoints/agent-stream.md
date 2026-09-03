@@ -35,10 +35,24 @@ report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer po
 ## Request / response
 
 - Request body 為 `AgentRequest`（`{prompt, history?, session_id?, option_id?}`）。
-- Bearer required（失敗 418）。
+- Required headers：`Authorization: Bearer <GLOBAL_TOKEN>` 與
+  `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`。前者失敗回 418；後者由 Falcon
+  permissions endpoint 驗證。
 - 成功建立 stream 後為 `text/event-stream`，keep-alive interval 15 秒。
 - prompt cap 為 runtime config `thresholds.input.max_prompt_chars`（目前 4 000），
   由 prelude 執行。這是全服務唯一的 prompt cap。
+
+Identity layer 只套在這條 `POST` 路由；缺失或格式錯誤的 Falcon header 回
+`401 identity.header_missing`，permissions endpoint 的 `401` 依其 body 的
+`error_code` 分為兩種：`auth.token_invalid` 回 `401 identity.token_refreshable`（消費端可花掉
+一次 silent-refresh 並重送一次），其餘任何 code、未知 code 或無 code 一律回
+`401 identity.token_terminal`（**不得**進 refresh 路徑）。timeout／連線失敗／5xx／畸形 `200` 回
+`503 identity.upstream_unavailable`。兩個**告警級**例外：`error_code` 為 `auth.invalid_platform`
+時對呼叫端仍回 `401 identity.token_terminal`，但 runtime 另發 `IdentityAlarm`（platform 允許
+名單金絲雀）；`400 auth.conflicting_credentials` 回 `500 identity.upstream_conflict` 並告警——
+runtime 只送 Bearer，這代表 runtime 端請求建構出錯，且該結果**不**寫入負向 cache。
+例行身份失敗記為一般 `IdentityRefused` 事件，不觸發告警。upstream 的 `error_code` 只作為 runtime 內部判定輸入，
+不會轉送給消費端——消費端一律依本服務自己的 `code` 分流，因此上游改名不影響此契約。非 `POST` 仍交給 method router，維持原本的 `405` 行為。
 
 ## Prelude 的三種結果
 
@@ -53,23 +67,25 @@ report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer po
 > **這是與舊文件不同之處。** pre-stream validation 錯誤現在回**正確的 HTTP status**，
 > 不再是「先回 200 再送 error frame」。空／超長 prompt 的行為因此與 REST 路徑一致。
 
-## Opt-in 全域 burst limiter（429）
+## 全域與 per-actor burst limiter（429）
 
-`config.toml` 的 `[server.rate_limit]`（預設關閉）啟用後，本端點與
-`/v1/chat/completions` 共用一個 process-local token bucket。bucket 耗盡時，
+`config.toml` 的 `[server.rate_limit]` 是本服務身份層的必要啟動設定；本端點與
+`/v1/chat/completions` 共用一個 process-local global token bucket，並各自有
+identity 後的 per-actor bucket。bucket 耗盡時，
 **在 bearer 驗證之後、JSON 解析與 handler 之前**回：
 
 - `429` + 整數秒 `Retry-After` + `Cache-Control: no-store`
-- body `{"error": "rate limited: retry after <n>s"}`（本端點的統一 envelope）
+- global body `{"error":"rate limited: retry after <n>s","code":"rate_limit.global"}`
+- actor body 同形但 code 為 `rate_limit.actor`
 - 恰一筆 `audit.rate_limit_rejected` 結構化事件
 
-無效 bearer 仍回 `418` 且不消耗 bucket。`/health`、`/ready`、`/greeting`
-永不受限。狀態 process-local、重啟歸零；詳見
+無效 service bearer 仍回 `418` 且不消耗 bucket；identity 未解析成功也不會建立 actor bucket。
+`/health`、`/ready`、`/greeting` 永不受限。狀態 process-local、重啟歸零；詳見
 `docs/work/runtime-user-session-rate-limit/runbook.md`。
 
 ## SSE frame
 
-每個 SSE `data:` 是一個 JSON object，discriminator 為 `event`。`StreamFrame` 共 **9 種** variant：
+每個 SSE `data:` 是一個 JSON object，discriminator 為 `event`。`StreamFrame` 共 **10 種** variant：
 
 | Event | JSON payload | 意義 |
 |---|---|---|
@@ -82,14 +98,20 @@ report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer po
 | `clear` | `{"event":"clear"}` | 清掉先前串流的預覽 |
 | `done` | `{"event":"done"}` | 乾淨結束，關連線 |
 | `error` | `{"event":"error","data":"<message>"}` | 終止性錯誤，關連線 |
+| `refusal` | `{"event":"refusal","code":"authz.insufficient"}` | `200` 的終端授權拒答，不是 upstream error |
 
 `phase` 值為 `started` / `success` / `failure`（`rename_all = "lowercase"`），足以驅動
 「轉圈 → 變綠/變紅」的每階段指示燈。`usage` 的 `reasoning` 是 `completion` 的子集，
 模型沒回報時整個欄位省略（`skip_serializing_if`）。`IntentResolvedData` 的 `candidate_intents`
 透過 `rename_all = "camelCase"` 序列化為 `candidateIntents`，對齊前端事件形狀。
 
-> `Refused` 路徑**不送** `intent.resolved`——它直接 yield refusal copy 的 `token` 再 `done`。
+> Guardrail `Refused` 路徑**不送** `intent.resolved`——它直接 yield refusal copy 的 `token` 再
+> `done`。授權不足則送 `token`（拒答內容）→ `refusal`（`authz.insufficient`）→ `done`。
 > 消費端不可假設每次 200 回應都以 `intent.resolved` 開頭。
+
+報告有部分主題權限時仍回 `200`，但 `clear` 後的完整終端 `token` 會以聲明開頭，列出被省略的
+主題；同時寫入 `PermissionDegraded` audit event。報告的有效 data grant 是
+`[report.grants].fetcher` 與本次 Falcon permissions 的交集。
 
 ### 終局協定：clear 後重送完整答案
 
@@ -128,6 +150,7 @@ terminal outcome；見 [PRD FR-008](../prd.md) 與
 ```bash
 curl -N http://localhost:8080/agent/stream \
   -H "Authorization: Bearer $GLOBAL_TOKEN" \
+  -H "X-Falcon-Authorization: Bearer $FALCON_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"prompt":"列出本週充電量前五名","session_id":"abc"}'
 ```
@@ -135,7 +158,9 @@ curl -N http://localhost:8080/agent/stream \
 ## Test evidence
 
 - DTO serialization：`tests/runtime_contract.rs`。
-- event mapping、`wants_report_pipeline`、`fold_history_into_prompt`：handler module tests。
+- event mapping、`wants_report_pipeline`、授權拒答與 report 降級：handler module tests。
 - prelude ordering：fake `AgentPort` component test。
-- 未覆蓋：Router-level status、slow consumer 丟事件、disconnect、JoinError、
-  真 provider transport truncation、pipeline 路由的端到端驗證。
+- route scope、identity 三種失敗、Falcon cache、per-actor LRU 與 OpenAI refusal code：
+  crate 內 `#[cfg(test)]` tests。
+- live LLM/MCP provider、slow consumer 丟事件、disconnect、JoinError 與 pipeline 實網端到端
+  仍是非本地測試範圍。
