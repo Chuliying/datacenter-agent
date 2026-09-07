@@ -476,7 +476,7 @@ mod tests {
         );
         let granted = Permissions {
             user_id: 7,
-            codes: ["hdrenewables/elecsvc/starcharger/finance".to_string()]
+            codes: ["hdrenewables:elecsvc:starcharger:finance".to_string()]
                 .into_iter()
                 .collect(),
         };

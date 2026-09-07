@@ -1019,6 +1019,31 @@ request_timeout_ms = 5000
     /// a runtime intent to the tools it *requires*. The gate is the three-way intersection
     /// of boot grant, permission grant, and intent requirement — checking merely that the
     /// narrowed set is non-empty would let a finance-only user's member question through.
+    /// Falcon's `/api/auth/me/permissions` returns `code` in colon form
+    /// (`hdrenewables:elecsvc:starcharger:opperf`), and `authorize_pipeline` matches codes
+    /// by exact string. A slash-form key here silently denies every user (`authz.insufficient`),
+    /// which is exactly what shipped on 2026-09-07. Pin the format so it cannot drift back.
+    #[test]
+    fn shipped_config_permission_codes_use_falcon_colon_form() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg
+            .authz
+            .expect("config/config.toml must declare an [authz] section");
+        let codes = authz
+            .permission_tools
+            .keys()
+            .cloned()
+            .chain(authz.ss_chat_permissions.iter().cloned())
+            .collect::<Vec<_>>();
+        assert!(!codes.is_empty());
+        for code in codes {
+            assert!(
+                code.starts_with("hdrenewables:") && !code.contains('/'),
+                "permission code must be Falcon colon form, got {code}"
+            );
+        }
+    }
+
     #[test]
     fn shipped_config_declares_both_authorization_mapping_tables() {
         let cfg = AppConfig::load("config/config.toml").expect("config should load");
@@ -1030,13 +1055,13 @@ request_timeout_ms = 5000
         // no MCP endpoint serves engineering-project data yet (PRD FU-003).
         let finance = authz
             .permission_tools
-            .get("hdrenewables/elecsvc/starcharger/finance")
+            .get("hdrenewables:elecsvc:starcharger:finance")
             .expect("finance permission must be mapped");
         assert!(finance.contains(&"bill_revenue".to_string()));
         assert_eq!(
             authz
                 .permission_tools
-                .get("hdrenewables/elecsvc/starcharger/engproj")
+                .get("hdrenewables:elecsvc:starcharger:engproj")
                 .map(Vec::len),
             Some(0),
             "engproj has no corresponding MCP endpoint yet (FU-003)"

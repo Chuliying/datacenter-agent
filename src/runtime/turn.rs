@@ -1078,7 +1078,7 @@ mod tests {
 
         // Finance alone: enough for a revenue question, not enough for the report the turn
         // actually holds. The strict report rule drops it.
-        let finance_only = identity(123, &["hdrenewables/elecsvc/starcharger/finance"]);
+        let finance_only = identity(123, &["hdrenewables:elecsvc:starcharger:finance"]);
         assert!(
             !memory_turn_is_allowed(&report_turn, Some(&finance_only), &deps),
             "a report turn must not replay for a user who lost the other topics"
@@ -1097,9 +1097,9 @@ mod tests {
         let full = identity(
             123,
             &[
-                "hdrenewables/elecsvc/starcharger/finance",
-                "hdrenewables/elecsvc/starcharger/opperf",
-                "hdrenewables/elecsvc/starcharger/bizdev",
+                "hdrenewables:elecsvc:starcharger:finance",
+                "hdrenewables:elecsvc:starcharger:opperf",
+                "hdrenewables:elecsvc:starcharger:bizdev",
             ],
         );
         assert!(
@@ -1131,7 +1131,7 @@ mod tests {
         let audit = AuditWriter::new(audit_sink, AuditFailurePolicy::FailClosed);
         let advertised = vec!["business_metrics".to_string()];
         let ss_grant = vec!["ss_sunshine_hours".to_string()];
-        let id = identity(123, &["hdrenewables/elecsvc/startrade-power/finance"]);
+        let id = identity(123, &["hdrenewables:elecsvc:startrade-power:finance"]);
 
         let ss_deps = AgentTurnDeps {
             runtime_config: &cfg,
@@ -1580,7 +1580,7 @@ mod tests {
     /// S-RUNTIME-SEC-02 AC-023, AC-024
     async fn authorized_memory_context_drops_revoked_topics_and_audits_the_count() {
         let store = InMemorySessionStore::new(10);
-        let actor = identity(123, &["hdrenewables/elecsvc/starcharger/finance"]);
+        let actor = identity(123, &["hdrenewables:elecsvc:starcharger:finance"]);
         let scope = SessionMemoryScope {
             session_id: "s-authz".into(),
             actor_id: Some(actor.actor_key.as_str().into()),
@@ -1667,8 +1667,8 @@ mod tests {
     /// S-RUNTIME-SEC-02 AC-005
     async fn memory_scope_uses_actor_key_so_same_session_cannot_cross_users() {
         let store = InMemorySessionStore::new(10);
-        let first_actor = identity(123, &["hdrenewables/elecsvc/starcharger/finance"]);
-        let second_actor = identity(456, &["hdrenewables/elecsvc/starcharger/finance"]);
+        let first_actor = identity(123, &["hdrenewables:elecsvc:starcharger:finance"]);
+        let second_actor = identity(456, &["hdrenewables:elecsvc:starcharger:finance"]);
         let first_scope = SessionMemoryScope {
             session_id: "shared-session".into(),
             actor_id: Some(first_actor.actor_key.as_str().into()),
