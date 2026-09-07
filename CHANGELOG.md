@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-07
+
 ### Added
 
-- **Falcon end-user identity and RBAC on the prompt routes.** `/agent/stream`,
+- **BREAKING — Falcon end-user identity and RBAC on the prompt routes.** `/agent/stream`,
   `/ss-chat/stream` and `/v1/chat/completions` now require `X-Falcon-Authorization: Bearer
   <FALCON_ACCESS_TOKEN>` in addition to the service bearer; the runtime verifies it against
   Falcon's permissions endpoint (positive/negative TTL cache, whitelist 401 classification:
@@ -20,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer inside the (now mandatory) global one. Stable machine-readable `code` fields on
   all three error envelopes. Client-supplied `history` is ignored on identity-protected
   routes; `/v1/chat/completions` is single-turn.
+  - **Client migration**: every caller of the three prompt routes must now send a second header
+    alongside the service bearer. A request with only `Authorization` is refused `401`
+    (`identity.header_missing`) before the pipeline is built. Callers that relied on sending
+    `history` for multi-turn context must move to `session_id`; on `/v1/chat/completions` there is
+    no multi-turn path in this release.
+  - **Operator migration**: two new boot requirements, both fail-fast. `ACTOR_KEY_PEPPER` must be
+    set and at least 32 bytes. The Falcon host must come from `FALCON_API_BASE_URL` or
+    `[identity].base_url` — there is deliberately no checked-in default, so a deployment that
+    forgets it cannot silently verify production tokens against whatever host the repo shipped.
+    The global burst limiter is no longer opt-in. See `scripts/dev-falcon-stub.md` for a
+    loopback permissions stub to test against.
 - **`POST /ss-chat/stream`** — a streaming front door for the 星星電力 (SS) investor platform. It
   runs the same four-stage chat pipeline as `/agent/stream`'s insight path
   (`fetcher → analyst → charter → finalizer`) over the six `ss_*` MCP tools, with its own stage
@@ -49,6 +62,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `build_chat_pipeline` assembly, so a change to one chat pipeline's shape cannot silently skip the
   other. `agent_stream` and `ss_chat_stream` likewise share one `run_chat_stream` streaming body;
   each route supplies only its audit label, answer policy, and pipeline selector.
+
+### Known limitations
+
+- **`/ss-chat/stream` answer arithmetic depends on the configured model.** Verified against the
+  live investor-platform API on 2026-08-27 over the seven manager questions in
+  `eomc-mcp/docs/ss_chatbot_agent_test.md`. With `google/gemini-3.1-flash-lite` five of seven are
+  correct — including both adversarial checks in Q7 (it refuses to add kWh to kW, and corrects
+  「星火50」to「星展50計畫」unprompted) — but two show summation errors: Q3 totalled 73 cumulative
+  rows to 185,555,555 against a tool-verified 259,159,762, and Q5 mis-added three correctly listed
+  payments. The same prompts on `anthropic/claude-opus-5` reproduce the reference transcript
+  exactly (259,159,762; top-5 85.4%; 大福+茂泓 56.6%), so this is a model-capability ceiling, not a
+  pipeline or prompt defect. Point this endpoint at a stronger model if managers will quote its
+  figures.
+- `ss_analyst_system` carries hard rules for both failure classes (one aggregation basis per
+  answer, a stated total that equals the rows shown, a single share denominator, and a per-row
+  overdue procedure). These fixed a worse Q5 error — `gemini-3.1-flash-lite` had reported
+  「無逾期項目」while 匯聚_柳營1.5MW was 27 days overdue — but cannot supply arithmetic the model
+  lacks.
+- An out-of-grant tool name aborts a stage outright rather than being fed back for correction
+  (`run_llm_loop`, `src/agent/payload.rs`). Pre-existing and shared by both chat routes: one
+  `/ss-chat/stream` run lost a complete analyst report because the *optional* charter stage
+  invented a `default_chart` tool. Intermittent, and unchanged by this release.
 
 ## [0.4.0] - 2026-08-19
 

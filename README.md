@@ -27,13 +27,34 @@ LLM against live data with the power of MCP server.
 `POST /agent`, `/insight`, `/insight/stream`, `/report` and `/report/stream` have been retired;
 they return `404`. Use `/agent/stream` (streaming) or `/v1/chat/completions` (non-streaming).
 
-All routes, including `/health` and `/ready`, currently require a bearer token. See [the endpoint contract](docs/reference/endpoints/index.md) for middleware and probe caveats.
+All routes, including `/health` and `/ready`, require the service bearer token. The three prompt
+routes (`/agent/stream`, `/ss-chat/stream`, `/v1/chat/completions`) additionally require a Falcon
+end-user token — see [Authentication](#authentication). See
+[the endpoint contract](docs/reference/endpoints/index.md) for middleware and probe caveats.
 
 ## Authentication
 
-A single `GLOBAL_TOKEN` loaded at startup gates every request via an `Authorization: Bearer <token>` header, provides basic safety so the upstream LLM API key won't be abused by some random weirdos.
+Two layers, checked in order.
 
-The current failure response is `418 I'm a teapot`. The target authentication/CORS/probe policy is tracked, with build status, in the [runtime platform PRD](docs/reference/prd.md).
+**1. Service bearer — every route.** A single `GLOBAL_TOKEN` loaded at startup gates every request
+via an `Authorization: Bearer <token>` header, provides basic safety so the upstream LLM API key
+won't be abused by some random weirdos. The failure response is `418 I'm a teapot` on the standard
+routes, and `401` with the OpenAI error envelope on `/v1/chat/completions`.
+
+**2. Falcon end-user identity — the three prompt routes.** `/agent/stream`, `/ss-chat/stream` and
+`/v1/chat/completions` additionally require `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`.
+The runtime verifies it against Falcon's permissions endpoint, derives a pseudonymous `actor_key`
+from it, and narrows the pipeline's tool grant to `boot ∩ permission ∩ intent-required` **before**
+any LLM or MCP call — so a caller only ever reaches the data their Falcon permissions cover. A
+missing header is `401 identity.header_missing`; probes and `/greeting` are unaffected.
+
+This means the service bearer alone is no longer enough to reach a pipeline. Boot also now requires
+`ACTOR_KEY_PEPPER` (≥32 bytes) and a Falcon host from `FALCON_API_BASE_URL` or `[identity].base_url`
+— there is no default host on purpose. For local testing, `scripts/dev-falcon-stub.md` stands up a
+loopback permissions endpoint.
+
+The target authentication/CORS/probe policy is tracked, with build status, in the
+[runtime platform PRD](docs/reference/prd.md).
 
 ## Runtime status
 
