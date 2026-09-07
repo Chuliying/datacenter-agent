@@ -156,9 +156,9 @@ pub fn authorize_ss_chat(
 mod tests {
     use super::*;
 
-    const FINANCE: &str = "hdrenewables/elecsvc/starcharger/finance";
-    const OPPERF: &str = "hdrenewables/elecsvc/starcharger/opperf";
-    const BIZDEV: &str = "hdrenewables/elecsvc/starcharger/bizdev";
+    const FINANCE: &str = "hdrenewables:elecsvc:starcharger:finance";
+    const OPPERF: &str = "hdrenewables:elecsvc:starcharger:opperf";
+    const BIZDEV: &str = "hdrenewables:elecsvc:starcharger:bizdev";
 
     fn config() -> AuthzConfig {
         crate::config::AppConfig::load("config/config.toml")
@@ -210,7 +210,7 @@ mod tests {
         let decision = authorize_ss_chat(
             &config(),
             &ss_grant,
-            &permissions("hdrenewables/elecsvc/startrade-power/finance"),
+            &permissions("hdrenewables:elecsvc:startrade-power:finance"),
             &advertised,
             &["emit_chart".into()],
         );
@@ -225,8 +225,8 @@ mod tests {
     fn ss_chat_refuses_parent_only_and_other_unit_permissions() {
         let ss_grant: Vec<String> = vec!["ss_sunshine_hours".to_string()];
         for code in [
-            "hdrenewables/elecsvc/startrade-power",
-            "hdrenewables/elecsvc/starcharger/finance",
+            "hdrenewables:elecsvc:startrade-power",
+            "hdrenewables:elecsvc:starcharger:finance",
         ] {
             let decision = authorize_ss_chat(
                 &config(),
@@ -253,7 +253,7 @@ mod tests {
             let decision = authorize_pipeline(
                 &config(),
                 &["*".into()],
-                &permissions("hdrenewables/elecsvc/starcharger"),
+                &permissions("hdrenewables:elecsvc:starcharger"),
                 intent,
                 intent == "report",
                 &advertised(),
@@ -279,7 +279,7 @@ mod tests {
         let decision = authorize_pipeline(
             &config(),
             &["*".into()],
-            &permissions("hdrenewables/elecsvc/startrade-power/finance"),
+            &permissions("hdrenewables:elecsvc:startrade-power:finance"),
             "revenue",
             false,
             &advertised(),

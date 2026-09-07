@@ -357,7 +357,7 @@ mod tests {
         let buffer = crate::test_support::install_tracing_capture();
         let granted = crate::server::falcon::Permissions {
             user_id: 42,
-            codes: ["hdrenewables/elecsvc/starcharger/finance".to_string()]
+            codes: ["hdrenewables:elecsvc:starcharger:finance".to_string()]
                 .into_iter()
                 .collect(),
         };
@@ -400,7 +400,7 @@ mod tests {
     async fn identity_middleware_derives_opaque_actor_and_inserts_permissions() {
         let provider = crate::test_support::ScriptedPermissionsProvider::documented(
             123,
-            &["hdrenewables/elecsvc/starcharger/finance"],
+            &["hdrenewables:elecsvc:starcharger:finance"],
         );
         let app = identity_app(provider.clone()).await;
         let response = app
@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(body["user_id"], 123);
         assert_eq!(
             body["permissions"][0],
-            "hdrenewables/elecsvc/starcharger/finance"
+            "hdrenewables:elecsvc:starcharger:finance"
         );
         assert_eq!(provider.calls(), 1);
         let actor = body["actor_key"]

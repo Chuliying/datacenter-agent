@@ -583,13 +583,13 @@ mod tests {
 
         let starcharger_only = Permissions {
             user_id: 7,
-            codes: ["hdrenewables/elecsvc/starcharger/finance".to_string()]
+            codes: ["hdrenewables:elecsvc:starcharger:finance".to_string()]
                 .into_iter()
                 .collect(),
         };
         let startrade = Permissions {
             user_id: 8,
-            codes: ["hdrenewables/elecsvc/startrade-power/finance".to_string()]
+            codes: ["hdrenewables:elecsvc:startrade-power:finance".to_string()]
                 .into_iter()
                 .collect(),
         };

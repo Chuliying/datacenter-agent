@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `[authz.permission_tools]` and `[authz].ss_chat_permissions` now use Falcon's actual
+  permission `code` form (`hdrenewables:elecsvc:starcharger:opperf`, colon-separated).
+  The shipped config carried slash-separated keys copied from the local stub, so
+  `authorize_pipeline` never matched a real user's codes and every request was refused
+  with `authz.insufficient`. A config test pins the colon form; the dev stub and test
+  fixtures follow the same shape.
+
 ## [0.5.0] - 2026-09-07
 
 ### Added

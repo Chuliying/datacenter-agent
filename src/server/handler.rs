@@ -1734,7 +1734,7 @@ mod tests {
         let llm = crate::test_support::ScriptedChatCompletions::start();
         let provider = crate::test_support::ScriptedPermissionsProvider::documented(
             123,
-            &["hdrenewables/elecsvc/starcharger/finance"],
+            &["hdrenewables:elecsvc:starcharger:finance"],
         );
         let (state, mcp) = crate::test_support::runtime_app_state_with_fixtures(
             provider,
@@ -1807,7 +1807,7 @@ mod tests {
         let llm = crate::test_support::ScriptedChatCompletions::start();
         let provider = crate::test_support::ScriptedPermissionsProvider::documented(
             9,
-            &["hdrenewables/elecsvc/startrade-power/finance"],
+            &["hdrenewables:elecsvc:startrade-power:finance"],
         );
         let (state, mcp) = crate::test_support::runtime_app_state_with_fixtures(
             provider,

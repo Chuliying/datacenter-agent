@@ -776,7 +776,7 @@ mod tests {
 
         let provider = crate::test_support::ScriptedPermissionsProvider::documented(
             7,
-            &["hdrenewables/elecsvc/starcharger/finance"],
+            &["hdrenewables:elecsvc:starcharger:finance"],
         );
         // A runtime-wired state: `/agent/stream` answers 503 when the runtime is absent,
         // which would mask the very ordering this test exists to pin.

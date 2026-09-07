@@ -188,24 +188,24 @@ fetcher = [
 # tool set (rather than a finer per-sub-page split) needs the domain owner's sign-off at PR
 # review. The parent page alone deliberately unlocks nothing (AC-008's rule).
 ss_chat_permissions = [
-    "hdrenewables/elecsvc/startrade-power/finance",
-    "hdrenewables/elecsvc/startrade-power/opperf",
-    "hdrenewables/elecsvc/startrade-power/engproj",
-    "hdrenewables/elecsvc/startrade-power/bizdev",
+    "hdrenewables:elecsvc:startrade-power:finance",
+    "hdrenewables:elecsvc:startrade-power:opperf",
+    "hdrenewables:elecsvc:startrade-power:engproj",
+    "hdrenewables:elecsvc:startrade-power:bizdev",
 ]
 
 # Falcon permission code -> the MCP data tools it unlocks.
 [authz.permission_tools]
 # 財務
-"hdrenewables/elecsvc/starcharger/finance" = ["bill_revenue", "station_revenue_ranking"]  # CONFIRM? station_revenue_ranking
+"hdrenewables:elecsvc:starcharger:finance" = ["bill_revenue", "station_revenue_ranking"]  # CONFIRM? station_revenue_ranking
 # 營運績效
-"hdrenewables/elecsvc/starcharger/opperf" = ["bill_charge", "business_metrics"]           # CONFIRM? business_metrics
+"hdrenewables:elecsvc:starcharger:opperf" = ["bill_charge", "business_metrics"]           # CONFIRM? business_metrics
 # 業務發展
-"hdrenewables/elecsvc/starcharger/bizdev" = ["member_analysis", "bill_member_analysis"]
+"hdrenewables:elecsvc:starcharger:bizdev" = ["member_analysis", "bill_member_analysis"]
 # 工程專案 — no MCP endpoint serves engineering-project data yet, so this permission
 # unlocks nothing. Deliberately present rather than omitted: an absent row and an
 # empty row must not be confused.
-"hdrenewables/elecsvc/starcharger/engproj" = []
+"hdrenewables:elecsvc:starcharger:engproj" = []
 
 # Runtime intent -> the tools that intent requires. Must cover the whole
 # `intent_allowlist` in config/runtime/intents.toml; an uncovered intent fails startup.
