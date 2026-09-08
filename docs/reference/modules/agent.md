@@ -50,6 +50,21 @@
   開機即失敗，`report` 除外——它是部分授權例外，缺 tool 只會降級。
 - **報告模板固定**：chart / big-number 標題寫死在模板，動態化見上游
   [issue #8](https://github.com/h-alice/datacenter-agent/issues/8)。
+- **`emit_report` 驗兩層，不只驗 schema**：serde 反序列化只證明「形狀」；模板的 client script
+  另外依賴跨欄位不變量——`summary.latestCompletedPeriod` 必須等於**最近一個** `partial: false` 的
+  `periods[].period`、兩個陣列非空、月份是 `YYYY-MM` 且由舊到新、只有最後一個月可 partial、
+  `report.locale` 是 BCP-47 形狀。
+  只過 schema 但違反其中一條的 payload，會讓瀏覽器在畫圖前就拋 `TypeError`：報表標頭已填、
+  四張圖全白（headless Chrome 可重現）。`ReportData::validate`（`report.rs`）在 sink 端擋下這些，
+  rejection reason 直接點名欄位與修法，回饋給 model 重試；rejection 以 `info` 等級寫 log，
+  方便從 server log 分辨「model 一直把月份寫錯格式」和「fetch 沒有資料」。模板本身也加了
+  最後一道防線：不變量失敗或 render 拋錯時顯示 `role="alert"` 的錯誤橫幅，圖表框改為說明文字，
+  不再靜默留白。fetch 沒資料時 composer 被指示**不要**捏造項目；它因此送不出 `report.data`，
+  stage 以 `MissingArtifact` 結束（`with_required_output` 會先催三次，這是既有的必要輸出守門，
+  composer 的散文本身不會送到使用者）。handler 的 `classify_pipeline_failure` 把 report pipeline
+  的這個結果映成穩定 code `report.data_unavailable` 與使用者可讀文案（stream `error` frame、
+  OpenAI `502` envelope 皆同），Falcon 端再依 code 顯示對應文案；其他失敗維持 `upstream.error`。
+  更早在 fetcher 邊界就偵測「沒資料」、省下兩個 LLM stage，列為後續。
 
 ## Contract 出處
 

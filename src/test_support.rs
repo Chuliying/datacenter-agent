@@ -486,6 +486,10 @@ pub(crate) async fn runtime_app_state_with_fixtures(
 pub(crate) struct ScriptedChatCompletions {
     pub(crate) base_url: String,
     requests: Arc<AtomicUsize>,
+    /// When set, the scripted composer never calls `emit_report`: it answers every composer turn
+    /// with a "data missing" sentence, the way a model that obeys the prompt does when the fetch
+    /// returned no monthly figures. Drives the `report.data_unavailable` failure path.
+    refuse_report: Arc<AtomicBool>,
     /// Every request body the stub served, in order. Lets a test assert *what* reached the
     /// LLM — e.g. that a second turn's fetcher request carries the first turn's memory
     /// context — rather than only how many calls happened.
@@ -504,9 +508,11 @@ impl ScriptedChatCompletions {
         let requests = Arc::new(AtomicUsize::new(0));
         let bodies: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let refuse_report = Arc::new(AtomicBool::new(false));
         let thread_requests = requests.clone();
         let thread_bodies = bodies.clone();
         let thread_stop = stop.clone();
+        let thread_refuse = refuse_report.clone();
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -515,7 +521,11 @@ impl ScriptedChatCompletions {
                         stream
                             .set_nonblocking(false)
                             .expect("scripted connection should be blocking");
-                        if let Err(err) = serve_scripted_completion(stream, &thread_bodies) {
+                        if let Err(err) = serve_scripted_completion(
+                            stream,
+                            &thread_bodies,
+                            thread_refuse.load(Ordering::SeqCst),
+                        ) {
                             eprintln!("scripted LLM listener failed: {err}");
                             break;
                         }
@@ -533,10 +543,16 @@ impl ScriptedChatCompletions {
         Self {
             base_url: format!("http://{address}/v1"),
             requests,
+            refuse_report,
             bodies,
             stop,
             thread: Some(thread),
         }
+    }
+
+    /// Make the scripted composer decline to call `emit_report` (see `refuse_report`).
+    pub(crate) fn refuse_report(&self) {
+        self.refuse_report.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn requests(&self) -> usize {
@@ -566,6 +582,7 @@ impl Drop for ScriptedChatCompletions {
 fn serve_scripted_completion(
     mut stream: TcpStream,
     bodies: &StdMutex<Vec<serde_json::Value>>,
+    refuse_report: bool,
 ) -> std::io::Result<()> {
     let body = read_http_body(&mut stream)?;
     let request: serde_json::Value = serde_json::from_slice(&body).map_err(|err| {
@@ -578,7 +595,7 @@ fn serve_scripted_completion(
         .lock()
         .expect("scripted LLM body lock should not be poisoned")
         .push(request.clone());
-    let (kind, name, arguments, text) = scripted_reply(&request);
+    let (kind, name, arguments, text) = scripted_reply(&request, refuse_report);
     let payload = match kind {
         ScriptedReply::Tool => tool_call_stream(&name, &arguments),
         ScriptedReply::Message => message_stream(&text),
@@ -635,7 +652,10 @@ enum ScriptedReply {
     Message,
 }
 
-fn scripted_reply(request: &serde_json::Value) -> (ScriptedReply, String, String, String) {
+fn scripted_reply(
+    request: &serde_json::Value,
+    refuse_report: bool,
+) -> (ScriptedReply, String, String, String) {
     let tool_names = request["tools"]
         .as_array()
         .into_iter()
@@ -647,6 +667,15 @@ fn scripted_reply(request: &serde_json::Value) -> (ScriptedReply, String, String
         .into_iter()
         .flatten()
         .any(|message| message["role"] == "tool");
+
+    if tool_names.contains(&"emit_report") && refuse_report {
+        return (
+            ScriptedReply::Message,
+            String::new(),
+            String::new(),
+            "Material 中沒有月營運資料，無法產生報表。".into(),
+        );
+    }
 
     if !has_tool_result {
         if tool_names.contains(&"emit_report") {
@@ -720,7 +749,16 @@ fn sample_report_data() -> serde_json::Value {
             "chargers": 1,
             "partial": false
         }],
-        "stationRanking": []
+        // `emit_report` rejects an empty ranking (the template cannot render it), so the scripted
+        // composer must send at least one station for the pipeline to reach the renderer.
+        "stationRanking": [{
+            "rank": 1,
+            "name": "測試站",
+            "revenue": 1.0,
+            "kwh": 1.0,
+            "utilization": 1.0,
+            "revenuePerKw": 1.0
+        }]
     })
 }
 

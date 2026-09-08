@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Reports no longer render with blank charts.** `emit_report` only validated the JSON
+  *shape*, so a payload whose `summary.latestCompletedPeriod` did not match any
+  `periods[].period` (e.g. `2026-6` vs `2026-05`), or whose `periods` / `stationRanking`
+  was empty, was accepted and injected into the template, where the client script threw
+  before drawing a chart — header filled in, KPIs and all four charts blank.
+  `ReportData::validate` now enforces the cross-field invariants the template depends on
+  (non-empty arrays, `YYYY-MM` months oldest first, only the trailing month partial, the
+  anchor month copied verbatim from a non-partial period, consecutive ranks) and rejects
+  with a field-naming reason the model can act on; rejections are logged at `info` (still
+  under the `agent::probe` target the repro harness filters on). `report.locale` must be a
+  BCP-47 tag and the anchor must be the *most recent* complete month. The template shows a
+  visible error banner instead of blank canvases if any invariant still fails, and no
+  longer fabricates a "較上月 0.0%" kWh comparison when the anchor is the first month.
+- **A report whose fetched data has no monthly or station figures now fails clearly instead
+  of being fabricated or rendered blank.** The composer prompt tells the model not to
+  invent entries; when it therefore never produces `report.data`, the report pipeline
+  surfaces a stable `report.data_unavailable` code with user-facing copy — `/agent/stream`
+  `error` frame `{"data": "<copy>", "code": "report.data_unavailable"}`, OpenAI endpoint
+  `502` envelope `code: report.data_unavailable` — rather than the raw
+  `missing artifact: report.data` upstream error. Falcon maps the code to its own copy
+  (falcon-client branch `fix/report-data-unavailable-copy`). The required-output nudge in
+  `run_llm_loop` no longer orders the model to call the tool unconditionally: it now says
+  to restate what is missing rather than invent data when the material genuinely lacks it.
+
 ## [0.5.0] - 2026-09-07
 
 ### Added

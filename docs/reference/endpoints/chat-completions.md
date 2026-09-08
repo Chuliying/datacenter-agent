@@ -82,6 +82,7 @@ drain 出來的。answer policy 要求 disclaimer 時，disclaimer 會被 prepen
 | 逾時（600 s） | 504 | `server_error` |
 | 其他 middleware 錯誤 | 500 | `server_error` |
 | global／per-actor limiter 拒絕 | 429 | `rate_limit_error` / `rate_limit.global` 或 `rate_limit.actor` |
+| report pipeline 沒有可渲染的 `report.data`（多半是 fetch 沒有月／站點資料而 composer 依指示不捏造；也可能是 model 到步數上限都沒送出合格 payload） | 502 | `upstream_error` / `report.data_unavailable`（`message` 為使用者可讀文案；stream 版為 in-band error object 後 `[DONE]`） |
 
 `authz.insufficient` 不是 HTTP error：它是 `200` 的正常 assistant refusal，buffered response
 帶 `x_refusal_code`，stream response 在內容後以 `[DONE]` 結束；因此 client 不應把它當作可重試

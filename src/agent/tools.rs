@@ -428,13 +428,24 @@ pub fn emit_chart_tool() -> SchemaTool<ChartBatch> {
 ///
 /// - Sub-agent plan §10 — `emit_report` is a code-registered `SchemaTool` sink
 pub fn emit_report_tool() -> SchemaTool<ReportData> {
-    SchemaTool::<ReportData>::sink(
+    SchemaTool::<ReportData>::new(
         "emit_report",
-        "Emit the whole operations report as structured data. Call exactly once with the report \
-         metadata, the executive insight narrative, every monthly period, and the station ranking \
-         — all built strictly from the fetched numbers, never invented. Do NOT write HTML; the \
-         server renders it from this data.",
+        "Emit the whole operations report as structured data: the report metadata, the executive \
+         insight narrative, every monthly period, and the station ranking — all built strictly \
+         from the fetched numbers, never invented. One successful call completes the report; if \
+         the call is REJECTED, fix the field the reason names and call again. Do NOT write HTML; \
+         the server renders it from this data. Months are `YYYY-MM` (zero-padded), oldest first; \
+         only the last month may be partial; `summary.latestCompletedPeriod` must be copied \
+         verbatim from the most recent non-partial `periods[].period`; `periods` and \
+         `stationRanking` must be non-empty; `report.locale` is a BCP-47 tag such as `zh-TW`.",
         ArtifactKey::report_data(),
+        |report: ReportData| {
+            // Shape is proven by deserialization; this is the semantic layer the template needs.
+            report.validate()?;
+            serde_json::to_value(&report)
+                .map(ArtifactValue::Json)
+                .map_err(|e| format!("serialize: {e}"))
+        },
     )
 }
 
@@ -874,6 +885,91 @@ mod tests {
         assert!(matches!(
             tool.call(bad).await.unwrap(),
             ToolOutcome::Rejected { .. }
+        ));
+    }
+
+    /// Every case here deserializes into `ReportData` cleanly, yet the template's client script
+    /// throws before it draws a single chart (reproduced in headless Chrome: `Uncaught TypeError:
+    /// Cannot read properties of undefined (reading 'period')`, zero KPI cards, four blank
+    /// canvases). `emit_report` must reject each one with a reason that names the field, so the
+    /// model corrects instead of the browser failing silently.
+    #[tokio::test]
+    async fn emit_report_tool_rejects_schema_valid_payloads_the_template_cannot_render() {
+        let tool = emit_report_tool();
+
+        async fn rejection(tool: &SchemaTool<ReportData>, payload: serde_json::Value) -> String {
+            match tool.call(payload).await.unwrap() {
+                ToolOutcome::Rejected { reason } => reason,
+                other => panic!("expected Rejected, got {other:?}"),
+            }
+        }
+
+        // 1. `latestCompletedPeriod` written in a different format than the periods (`2026-5`
+        //    vs `2026-05`): the template's `findIndex` returns -1 → `completed` is undefined.
+        let mut bad = valid_report();
+        bad["summary"]["latestCompletedPeriod"] = "2026-5".into();
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("latestCompletedPeriod"), "{reason}");
+
+        // 2. No periods at all (an empty fetch transcribed as-is).
+        let mut bad = valid_report();
+        bad["periods"] = serde_json::json!([]);
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("periods"), "{reason}");
+
+        // 3. No station ranking: `stationRanking[0].name` throws.
+        let mut bad = valid_report();
+        bad["stationRanking"] = serde_json::json!([]);
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("stationRanking"), "{reason}");
+
+        // 4. `latestCompletedPeriod` anchored on the partial trailing month.
+        let mut bad = valid_report();
+        bad["summary"]["latestCompletedPeriod"] = "2026-06".into();
+        let reason = rejection(&tool, bad).await;
+        assert!(
+            reason.contains("latestCompletedPeriod") && reason.contains("partial"),
+            "{reason}"
+        );
+
+        // 5. A period not in `YYYY-MM` form (zero-padded month) — the anchor can never match it.
+        //    Checked on every entry: mutate the second one, not only the first.
+        let mut bad = valid_report();
+        bad["periods"][1]["period"] = "2026年6月".into();
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("YYYY-MM"), "{reason}");
+
+        // 5b. A locale `Intl.NumberFormat` throws on.
+        let mut bad = valid_report();
+        bad["report"]["locale"] = "zh_TW".into();
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("report.locale"), "{reason}");
+
+        // 6. Periods newest-first: the template reads `periods[0]` as the first month.
+        let mut bad = valid_report();
+        let periods = bad["periods"].as_array().unwrap().clone();
+        bad["periods"] = serde_json::json!([periods[1], periods[0]]);
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("oldest first"), "{reason}");
+
+        // 7. A partial month that is not the trailing one.
+        let mut bad = valid_report();
+        bad["periods"][0]["partial"] = true.into();
+        bad["periods"][1]["partial"] = false.into();
+        bad["summary"]["latestCompletedPeriod"] = "2026-06".into();
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("partial"), "{reason}");
+
+        // 8. Ranks not consecutive from 1.
+        let mut bad = valid_report();
+        bad["stationRanking"][0]["rank"] = 2.into();
+        let reason = rejection(&tool, bad).await;
+        assert!(reason.contains("rank"), "{reason}");
+
+        // The well-formed payload still produces.
+        assert!(matches!(
+            tool.call(valid_report()).await.unwrap(),
+            ToolOutcome::Produced(_)
         ));
     }
 

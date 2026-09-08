@@ -25,6 +25,7 @@ skill-commons v0.10.0 起，`work_status: completed` 的 v3 work item 必須宣�
 | Work item | Type | Surface | Area | Delivery | 遺留 gate |
 |---|---|---|---|---|---|
 | [retire-superseded-agent-endpoints](./retire-superseded-agent-endpoints/prd.md) | refactor | server | endpoints | [PR #11](https://github.com/h-alice/datacenter-agent/pull/11) merged `7aa2af1` | AC-001/AC-002 缺 route-level 404 斷言（見 prd.md `## Delivery`） |
+| [report-data-semantic-validation](./report-data-semantic-validation/implement-report.md) | bug-fix | agent + template + server | report | 分支 `fix/report-blank-charts`（falcon 配套 `fix/report-data-unavailable-copy`），未開 PR | 真實 model 端到端（`tests/repro_report_data.rs`，需 OPENROUTER_API_KEY）未重跑 |
 
 ## 尚未進 main
 

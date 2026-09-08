@@ -41,7 +41,7 @@ use crate::agent::clock::{Clock, SystemClock};
 use crate::agent::config::PipelineId;
 use crate::agent::engine::Orchestrator;
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
-use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
+use crate::agent::payload::{AgentError, AgentPayload, ArtifactKey, Exchange, InitialPrompt};
 use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id, ss_chat_pipeline_id};
 use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline, build_ss_chat_pipeline};
 use crate::runtime::audit::{hash_identifier, AuditCtx, AuditEvent, AuditWriter};
@@ -632,6 +632,8 @@ async fn run_chat_stream(
                     };
                     completed = true;
                 }
+                // The audit keeps the raw stage message (same as the OpenAI routes); the wire
+                // frame below carries the classified code + copy.
                 AgentEvent::Error { message } => failure = Some(message.clone()),
                 _ => {}
             }
@@ -645,7 +647,19 @@ async fn run_chat_stream(
                 }
                 other => other,
             };
-            for frame in insight_frames(event) {
+            // A stage failure carries the pipeline-aware code + copy (the report pipeline's
+            // "data insufficient" outcome must not read as a generic upstream error).
+            let frames = match event {
+                AgentEvent::Error { message } => {
+                    let failure = classify_pipeline_failure(ran_report_pipeline, message);
+                    vec![StreamFrame::Error {
+                        data: failure.message,
+                        code: failure.code.to_string(),
+                    }]
+                }
+                other => insight_frames(other),
+            };
+            for frame in frames {
                 yield Ok::<_, Infallible>(sse_event(frame));
             }
         }
@@ -758,6 +772,41 @@ fn with_prefix(prefix: &str, answer: String) -> String {
         answer
     } else {
         format!("{prefix}\n\n{answer}")
+    }
+}
+
+/// The user-facing copy for a report pipeline that ended without a renderable `report.data`.
+const REPORT_DATA_UNAVAILABLE_COPY: &str = "無法產生報表：未能取得可渲染的報表資料，可能是所選期間沒有月營運或站點資料。請調整期間或稍後再試。";
+
+/// A pipeline failure as the client sees it: a stable `code` plus a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipelineFailure {
+    code: &'static str,
+    message: String,
+}
+
+/// Classify a pipeline failure message for the wire.
+///
+/// A report pipeline that ends with `missing artifact: report.data` — the composer never produced
+/// a payload that passed `emit_report` (most often because the fetched material had no monthly or
+/// station figures and the model, correctly, declined to invent them; occasionally because it kept
+/// mis-shaping the payload until the step cap) — is not an upstream fault the client can retry
+/// blindly: it gets its own stable code and a user-facing explanation instead of the raw
+/// `missing artifact` text. The copy names the likely cause without asserting it. Everything else
+/// stays `upstream.error` with the message as-is. The audit record keeps the raw message on every
+/// route, so operators still see which stage failed.
+fn classify_pipeline_failure(ran_report_pipeline: bool, message: String) -> PipelineFailure {
+    let missing_report_data = AgentError::MissingArtifact(ArtifactKey::report_data()).to_string();
+    if ran_report_pipeline && message == missing_report_data {
+        PipelineFailure {
+            code: crate::server::codes::REPORT_DATA_UNAVAILABLE,
+            message: REPORT_DATA_UNAVAILABLE_COPY.to_string(),
+        }
+    } else {
+        PipelineFailure {
+            code: crate::server::codes::UPSTREAM_ERROR,
+            message,
+        }
     }
 }
 
@@ -1266,7 +1315,16 @@ async fn openai_buffered_response(
             {
                 warn!(error = %e, "chat_completions: audit ResponseFailed failed");
             }
-            openai_error(StatusCode::BAD_GATEWAY, openai::ERR_UPSTREAM, message)
+            let failure = classify_pipeline_failure(report, message);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(openai::OpenAiErrorBody::with_code(
+                    failure.code,
+                    openai::ERR_UPSTREAM,
+                    failure.message,
+                )),
+            )
+                .into_response()
         }
     }
 }
@@ -1420,7 +1478,12 @@ async fn openai_stream_response(
                 {
                     warn!(error = %e, "chat_completions stream: audit ResponseFailed failed");
                 }
-                let body = openai::OpenAiErrorBody::new(openai::ERR_UPSTREAM, message);
+                let failure = classify_pipeline_failure(report, message);
+                let body = openai::OpenAiErrorBody::with_code(
+                    failure.code,
+                    openai::ERR_UPSTREAM,
+                    failure.message,
+                );
                 yield Ok::<_, Infallible>(
                     Event::default()
                         .json_data(&body)
@@ -1723,6 +1786,160 @@ mod tests {
         assert!(wants_report_pipeline(&classify("我想要營收報告")));
         // A plain analytics ask (no report vocabulary) → insight pipeline.
         assert!(!wants_report_pipeline(&classify("分析最近三個月的營收")));
+    }
+
+    #[test]
+    fn classify_pipeline_failure_gives_missing_report_data_its_own_code_only_for_the_report_pipeline(
+    ) {
+        let missing = AgentError::MissingArtifact(ArtifactKey::report_data()).to_string();
+        let report = classify_pipeline_failure(true, missing.clone());
+        assert_eq!(report.code, crate::server::codes::REPORT_DATA_UNAVAILABLE);
+        assert_eq!(report.message, REPORT_DATA_UNAVAILABLE_COPY);
+
+        // The insight pipeline never produces report.data; the same text there is a wiring fault.
+        let insight = classify_pipeline_failure(false, missing.clone());
+        assert_eq!(insight.code, crate::server::codes::UPSTREAM_ERROR);
+        assert_eq!(insight.message, missing);
+
+        // Any other report failure stays a plain upstream error with its message intact.
+        let other = classify_pipeline_failure(true, "boom".into());
+        assert_eq!(other.code, crate::server::codes::UPSTREAM_ERROR);
+        assert_eq!(other.message, "boom");
+    }
+
+    /// The composer obeys the prompt when the fetched material has no monthly figures: it never
+    /// calls `emit_report`. The stage then fails with `missing artifact: report.data`, which the
+    /// report pipeline must surface as `report.data_unavailable` with user-facing copy — not as a
+    /// blank-chart report (before this change) nor as a raw `missing artifact` upstream error.
+    #[tokio::test]
+    async fn report_without_emitted_data_fails_as_report_data_unavailable() {
+        let llm = crate::test_support::ScriptedChatCompletions::start();
+        llm.refuse_report();
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            123,
+            &["hdrenewables/elecsvc/starcharger/finance"],
+        );
+        let (state, _mcp) = crate::test_support::runtime_app_state_with_fixtures(
+            provider,
+            llm.base_url.clone(),
+            &[
+                "bill_revenue",
+                "bill_charge",
+                "member_analysis",
+                "business_metrics",
+                "station_revenue_ranking",
+                "bill_member_analysis",
+            ],
+        )
+        .await;
+        let app = crate::server::route::build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .header("x-falcon-authorization", "Bearer delegated-local-token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "test/model",
+                            "messages": [{"role": "user", "content": "給我一份完整的報告"}],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await)
+            .expect("OpenAI error envelope should be JSON");
+        assert_eq!(
+            body["error"]["code"],
+            crate::server::codes::REPORT_DATA_UNAVAILABLE
+        );
+        assert_eq!(body["error"]["message"], REPORT_DATA_UNAVAILABLE_COPY);
+        assert_eq!(body["error"]["type"], openai::ERR_UPSTREAM);
+    }
+
+    /// The same "no data" composer on the route Falcon actually consumes: the `error` frame must
+    /// carry the stable code and the user-facing copy, and the composer must have been nudged the
+    /// full `MAX_OUTPUT_RETRIES` times before the stage gave up (proving the failure came from the
+    /// required-output guard, not from an unrelated stage error).
+    #[tokio::test]
+    async fn report_stream_without_emitted_data_emits_report_data_unavailable_error_frame() {
+        let llm = crate::test_support::ScriptedChatCompletions::start();
+        llm.refuse_report();
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            123,
+            &["hdrenewables/elecsvc/starcharger/finance"],
+        );
+        let (state, _mcp) = crate::test_support::runtime_app_state_with_fixtures(
+            provider,
+            llm.base_url.clone(),
+            &[
+                "bill_revenue",
+                "bill_charge",
+                "member_analysis",
+                "business_metrics",
+                "station_revenue_ranking",
+                "bill_member_analysis",
+            ],
+        )
+        .await;
+        let app = crate::server::route::build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agent/stream")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .header("x-falcon-authorization", "Bearer delegated-local-token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "prompt": "給我一份完整的報告" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let frames: Vec<serde_json::Value> = sse_data_lines(&body_string(response).await)
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let error = frames
+            .iter()
+            .find(|f| f["event"] == "error")
+            .expect("the stream must end with an error frame");
+        assert_eq!(
+            error["code"],
+            crate::server::codes::REPORT_DATA_UNAVAILABLE,
+            "frames: {frames:?}"
+        );
+        assert_eq!(error["data"], REPORT_DATA_UNAVAILABLE_COPY);
+        assert!(
+            !frames.iter().any(|f| f["event"] == "done"),
+            "a failed report must not also signal a clean `done`"
+        );
+
+        // The composer was nudged the full retry budget before the stage failed.
+        let nudges = llm
+            .request_bodies()
+            .iter()
+            .filter(|body| body.contains("You have NOT produced the required result yet"))
+            .count();
+        assert_eq!(nudges, crate::agent::payload::MAX_OUTPUT_RETRIES);
     }
 
     #[tokio::test]

@@ -252,6 +252,16 @@
       height: 300px;
     }
 
+    .report-error {
+      margin: 0 0 16px;
+      padding: 12px 16px;
+      border-left: 4px solid var(--report-color-status-caution);
+      border-radius: var(--report-radius-control);
+      background: var(--report-color-surface-subtle);
+      color: var(--report-color-content-primary);
+      font-size: 13px;
+    }
+
     .chart-fallback {
       display: grid;
       min-height: 300px;
@@ -686,8 +696,63 @@
     (() => {
       'use strict'
 
+      // Any failure past this point must be *visible*. Without this guard a thrown error leaves
+      // the header filled in and every chart canvas blank, which reads as "the report generated
+      // but the charts are empty" rather than as the data fault it is.
+      const showReportError = (detail) => {
+        document.querySelectorAll('[data-chart-frame]').forEach((frame) => {
+          frame.replaceChildren()
+          const fallback = document.createElement('p')
+          fallback.className = 'chart-fallback'
+          fallback.textContent = '報表資料不完整，無法繪製圖表。'
+          frame.append(fallback)
+        })
+        const banner = document.createElement('p')
+        banner.className = 'report-error'
+        banner.setAttribute('role', 'alert')
+        banner.dataset.reportError = 'true'
+        banner.textContent = `報表資料不完整，未能完整呈現：${detail}`
+        const main = document.querySelector('main') || document.body
+        main.prepend(banner)
+      }
+
+      // The invariants whose violation makes the script below throw. The server's `emit_report`
+      // sink (`ReportData::validate`) enforces these plus the ordering/format rules that only
+      // render wrongly; this is the last line of defence, not the first.
+      const checkInvariants = (data) => {
+        if (!Array.isArray(data.periods) || data.periods.length === 0) {
+          throw new Error('periods 為空')
+        }
+        if (!Array.isArray(data.stationRanking) || data.stationRanking.length === 0) {
+          throw new Error('stationRanking 為空')
+        }
+        const anchor = data.summary && data.summary.latestCompletedPeriod
+        const completed = data.periods.find((item) => item.period === anchor)
+        if (!completed) {
+          throw new Error(`summary.latestCompletedPeriod「${anchor}」不在 periods 之中`)
+        }
+        if (completed.partial) {
+          throw new Error(`summary.latestCompletedPeriod「${anchor}」是部分月份`)
+        }
+      }
+
       const dataNode = document.getElementById('report-data')
-      const data = JSON.parse(dataNode.textContent)
+      let data
+      try {
+        data = JSON.parse(dataNode.textContent)
+        checkInvariants(data)
+      } catch (error) {
+        showReportError(error && error.message ? error.message : String(error))
+        return
+      }
+
+      try {
+        renderReport(data)
+      } catch (error) {
+        showReportError(error && error.message ? error.message : String(error))
+      }
+
+      function renderReport(data) {
       const locale = data.report.locale || 'zh-TW'
       const integerFormat = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 })
       const compactFormat = new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 })
@@ -743,7 +808,9 @@
 
       const completedIndex = data.periods.findIndex((item) => item.period === data.summary.latestCompletedPeriod)
       const completed = data.periods[completedIndex]
-      const previousCompleted = data.periods[Math.max(0, completedIndex - 1)]
+      // No month precedes the anchor when it is the first in the window; say so instead of
+      // comparing the month against itself (which reads as a fabricated "0.0%").
+      const previousCompleted = completedIndex > 0 ? data.periods[completedIndex - 1] : null
       const first = data.periods[0]
       const latest = data.periods[data.periods.length - 1]
       const topStation = data.stationRanking[0]
@@ -758,8 +825,10 @@
         {
           label: `${completed.period} 充電度數`,
           value: `${integerFormat.format(completed.kwh)} kWh`,
-          detail: `較上月 ${formatPercent(comparePercent(completed.kwh, previousCompleted.kwh))}`,
-          tone: completed.kwh >= previousCompleted.kwh ? 'positive' : 'negative',
+          detail: previousCompleted
+            ? `較上月 ${formatPercent(comparePercent(completed.kwh, previousCompleted.kwh))}`
+            : '無前期資料可比較',
+          tone: !previousCompleted ? 'neutral' : completed.kwh >= previousCompleted.kwh ? 'positive' : 'negative',
         },
         {
           label: '累積會員數',
@@ -1072,6 +1141,7 @@
           },
         },
       })
+      }
     })()
   </script>
 </body>

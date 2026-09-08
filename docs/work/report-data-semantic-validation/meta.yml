@@ -1,0 +1,29 @@
+schema_version: work-item/v3
+slug: report-data-semantic-validation
+title: emit_report 語意驗證與報表模板防線，修正圖表全白的報表
+created_at: 2026-09-08T10:15:00+08:00
+updated_at: 2026-09-08T15:00:00+08:00
+execution_mode: bug-fix
+work_status: completed
+delivery_status: awaiting_approval
+documentation_impact: doc:docs/reference/modules/agent.md
+stages:
+  implement: { skill: implement, file: implement-report.md, status: done }
+inputs:
+  - user:report-tool-generates-empty-chart-2026-09-08
+  - src/agent/report.rs
+  - src/agent/tools.rs
+  - src/agent/payload.rs
+  - src/test_support.rs
+  - config/report_template/report.html
+  - config/prompt_guide/report_composer_system.md
+  - local:headless-chrome-repro-schema-valid-payloads-2026-09-08
+  - local:fable-fresh-review-round-1-pass-with-fixes-2026-09-08
+  - user:option-a-clear-failure-over-composer-prose-exit-2026-09-08
+  - src/server/handler.rs
+  - src/server/codes.rs
+  - docs/reference/endpoints/agent-stream.md
+  - docs/reference/endpoints/chat-completions.md
+  - external:falcon-client/src/components/chief-of-staff/useChiefOfStaffStream.ts
+  - external:falcon-client/src/lib/chief-of-staff/agent-runtime/streaming-events.ts
+  - external:falcon-client/src/lib/chief-of-staff/copy.ts

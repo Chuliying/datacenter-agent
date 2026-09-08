@@ -97,7 +97,7 @@ identity 後的 per-actor bucket。bucket 耗盡時，
 | `usage` | `{"event":"usage","data":{"prompt":N,"completion":N,"reasoning":N,"total":N}}` | 一次 LLM turn 的 token 用量；一個 stage 可能報多次 |
 | `clear` | `{"event":"clear"}` | 清掉先前串流的預覽 |
 | `done` | `{"event":"done"}` | 乾淨結束，關連線 |
-| `error` | `{"event":"error","data":"<message>"}` | 終止性錯誤，關連線 |
+| `error` | `{"event":"error","data":"<message>","code":"upstream.error"}` | 終止性錯誤，關連線。report pipeline 產不出可渲染的 `report.data`（多半是 fetch 沒有月／站點資料，也可能是 model 到步數上限都沒送出合格 payload）時 `code` 為 `report.data_unavailable`，`data` 是使用者可讀文案；audit 仍記原始 stage 訊息 |
 | `refusal` | `{"event":"refusal","code":"authz.insufficient"}` | `200` 的終端授權拒答，不是 upstream error |
 
 `phase` 值為 `started` / `success` / `failure`（`rename_all = "lowercase"`），足以驅動

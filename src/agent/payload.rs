@@ -406,6 +406,10 @@ pub trait Tool: Send + Sync {
     async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError>;
 }
 
+/// How many times [`run_llm_loop`] nudges a model that ends on a bare message while its required
+/// output is still missing, before the stage fails with [`AgentError::MissingArtifact`].
+pub const MAX_OUTPUT_RETRIES: usize = 3;
+
 /// Drives the model's tool-use loop until it returns a final message.
 ///
 /// The model sees `tools` and decides which to call.
@@ -462,7 +466,6 @@ pub async fn run_llm_loop<L: LlmCapability>(
 
     const MAX_STEPS: usize = 8; // guard against a non-terminating tool loop
                                 // How many times to nudge a model that ends without its `required` output before giving up.
-    const MAX_OUTPUT_RETRIES: usize = 3;
     let mut output_retries = 0usize;
     for step in 0..MAX_STEPS {
         match llm.chat(&messages, &schemas).await? {
@@ -497,12 +500,17 @@ pub async fn run_llm_loop<L: LlmCapability>(
                             content: Some(text),
                             tool_calls: vec![],
                         });
+                        // The nudge must not push the model into inventing data: when the
+                        // material genuinely lacks what the tool needs, the correct move is to
+                        // restate the gap (the stage then fails cleanly), never to fabricate.
                         messages.push(LlmMessage::User(format!(
                             "You have NOT produced the required result yet: the `{key}` artifact is \
-                             missing because no tool call has succeeded. Do not reply with prose or a \
-                             confirmation. You MUST call the required tool now with valid, \
+                             missing because no tool call has succeeded. If the material contains \
+                             the data the tool needs, call the required tool now with valid, \
                              fully-populated arguments — every field present, and nested values as \
-                             real JSON objects/arrays, never as strings."
+                             real JSON objects/arrays, never as strings; do not reply with prose or \
+                             a confirmation instead. If the material genuinely lacks that data, do \
+                             NOT invent it: restate exactly which data is missing."
                         )));
                         continue;
                     }
@@ -551,9 +559,12 @@ pub async fn run_llm_loop<L: LlmCapability>(
                         }
                         // Do NOT record an artifact: the model must correct and call again.
                         ToolOutcome::Rejected { reason } => {
-                            // DEBUG PROBE: a tool call was rejected (schema/validation). Repeated
-                            // rejections are a prime reason `report.data` never gets set.
-                            tracing::debug!(
+                            // Visible at the default log level: a rejection names the exact
+                            // field the model got wrong, which is the evidence needed to tell a
+                            // "model keeps mis-formatting X" problem from a "fetch returned
+                            // nothing" one. Repeated rejections are also the prime reason a
+                            // required output (`report.data`) never gets set.
+                            tracing::info!(
                                 target: "agent::probe",
                                 step,
                                 tool = %name,

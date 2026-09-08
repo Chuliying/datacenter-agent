@@ -16,5 +16,8 @@ pub const RATE_LIMIT_GLOBAL: &str = "rate_limit.global";
 pub const RATE_LIMIT_ACTOR: &str = "rate_limit.actor";
 pub const REQUEST_INVALID: &str = "request.invalid";
 pub const UPSTREAM_ERROR: &str = "upstream.error";
+/// The report pipeline ended without a renderable `report.data` (the fetched material lacked the
+/// monthly or station figures a report needs, or the model never produced a valid payload).
+pub const REPORT_DATA_UNAVAILABLE: &str = "report.data_unavailable";
 pub const SERVER_UNAVAILABLE: &str = "server.unavailable";
 pub const SERVER_INTERNAL: &str = "server.internal";
