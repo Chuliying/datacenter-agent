@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-07
+
 ### Fixed
 - `[authz.permission_tools]` and `[authz].ss_chat_permissions` now use Falcon's actual
   permission `code` form (`hdrenewables:elecsvc:starcharger:opperf`, colon-separated).
