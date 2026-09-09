@@ -27,8 +27,12 @@
 //! ```ignore
 //! use datacenter_agent::config::AppConfig;
 //!
+//! # fn main() -> anyhow::Result<()> {
 //! let app = AppConfig::load("config/config.toml")?;
 //! let agent_prompt = app.get_prompt_by_id("agent_system")?;
+//! # let _ = agent_prompt;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::BTreeMap;
