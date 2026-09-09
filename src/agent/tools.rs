@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -363,7 +364,7 @@ where
     async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutcome, AgentError> {
         // Schema enforcement: a shape the protocol type can't accept is REJECTED, not fatal —
         // the loop feeds the reason back and the model corrects (loop-until-valid).
-        let parsed: T = match serde_json::from_value(arguments.clone()) {
+        let parsed: T = match deserialize_with_path::<T>(arguments.clone()) {
             Ok(value) => value,
             Err(first_err) => {
                 // Some models (notably Gemini) emit *nested* object/array arguments as JSON
@@ -372,12 +373,12 @@ where
                 // The content is correct; only the encoding is wrong. Recover by decoding any
                 // embedded JSON strings and retrying once. This fires ONLY on the error path, so a
                 // well-formed call is never touched.
-                match serde_json::from_value(coerce_embedded_json(arguments)) {
+                match deserialize_with_path::<T>(coerce_embedded_json(arguments.clone())) {
                     Ok(value) => value,
                     // Report the ORIGINAL error: it describes the shape the model actually sent.
                     Err(_) => {
                         return Ok(ToolOutcome::Rejected {
-                            reason: format!("schema: {first_err}"),
+                            reason: reject_reason(&self.name, &first_err, &arguments),
                         })
                     }
                 }
@@ -385,9 +386,122 @@ where
         };
         Ok(match (self.on_valid)(parsed) {
             Ok(value) => ToolOutcome::Produced(value),
-            Err(reason) => ToolOutcome::Rejected { reason },
+            Err(reason) => ToolOutcome::Rejected {
+                reason: format!(
+                    "{reason}. Nothing was recorded. Fix exactly that and call `{}` again.",
+                    self.name
+                ),
+            },
         })
     }
+}
+
+// ===========================================================================
+// Rejection feedback — the model's only channel for self-correction
+// ===========================================================================
+
+/// A deserialization failure that knows **where** it happened.
+///
+/// `serde_json`'s own error says *what* was wrong (`missing field \`kwh\``) but locates it only by
+/// line/column of a buffer the model never saw. [`serde_path_to_error`] adds the JSON path
+/// (`periods[3].kwh`), which is the part a model can actually act on.
+struct PathError {
+    /// The JSON path to the offending value, e.g. `periods[3].kwh`. Empty at the root.
+    path: String,
+    /// The underlying `serde` message, with its meaningless line/column tail stripped.
+    message: String,
+}
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.path.is_empty() {
+            write!(f, "{}", self.message)
+        } else {
+            write!(f, "at `{}`: {}", self.path, self.message)
+        }
+    }
+}
+
+/// Deserializes `value` into `T`, keeping the JSON path of any failure.
+fn deserialize_with_path<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, PathError> {
+    serde_path_to_error::deserialize(value).map_err(|e| {
+        let path = e.path().to_string();
+        // `serde_path_to_error` renders a root failure as ".", which reads like a real path.
+        let path = if path == "." { String::new() } else { path };
+        let message = e.into_inner().to_string();
+        // Drop the ` at line 1 column 4271` tail: the model never saw that buffer, and the offset
+        // only invites it to "fix" a position rather than a field.
+        let message = match message.find(" at line ") {
+            Some(cut) => message[..cut].to_string(),
+            None => message,
+        };
+        PathError { path, message }
+    })
+}
+
+/// Builds the feedback string a rejected schema call sends back to the model.
+///
+/// The loop hands this to the model verbatim as the tool result, so it is written *at* the model:
+/// what failed, where, what it actually sent there, and what to do next. A bare
+/// `schema: missing field \`kwh\`` leaves a model guessing which of 12 `periods` entries to fix;
+/// this names the path and echoes the shape it sent, which is what turns a retry into a correction.
+fn reject_reason(tool: &str, err: &PathError, arguments: &serde_json::Value) -> String {
+    let mut reason = format!(
+        "the arguments did not match the tool's schema, so NOTHING was recorded and this call did \
+         not count. Problem {err}."
+    );
+    if let Some(observed) = describe_at_path(arguments, &err.path) {
+        reason.push_str(&format!(" You sent there: {observed}."));
+    }
+    reason.push_str(&format!(
+        " Fix only that, keep every other field you already had, and call `{tool}` again with the \
+         COMPLETE payload — the schema in this tool's definition is authoritative, every required \
+         field must be present, and nested values must be real JSON objects/arrays, never strings."
+    ));
+    reason
+}
+
+/// Renders a short, truncated description of whatever the model actually put at `path`.
+///
+/// `path` is [`serde_path_to_error`]'s rendering — dot-separated keys with bracketed sequence
+/// indices, e.g. `periods[3].kwh`.
+///
+/// Returns `None` when the path does not resolve (a missing field — there is nothing to echo).
+fn describe_at_path(arguments: &serde_json::Value, path: &str) -> Option<String> {
+    let mut cursor = arguments;
+    for segment in path.split('.').filter(|s| !s.is_empty()) {
+        // A segment is `key`, `key[3]`, or a bare `[3]` — walk the key first, then each index.
+        let (key, mut rest) = match segment.find('[') {
+            Some(at) => (&segment[..at], &segment[at..]),
+            None => (segment, ""),
+        };
+        if !key.is_empty() {
+            cursor = cursor.get(key)?;
+        }
+        while let Some(close) = rest.find(']') {
+            let index: usize = rest.get(1..close)?.parse().ok()?;
+            cursor = cursor.get(index)?;
+            rest = &rest[close + 1..];
+        }
+    }
+    let rendered = match cursor {
+        serde_json::Value::Object(map) => format!(
+            "an object with keys [{}]",
+            map.keys()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        serde_json::Value::Array(items) => format!("an array of {} items", items.len()),
+        other => {
+            let mut text = other.to_string();
+            if text.chars().count() > 120 {
+                text = text.chars().take(120).collect::<String>() + "…";
+            }
+            text
+        }
+    };
+    Some(rendered)
 }
 
 /// Builds the `emit_chart` sink: a [`SchemaTool`] over [`ChartBatch`] whose validated value lands
@@ -459,10 +573,35 @@ fn arg_object(
         serde_json::Value::Object(map) => Ok(map),
         serde_json::Value::Null => Ok(serde_json::Map::new()),
         other => Err(format!(
-            "expected a JSON object for tool arguments, got {other}"
+            "the arguments must be a JSON object of this tool's named parameters, but a bare \
+             {kind} was sent ({preview}). Nothing was recorded. Call the tool again, passing every \
+             parameter by name.",
+            kind = match other {
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Bool(_) => "boolean",
+                _ => "number",
+            },
+            preview = {
+                let text = other.to_string();
+                if text.chars().count() > 120 {
+                    text.chars().take(120).collect::<String>() + "…"
+                } else {
+                    text
+                }
+            }
         )),
     }
 }
+
+/// How many times one [`McpTool`] instance absorbs a transport failure as retryable feedback
+/// before giving up and failing the stage.
+///
+/// Tools are built per request, so this counter is per turn. The first failure is handed back to
+/// the model as a [`ToolOutcome::Rejected`] — a single flaky call must not kill a six-tool report
+/// fetch — but a tool that fails *again* means the server is genuinely unreachable, and a fatal
+/// error is a far better outcome than a report silently composed from five sixths of the data.
+const MCP_TRANSPORT_RETRIES: usize = 1;
 
 /// A [`Tool`] backed by an MCP server.
 ///
@@ -485,6 +624,8 @@ pub struct McpTool {
     description: String,
     parameters: serde_json::Value,
     target: ArtifactKey,
+    /// Transport failures absorbed so far this turn — see [`MCP_TRANSPORT_RETRIES`].
+    transport_failures: AtomicUsize,
 }
 
 impl McpTool {
@@ -515,6 +656,7 @@ impl McpTool {
             description: description.into(),
             parameters,
             target,
+            transport_failures: AtomicUsize::new(0),
         }
     }
 
@@ -559,15 +701,49 @@ impl Tool for McpTool {
             Ok(map) => map,
             Err(reason) => return Ok(ToolOutcome::Rejected { reason }),
         };
-        // Transport / wiring failure is fatal (`Err`). Note `call_tool_text` already absorbs a
-        // *tool-reported* error into `Ok(text)` (logging a warning), so the model still sees it
-        // as data it can react to; only a genuine transport failure reaches this `Err` arm.
+        // Note `call_tool_text` already absorbs a *tool-reported* error into `Ok(text)` (logging a
+        // warning), so the model still sees it as data it can react to; only a genuine transport
+        // failure reaches the `Err` arm below.
         match self.handle.call_tool_text(&self.mcp_name, args).await {
-            Ok(text) => Ok(ToolOutcome::Produced(ArtifactValue::Text(text))),
-            Err(e) => Err(AgentError::Capability(format!(
-                "mcp tool `{}`: {e:#}",
-                self.mcp_name
-            ))),
+            Ok(text) => {
+                self.transport_failures.store(0, Ordering::Relaxed);
+                Ok(ToolOutcome::Produced(ArtifactValue::Text(text)))
+            }
+            // A transport failure is recoverable ONCE: the model is told, in words it can act on,
+            // that this specific fetch produced nothing, and can retry it or carry on with the
+            // remaining tools. A second failure of the same tool is fatal — see
+            // `MCP_TRANSPORT_RETRIES`.
+            Err(e) => {
+                let seen = self.transport_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if seen > MCP_TRANSPORT_RETRIES {
+                    tracing::error!(
+                        tool = %self.name,
+                        failures = seen,
+                        error = %format!("{e:#}"),
+                        "mcp tool failed repeatedly — failing the stage"
+                    );
+                    return Err(AgentError::Capability(format!(
+                        "mcp tool `{}` failed {seen} times: {e:#}",
+                        self.mcp_name
+                    )));
+                }
+                tracing::warn!(
+                    tool = %self.name,
+                    failures = seen,
+                    error = %format!("{e:#}"),
+                    "mcp tool transport failure — feeding it back to the model as retryable"
+                );
+                Ok(ToolOutcome::Rejected {
+                    reason: format!(
+                        "the data server could not be reached, so this call returned NO data and \
+                         nothing was recorded. Transport error: {e:#}. You may call `{name}` once \
+                         more with the same arguments. If it fails again, do NOT invent or estimate \
+                         the missing figures — call the other granted tools, then state plainly \
+                         which data could not be retrieved.",
+                        name = self.name
+                    ),
+                })
+            }
         }
     }
 }
@@ -717,7 +893,44 @@ mod tests {
         );
         let bad = serde_json::json!({ "chart_type": "donut" });
         match tool.call(bad).await {
-            Ok(ToolOutcome::Rejected { reason }) => assert!(reason.starts_with("schema:")),
+            Ok(ToolOutcome::Rejected { reason }) => {
+                // The feedback must be actionable: name the offending field, quote what was sent,
+                // say nothing was recorded, and tell the model to call again.
+                assert!(reason.contains("`chart_type`"), "reason: {reason}");
+                assert!(reason.contains("\"donut\""), "reason: {reason}");
+                assert!(reason.contains("NOTHING was recorded"), "reason: {reason}");
+                assert!(reason.contains("`emit_chart` again"), "reason: {reason}");
+                // The line/column tail is noise the model cannot act on.
+                assert!(!reason.contains("at line "), "reason: {reason}");
+            }
+            other => panic!("expected Ok(Rejected), got {other:?}"),
+        }
+    }
+
+    // A failure deep inside a nested payload must be located by JSON *path*, not by byte offset:
+    // "missing field `y`" is useless when there are twelve entries to choose between.
+    #[tokio::test]
+    async fn a_nested_rejection_names_the_json_path_and_echoes_what_was_sent() {
+        let tool = SchemaTool::<ChartSpec>::sink(
+            "emit_chart",
+            "emit a chart",
+            ArtifactKey::fetcher_records(),
+        );
+        let bad = serde_json::json!({
+            "chart_type": "bar",
+            "title": "revenue",
+            "data_points": [
+                { "label": "AC", "value": 1.0 },
+                { "label": "DC", "value": "not-a-number" },
+            ]
+        });
+        match tool.call(bad).await {
+            Ok(ToolOutcome::Rejected { reason }) => {
+                // The path pinpoints the offending element, not just "somewhere in data_points".
+                assert!(reason.contains("data_points[1].value"), "reason: {reason}");
+                // …and the value it actually sent there is echoed back.
+                assert!(reason.contains("not-a-number"), "reason: {reason}");
+            }
             other => panic!("expected Ok(Rejected), got {other:?}"),
         }
     }
@@ -763,8 +976,50 @@ mod tests {
             "data_points": 42
         });
         match tool.call(bad).await {
-            Ok(ToolOutcome::Rejected { reason }) => assert!(reason.starts_with("schema:")),
+            Ok(ToolOutcome::Rejected { reason }) => {
+                assert!(reason.contains("data_points"), "reason: {reason}");
+                assert!(reason.contains("42"), "reason: {reason}");
+            }
             other => panic!("expected Ok(Rejected), got {other:?}"),
+        }
+    }
+
+    // A transport failure must be RECOVERABLE once — a single flaky call cannot be allowed to kill
+    // a six-tool report fetch — and fatal on the second, because a server that is genuinely
+    // unreachable must not yield a report quietly composed from five sixths of the data.
+    #[tokio::test]
+    async fn an_mcp_transport_failure_is_retryable_once_then_fatal() {
+        let session = crate::test_support::stub_mcp_with_tools(["bill_revenue"]).await;
+        let tool = McpTool::from_name(
+            session.handle.clone(),
+            "bill_revenue",
+            "bill_revenue",
+            "revenue",
+            serde_json::json!({ "type": "object", "properties": {} }),
+            ArtifactKey::new("fetcher", "bill_revenue"),
+        );
+        // Tear the session down: every call now fails at the transport, exactly as an unreachable
+        // datacenter does.
+        drop(session);
+
+        // First failure: handed back to the model with something it can act on.
+        match tool.call(serde_json::json!({})).await {
+            Ok(ToolOutcome::Rejected { reason }) => {
+                assert!(reason.contains("could not be reached"), "reason: {reason}");
+                assert!(reason.contains("NO data"), "reason: {reason}");
+                // It must be told what NOT to do with the gap.
+                assert!(reason.contains("do NOT invent"), "reason: {reason}");
+            }
+            other => panic!("the first transport failure must be retryable, got {other:?}"),
+        }
+
+        // Second failure of the same tool: fatal, so the stage fails loudly.
+        match tool.call(serde_json::json!({})).await {
+            Err(AgentError::Capability(message)) => {
+                assert!(message.contains("bill_revenue"), "message: {message}");
+                assert!(message.contains("failed 2 times"), "message: {message}");
+            }
+            other => panic!("a repeated transport failure must be fatal, got {other:?}"),
         }
     }
 

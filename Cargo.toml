@@ -16,6 +16,10 @@ serde_json = "1"
 # JSON-Schema derivation for `SchemaTool<T>` (tool contract §3): the advertised
 # tool schema and the on-receipt validation both come from one Rust type.
 schemars = "0.8"
+# Field-path-aware deserialization errors. `serde_json`'s own error says *what* was wrong but not
+# *where* in a nested payload; wrapping the deserializer gives the model a JSON path
+# (`periods[3].kwh`) it can actually act on when a tool call is Rejected (see `agent::tools`).
+serde_path_to_error = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 
 tracing = "0.1"

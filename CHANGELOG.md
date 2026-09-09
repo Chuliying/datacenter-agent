@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Report sections rendered empty because the fetcher skipped tools.** The `/report` fetcher was
+  told to "fetch only what the question needs", with a report caveat it had to infer from the
+  user's wording — so it routinely stopped after four or five of its six granted tools. The topics
+  it skipped had no data for the composer to transcribe, landed as `0`, and rendered as flat
+  charts and an empty station-ranking table. The report pipeline now tells the fetcher outright
+  that this is a report turn and that every granted tool must be called, and names the coverage the
+  fixed template needs (revenue; kWh + sessions; new/total/active members; stations + chargers; the
+  station ranking) rather than tool names, so a permission-narrowed grant still binds. Verified
+  live: the previous behaviour skipped `station_revenue_ranking` in 2 of 3 runs; 8 of 8 runs are
+  now complete. A new `#[ignore]`d harness, `tests/report_pipeline_coverage.rs`, asserts this
+  end to end.
+- **The tool-use loop's step cap could discard a nearly-complete fetch.** `MAX_STEPS` was 8, but a
+  model calling six tools one per step needs seven before any retry — so a single rejected call
+  cost the report a whole topic. The cap is now 16, and hitting it no longer fails a stage that
+  produced what it was asked for: the artifacts gathered so far are returned (logged at `warn`)
+  instead of taking the pipeline down with them.
+
+### Changed
+- **Tool rejections now tell the model what to fix.** A schema failure reported only
+  ``schema: missing field `kwh` ``, with a line/column offset into a buffer the model never saw.
+  Rejections now carry the JSON path (`periods[3].kwh`), echo the value actually sent there, state
+  that nothing was recorded, and say what to do next. The required-output nudge — sent when a stage
+  ends in prose without calling its sink — likewise names the tool that fills the slot, quotes the
+  last rejection verbatim, and says how many attempts remain.
+- **A datacenter transport failure is recoverable once.** An MCP call that failed at the transport
+  used to abort the whole pipeline; the first failure of a given tool is now fed back to the model
+  as a rejection explaining that the call returned no data and that the missing figures must not be
+  invented. A second failure of the same tool is still fatal, so a genuinely unreachable server can
+  never yield a report quietly composed from partial data.
+- The composer is now told that a zeroed field is not the same as missing data: an absent topic must
+  be named in `partialPeriodNote` rather than silently rendering as an empty chart.
+
 ## [0.5.1] - 2026-09-07
 
 ### Fixed
