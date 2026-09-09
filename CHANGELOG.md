@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-09
+
 ### Fixed
 - **Report sections rendered empty because the fetcher skipped tools.** The `/report` fetcher was
   told to "fetch only what the question needs", with a report caveat it had to infer from the
