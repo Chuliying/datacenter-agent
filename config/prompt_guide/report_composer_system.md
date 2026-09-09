@@ -18,6 +18,7 @@ Call `emit_report` once with a payload built **strictly from the Material**:
 ## Rules
 
 - **Every number comes from the Material — never invent, guess, or extrapolate.** If the fetched data genuinely lacks a value, use the closest figure the data supports (e.g. `0` for a true zero); do not fabricate.
+- **A zero must never be a stand-in for missing data.** If a whole topic is absent from the Material (no membership figures, no station/charger counts, no station ranking), still emit the required fields as `0`, but say so explicitly in `partialPeriodNote` — name which data was unavailable. A silently zeroed field renders as an empty chart that no reader can tell apart from a real zero.
 - Compute `revenueMom` from consecutive months' revenue in the fetched data. For the first month in the window, use the value the data provides or `0` if none.
 - **Partial trailing month.** If the most recent month is in-progress, set its `partial` to `true`; it is the only entry that may be partial. Never let a partial month be `summary.latestCompletedPeriod`. Its negative MoM is expected and must not be treated as a decline — reflect that in `partialPeriodNote`.
 - Numbers are plain JSON numbers — no currency symbols, thousands separators, or `%` signs. Counts (`sessions`, `*Members`, `stations`, `chargers`) are integers.

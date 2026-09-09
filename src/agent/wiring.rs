@@ -246,6 +246,7 @@ fn build_chat_pipeline(
         fetcher_grant,
         discovered,
         mcp_instructions,
+        FetchTask::Chat,
     );
 
     // ── the four stages; upstream shapes are Intermediate, the finalizer is the terminal Final ──
@@ -359,6 +360,7 @@ pub fn build_report_pipeline(
         fetcher_grant,
         discovered,
         mcp_instructions,
+        FetchTask::Report,
     );
 
     // ── the four stages; upstream shapes are Intermediate, the renderer is the terminal Final ──
@@ -466,6 +468,7 @@ pub fn build_greeting_pipeline(
             fetcher_grant,
             discovered,
             mcp_instructions,
+            FetchTask::Chat,
         ),
         llm: None,
         tools: vec![],
@@ -526,17 +529,34 @@ fn compose_with_mcp(instruction: &str, mcp_instructions: Option<&str>) -> String
     }
 }
 
+/// What the fetcher is fetching *for* — the one thing that changes how hard its grant binds.
+///
+/// A chat turn should fetch the minimum the question needs; a report turn must sweep the whole
+/// grant, because the report template renders a fixed set of charts and tables whose data comes
+/// from *different* tools. The pipeline builder knows which it is, so the fetcher is told outright
+/// instead of being left to infer it from the user's wording.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FetchTask {
+    /// A conversational / insight turn: fetch only what the question needs.
+    Chat,
+    /// A report turn: every granted tool feeds a section of the template.
+    Report,
+}
+
 /// Append the concrete per-pipeline data-tool grant to the fetcher's instruction.
 ///
 /// The checked-in prompt deliberately contains no closed list of tool names: `/report` may be
 /// narrowed per request and the same builder is also used by the greeting pipeline. Resolving the
 /// wildcard against the boot-advertised set here keeps the model's instructions aligned with the
 /// tools actually exposed by `build_stage_tools`.
+///
+/// `task` decides how the grant binds — see [`FetchTask`] and [`report_sweep_directive`].
 fn compose_fetcher_instruction(
     instruction: &str,
     grant: &[String],
     discovered: &[ChatCompletionTool],
     mcp_instructions: Option<&str>,
+    task: FetchTask,
 ) -> String {
     let advertised = discovered
         .iter()
@@ -546,18 +566,58 @@ fn compose_fetcher_instruction(
     let grant_text = if granted.is_empty() {
         "No data tools are granted for this turn. Do not make a tool call.".to_string()
     } else {
-        format!(
-            "For this turn you may call only these granted data tools: {}. For a report request, call every listed tool that is relevant to the requested date range; never call a tool that is not listed.",
-            granted
-                .iter()
-                .map(|name| format!("`{name}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let names = granted
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match task {
+            FetchTask::Chat => format!(
+                "For this turn you may call only these granted data tools: {names}. Fetch only what \
+                 the question needs; never call a tool that is not listed."
+            ),
+            FetchTask::Report => format!(
+                "For this turn you may call only these granted data tools: {names}.\n\n{}",
+                report_sweep_directive(granted.len())
+            ),
+        }
     };
     compose_with_mcp(
         &format!("{instruction}\n\n## Per-turn tool grant\n{grant_text}"),
         mcp_instructions,
+    )
+}
+
+/// The report fetcher's non-negotiable sweep instruction.
+///
+/// The report template is a **fixed layout**: four trend charts (revenue, charging, membership,
+/// infrastructure), a monthly table and a station ranking. Each is fed by a different tool, and the
+/// composer is forbidden from inventing figures — so a tool the fetcher skipped becomes a chart
+/// rendered flat at zero, with nothing downstream able to notice or recover. The stage therefore
+/// gets an unconditional "call all of them" rather than the chat path's "fetch what you need":
+/// deciding a topic is uninteresting is not the fetcher's call to make on a report turn.
+///
+/// It is written against the report's *data needs*, not tool names, because the grant is narrowed
+/// per caller by their Falcon permissions — whatever survives that narrowing must still be swept in
+/// full, and the sections nothing covers degrade rather than being silently guessed at.
+fn report_sweep_directive(granted: usize) -> String {
+    format!(
+        "**This turn is a REPORT request, and the rules above about fetching only what is needed do \
+         NOT apply.** The report is a fixed template whose sections are each fed by a different \
+         tool, so you MUST call **every one of the {granted} granted tools** — all of them, in this \
+         turn, over the full requested date range — before you stop. Do not decide that a topic is \
+         irrelevant, redundant or uninteresting; that judgement is not yours to make here, and a \
+         tool you skip becomes an empty chart in the delivered report.\n\n\
+         Between them, the granted tools must cover a monthly series for the whole window of:\n\
+         - revenue per month;\n\
+         - energy delivered (kWh) and charging sessions per month;\n\
+         - new, total and active members per month;\n\
+         - live stations and chargers at each month end;\n\
+         - the per-station revenue ranking for the window.\n\n\
+         Use the same date range and monthly granularity for every call so the series line up. If a \
+         call is rejected or returns no data, retry it once, then move on and call the remaining \
+         tools anyway — never abandon the sweep because one tool failed, and never substitute a \
+         figure you did not fetch. Never call a tool that is not listed."
     )
 }
 
@@ -839,14 +899,52 @@ mod tests {
             &["bill_revenue".to_string()],
             &discovered,
             None,
+            FetchTask::Chat,
         );
         assert!(narrowed.contains("`bill_revenue`"));
         assert!(!narrowed.contains("`member_analysis`"));
 
-        let expanded =
-            compose_fetcher_instruction("base instruction", &["*".to_string()], &discovered, None);
+        let expanded = compose_fetcher_instruction(
+            "base instruction",
+            &["*".to_string()],
+            &discovered,
+            None,
+            FetchTask::Chat,
+        );
         assert!(expanded.contains("`bill_revenue`"));
         assert!(expanded.contains("`member_analysis`"));
+    }
+
+    #[test]
+    fn a_report_turn_orders_the_fetcher_to_sweep_every_granted_tool() {
+        let discovered = vec![
+            discovered_tool("bill_revenue"),
+            discovered_tool("member_analysis"),
+        ];
+
+        let report = compose_fetcher_instruction(
+            "base instruction",
+            &["*".to_string()],
+            &discovered,
+            None,
+            FetchTask::Report,
+        );
+        // The count is spelled out, so "every one of them" is checkable by the model itself.
+        assert!(report.contains("every one of the 2 granted tools"));
+        assert!(report.contains("REPORT request"));
+        // …and the coverage the fixed template needs is named, not left to inference.
+        assert!(report.contains("live stations and chargers"));
+
+        // A chat turn keeps the narrow-fetch instruction and never sees the sweep.
+        let chat = compose_fetcher_instruction(
+            "base instruction",
+            &["*".to_string()],
+            &discovered,
+            None,
+            FetchTask::Chat,
+        );
+        assert!(chat.contains("Fetch only what the question needs"));
+        assert!(!chat.contains("REPORT request"));
     }
 
     #[test]
