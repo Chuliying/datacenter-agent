@@ -2,7 +2,7 @@
 
 > **文件類型**：documentation source of truth。PRD 定義完成後的 target state 並逐項標建置狀態；Spec、QA、endpoint 與 module 頁描述目前 worktree。  
 > **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/agent/`](../../src/agent/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
-> **對應版本**：PRD v1.4.0 · Spec v1.4.0 · QA v1.4.0（2026-08-20，對應 crate 0.4.0）
+> **對應版本**：PRD v1.4.0 · Spec v1.4.0 · QA v1.5.0（2026-09-09 快照，對應 crate 0.5.0；PRD / Spec 仍為 0.4.0 基準）
 >
 > **同步狀態（逐檔）**：
 >
@@ -10,7 +10,7 @@
 > |---|---|---|
 > | `prd.md` | crate 0.4.0（2026-08-20） | 無已知落差 |
 > | `spec/spec.md` | crate 0.4.0（2026-08-20） | 無已知落差 |
-> | `tests/qa-plan.md` | crate 0.4.0（2026-08-20 fresh run） | docker build 證據停在 0.3.x image |
+> | `tests/qa-plan.md` | crate 0.5.0（2026-09-09 fresh run，含 live test） | §3–§9 inventory 仍為 0.4.0 基準；docker build 證據停在 0.3.x image |
 > | `endpoints/**` | 2026-08-17 兩次校正（sub-agent 層＋`/v1/chat/completions`；退役端點移除） | 無已知落差 |
 > | `modules/**` | 2026-08-17 校正；2026-08-20 依 §1 規則 4 縮減 | 無已知落差 |
 >
