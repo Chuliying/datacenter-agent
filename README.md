@@ -20,7 +20,9 @@ LLM against live data with the power of MCP server.
   tag so multi-turn context survives the identity slice's replay filter. See
   [ss-chat-stream](docs/reference/endpoints/ss-chat-stream.md).
 - `/v1/chat/completions`: OpenAI-compatible (agentgateway Path C), streaming and non-streaming.
-- `/greeting`: a random pre-generated, data-aware welcome message
+- `/greeting`: a random pre-generated, data-aware welcome message. Send `X-Falcon-Authorization`
+  as well and the greeting is scoped to that user: roles whose permissions do not unlock every
+  greeting-fetcher tool get a neutral greeting with no figures (`"scope": "neutral"`).
 - `/health`: liveness probe
 - `/ready`: readiness probe
 
@@ -46,7 +48,8 @@ routes, and `401` with the OpenAI error envelope on `/v1/chat/completions`.
 The runtime verifies it against Falcon's permissions endpoint, derives a pseudonymous `actor_key`
 from it, and narrows the pipeline's tool grant to `boot ∩ permission ∩ intent-required` **before**
 any LLM or MCP call — so a caller only ever reaches the data their Falcon permissions cover. A
-missing header is `401 identity.header_missing`; probes and `/greeting` are unaffected.
+missing header is `401 identity.header_missing`; probes are unaffected, and `/greeting` treats the
+header as optional (present → permission-scoped greeting, absent → the global one).
 
 This means the service bearer alone is no longer enough to reach a pipeline. Boot also now requires
 `ACTOR_KEY_PEPPER` (≥32 bytes) and a Falcon host from `FALCON_API_BASE_URL` or `[identity].base_url`

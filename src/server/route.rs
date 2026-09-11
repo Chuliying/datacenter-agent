@@ -646,4 +646,79 @@ mod tests {
             "a startrade-power user must pass the SS gate: {allowed_text}"
         );
     }
+
+    /// `/greeting` stays outside the identity layer, but a caller who sends
+    /// `X-Falcon-Authorization` gets a greeting scoped to their permissions: a page-only role
+    /// (engproj → no data tools) must not learn the month's revenue from the welcome line it
+    /// would be refused on if it asked, while a role holding every greeting-fetcher tool still
+    /// sees the data-aware greeting. No header keeps the legacy global greeting.
+    #[tokio::test]
+    async fn greeting_is_scoped_by_falcon_permissions_when_the_header_is_present() {
+        use crate::server::handler::NEUTRAL_GREETING;
+        const ENGPROJ: &str = "hdrenewables/elecsvc/starcharger/engproj";
+        const ALL: [&str; 3] = [
+            "hdrenewables/elecsvc/starcharger/finance",
+            "hdrenewables/elecsvc/starcharger/opperf",
+            "hdrenewables/elecsvc/starcharger/bizdev",
+        ];
+        const DATA_GREETING: &str = "八月營收達 6,314,185，會員總數達 53,555。";
+
+        async fn greeting_for(codes: &[&str], send_header: bool) -> serde_json::Value {
+            let provider = crate::test_support::ScriptedPermissionsProvider::documented(7, codes);
+            let (mut state, _mcp) = crate::test_support::app_state_with_provider(provider).await;
+            // The fixture's boot grant is the wildcard over the stub MCP's tools; pin the shipped
+            // greeting-fetcher grant so the decision is about permissions, not the stub's tool set.
+            state.insight_grants.fetcher = [
+                "bill_revenue",
+                "station_revenue_ranking",
+                "bill_charge",
+                "business_metrics",
+                "member_analysis",
+                "bill_member_analysis",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            state.greetings.lock().await.push(DATA_GREETING.to_string());
+            let app = build_router(state);
+            let mut request = Request::builder().method("GET").uri("/greeting").header(
+                "authorization",
+                format!("Bearer {}", crate::test_support::TEST_TOKEN),
+            );
+            if send_header {
+                request = request.header("x-falcon-authorization", "Bearer falcon-user-token");
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let page_only = greeting_for(&[ENGPROJ], true).await;
+        assert_eq!(page_only["greeting"], NEUTRAL_GREETING);
+        assert_eq!(page_only["scope"], "neutral");
+        assert!(
+            !page_only["greeting"]
+                .as_str()
+                .unwrap()
+                .contains("6,314,185"),
+            "a role without revenue tools must not see the revenue figure"
+        );
+
+        let full = greeting_for(&ALL, true).await;
+        assert_eq!(full["greeting"], DATA_GREETING);
+        assert_eq!(full["scope"], "full");
+
+        let legacy = greeting_for(&[ENGPROJ], false).await;
+        assert_eq!(
+            legacy["greeting"], DATA_GREETING,
+            "no header keeps the legacy global greeting"
+        );
+        assert_eq!(legacy["scope"], "full");
+    }
 }

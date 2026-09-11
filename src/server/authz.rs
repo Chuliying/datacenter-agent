@@ -26,6 +26,32 @@ pub struct AuthorizationDecision {
     pub report_pipeline: bool,
 }
 
+/// Whether a caller may see the **data-aware** greeting.
+///
+/// Greetings are pre-generated at boot from everything the greeting fetcher may call
+/// (`[insight.grants].fetcher`), so a single greeting can quote revenue, member and station
+/// figures. A caller therefore only qualifies when their Falcon permissions unlock *every* tool
+/// in that grant; anyone narrower gets the neutral greeting instead. Conservative on purpose: a
+/// finance-only role loses the data greeting rather than risk seeing a member figure it may not
+/// query. An empty grant never qualifies.
+pub fn greeting_scope_allows(
+    config: &AuthzConfig,
+    permission_codes: &HashSet<String>,
+    greeting_fetcher_grant: &[String],
+    advertised: &[String],
+) -> bool {
+    let required = expand_grant(greeting_fetcher_grant, advertised);
+    if required.is_empty() {
+        return false;
+    }
+    let granted = permission_codes
+        .iter()
+        .filter_map(|code| config.permission_tools.get(code))
+        .flat_map(|grant| expand_grant(grant, advertised))
+        .collect::<HashSet<_>>();
+    required.iter().all(|tool| granted.contains(tool))
+}
+
 /// Intersect boot data grants, Falcon permission grants, and required intent tools.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_pipeline(
@@ -196,6 +222,56 @@ mod tests {
 
     fn permissions(code: &str) -> HashSet<String> {
         [code.to_string()].into_iter().collect()
+    }
+
+    const ENGPROJ: &str = "hdrenewables/elecsvc/starcharger/engproj";
+
+    /// The data-aware greeting requires every greeting-fetcher tool to be unlocked.
+    #[test]
+    fn greeting_scope_requires_the_whole_greeting_grant() {
+        let config = config();
+        let grant = shipped_insight_fetcher_grant();
+        let all = [FINANCE, OPPERF, BIZDEV]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert!(greeting_scope_allows(&config, &all, &grant, &advertised()));
+    }
+
+    /// A page-only role (engproj maps to no tools) and a partial role both get the neutral greeting.
+    #[test]
+    fn greeting_scope_is_neutral_for_page_only_and_partial_roles() {
+        let config = config();
+        let grant = shipped_insight_fetcher_grant();
+        assert!(!greeting_scope_allows(
+            &config,
+            &permissions(ENGPROJ),
+            &grant,
+            &advertised()
+        ));
+        assert!(!greeting_scope_allows(
+            &config,
+            &permissions(FINANCE),
+            &grant,
+            &advertised()
+        ));
+        assert!(!greeting_scope_allows(
+            &config,
+            &HashSet::new(),
+            &grant,
+            &advertised()
+        ));
+    }
+
+    /// An empty greeting grant can never qualify, whatever the caller holds.
+    #[test]
+    fn greeting_scope_denies_on_empty_grant() {
+        let config = config();
+        let all = [FINANCE, OPPERF, BIZDEV]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert!(!greeting_scope_allows(&config, &all, &[], &advertised()));
     }
 
     /// The SS gate: any configured startrade-power sub-page unlocks the full SS grant.

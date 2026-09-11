@@ -168,6 +168,9 @@ pub struct UsageData {
 #[derive(Debug, Clone, Serialize)]
 pub struct GreetingResponse {
     pub greeting: String,
+    /// `"full"` when the caller may see the data-aware greeting, `"neutral"` when the runtime
+    /// substituted the permission-safe greeting (see [`crate::server::handler::greeting`]).
+    pub scope: &'static str,
 }
 
 // ──── /ready ───

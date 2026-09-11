@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -35,6 +35,7 @@ use super::dto::{
 };
 use super::error::AppError;
 use super::identity::IdentityContext;
+use super::identity::{parse_bearer, FALCON_AUTHORIZATION_HEADER};
 use super::openai;
 use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
@@ -51,7 +52,9 @@ use crate::runtime::turn::{
     append_memory_turn_if_enabled, plan_stream_turn, AgentPort, AgentTurnDeps, StreamPlan,
     TurnEvent,
 };
-use crate::server::authz::{authorize_pipeline, authorize_ss_chat, AuthorizationDecision};
+use crate::server::authz::{
+    authorize_pipeline, authorize_ss_chat, greeting_scope_allows, AuthorizationDecision,
+};
 
 /// SSE keep-alive interval.
 ///
@@ -102,14 +105,90 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 
 // ──── /greeting ───
 
-#[instrument(skip(state))]
-pub async fn greeting(State(state): State<AppState>) -> Result<Json<GreetingResponse>, AppError> {
+/// The permission-safe greeting served when the caller may not see the data-aware one.
+///
+/// It must not quote any figure: the whole point is that a role without (say) revenue tools
+/// should not learn the month's revenue from the welcome line it would be refused on if it asked.
+pub const NEUTRAL_GREETING: &str = "請選擇事業單位，或直接輸入想了解的營運問題。";
+
+/// Which greeting the caller may see. Decided per request in [`greeting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GreetingScope {
+    /// The pre-generated, data-aware greeting.
+    Full,
+    /// [`NEUTRAL_GREETING`].
+    Neutral,
+}
+
+impl GreetingScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            GreetingScope::Full => "full",
+            GreetingScope::Neutral => "neutral",
+        }
+    }
+}
+
+/// `/greeting` stays outside the identity middleware (probes and the welcome line must work
+/// before a user is resolved), but when the caller *does* send `X-Falcon-Authorization` the
+/// greeting is scoped to their permissions:
+///
+/// - no header → `Full` (legacy behaviour, unauthenticated callers keep the global greeting);
+/// - header present and the permissions unlock every greeting-fetcher tool → `Full`;
+/// - header present but malformed, unverifiable, or narrower than the greeting grant → `Neutral`
+///   (fail closed on *content*, never on availability — the response is still `200`).
+async fn resolve_greeting_scope(state: &AppState, headers: &HeaderMap) -> GreetingScope {
+    let Some(header) = headers.get(FALCON_AUTHORIZATION_HEADER) else {
+        return GreetingScope::Full;
+    };
+    let Some(token) = parse_bearer(header) else {
+        return GreetingScope::Neutral;
+    };
+    let permissions = match state.permissions_provider.permissions(token).await {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            warn!(error = ?err, "greeting: identity unavailable, serving neutral greeting");
+            return GreetingScope::Neutral;
+        }
+    };
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    if greeting_scope_allows(
+        &state.authz,
+        &permissions.codes,
+        &state.insight_grants.fetcher,
+        &advertised,
+    ) {
+        GreetingScope::Full
+    } else {
+        GreetingScope::Neutral
+    }
+}
+
+#[instrument(skip(state, headers))]
+pub async fn greeting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<GreetingResponse>, AppError> {
+    let scope = resolve_greeting_scope(&state, &headers).await;
+    if scope == GreetingScope::Neutral {
+        return Ok(Json(GreetingResponse {
+            greeting: NEUTRAL_GREETING.to_string(),
+            scope: scope.as_str(),
+        }));
+    }
     let picked = {
         let v = state.greetings.lock().await;
         v.choose(&mut rand::thread_rng()).cloned()
     };
     match picked {
-        Some(greeting) => Ok(Json(GreetingResponse { greeting })),
+        Some(greeting) => Ok(Json(GreetingResponse {
+            greeting,
+            scope: scope.as_str(),
+        })),
         None => Err(AppError::ServiceUnavailable(
             "greeting not ready, retry shortly".into(),
         )),

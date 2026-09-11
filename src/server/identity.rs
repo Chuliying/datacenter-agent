@@ -142,7 +142,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
 }
 
 /// Parse exactly the `Bearer <token>` transport documented by Falcon.
-fn parse_bearer(value: &HeaderValue) -> Option<&str> {
+pub(crate) fn parse_bearer(value: &HeaderValue) -> Option<&str> {
     let value = value.to_str().ok()?.trim();
     let (scheme, token) = value.split_once(char::is_whitespace)?;
     if !scheme.eq_ignore_ascii_case("Bearer") {
