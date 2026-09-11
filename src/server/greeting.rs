@@ -18,7 +18,9 @@
 //! (fetcher → analyst) and appends the resulting short C-suite welcome paragraph to
 //! [`AppState::greetings`].
 //!
-//! `GET /greeting` then serves a random pick.
+//! `GET /greeting` then serves a random pick — unless the caller sends `X-Falcon-Authorization`
+//! and their permissions do not unlock every tool in the greeting fetcher grant, in which case
+//! the handler substitutes the neutral, figure-free greeting (see `handler::greeting`).
 
 use anyhow::{bail, Context, Result};
 use tracing::{error, info, warn};

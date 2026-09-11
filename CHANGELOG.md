@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`/greeting` is scoped by Falcon permissions when `X-Falcon-Authorization` is sent.** The
+  pre-generated welcome line quotes revenue, member and station figures; a role whose permissions
+  do not unlock every greeting-fetcher tool (`[insight.grants].fetcher`) — e.g. a page-only
+  `engproj` role — now receives a neutral, figure-free greeting instead, with `"scope": "neutral"`
+  in the response (`"full"` otherwise). Callers that send no header keep the legacy global
+  greeting. Found during the 2026-09-11 acceptance walk-through: a restricted account was refused
+  `revenue` data on its first question but had already been told the month's revenue by the
+  greeting. Decision helper `authz::greeting_scope_allows`; falcon-client forwards the user's
+  access token on its greeting route from the same change set.
+- **Report template no longer renders missing data as `0`.** When a report's periods carry no
+  member (`newMembers` / `totalMembers` / `activeMembers`), infrastructure (`stations` /
+  `chargers`) or charge (`kwh` / `sessions`) figures at all — the composer received no material
+  for them — the KPI card shows `—` with `本期資料未提供` and the corresponding chart frame shows
+  a text note instead of a flat zero line. Previously `累積會員數 0 人` and `0 站 / 0 樁` read as
+  real figures next to a narrative that said the data was not provided.
+
 ### Fixed
 - **Reports no longer render with blank charts.** `emit_report` only validated the JSON
   *shape*, so a payload whose `summary.latestCompletedPeriod` did not match any

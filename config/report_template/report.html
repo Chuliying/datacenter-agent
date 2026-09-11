@@ -815,6 +815,18 @@
       const latest = data.periods[data.periods.length - 1]
       const topStation = data.stationRanking[0]
 
+      // 資料可用性：composer 拿不到某類資料時（例如 fetcher 未呼叫會員／站點工具）整段欄位會是 0，
+      // 若照常渲染成「0 人」「0 站」會被讀成真實數字。整個視窗都是 0 就視為「未提供」，
+      // KPI 顯示「—」並註明，圖表改為文字說明，不畫一條貼地的假折線。
+      const hasAny = (keys) => data.periods.some((item) => keys.some((key) => Number(item[key]) > 0))
+      const availability = {
+        charge: hasAny(['kwh', 'sessions']),
+        members: hasAny(['newMembers', 'totalMembers', 'activeMembers']),
+        infrastructure: hasAny(['stations', 'chargers']),
+      }
+      const UNAVAILABLE_VALUE = '—'
+      const UNAVAILABLE_DETAIL = '本期資料未提供'
+
       const kpis = [
         {
           label: `${completed.period} 總營收`,
@@ -822,26 +834,32 @@
           detail: `較上月 ${formatPercent(completed.revenueMom)}`,
           tone: completed.revenueMom >= 0 ? 'positive' : 'negative',
         },
-        {
-          label: `${completed.period} 充電度數`,
-          value: `${integerFormat.format(completed.kwh)} kWh`,
-          detail: previousCompleted
-            ? `較上月 ${formatPercent(comparePercent(completed.kwh, previousCompleted.kwh))}`
-            : '無前期資料可比較',
-          tone: !previousCompleted ? 'neutral' : completed.kwh >= previousCompleted.kwh ? 'positive' : 'negative',
-        },
-        {
-          label: '累積會員數',
-          value: `${integerFormat.format(latest.totalMembers)} 人`,
-          detail: `${latest.period} 新增 ${integerFormat.format(latest.newMembers)} 人`,
-          tone: 'neutral',
-        },
-        {
-          label: '全網站點 / 充電樁',
-          value: `${integerFormat.format(latest.stations)} 站 / ${integerFormat.format(latest.chargers)} 樁`,
-          detail: `期間增加 ${integerFormat.format(latest.stations - first.stations)} 站 / ${integerFormat.format(latest.chargers - first.chargers)} 樁`,
-          tone: 'neutral',
-        },
+        availability.charge
+          ? {
+              label: `${completed.period} 充電度數`,
+              value: `${integerFormat.format(completed.kwh)} kWh`,
+              detail: previousCompleted
+                ? `較上月 ${formatPercent(comparePercent(completed.kwh, previousCompleted.kwh))}`
+                : '無前期資料可比較',
+              tone: !previousCompleted ? 'neutral' : completed.kwh >= previousCompleted.kwh ? 'positive' : 'negative',
+            }
+          : { label: `${completed.period} 充電度數`, value: UNAVAILABLE_VALUE, detail: UNAVAILABLE_DETAIL, tone: 'neutral', kind: 'unavailable' },
+        availability.members
+          ? {
+              label: '累積會員數',
+              value: `${integerFormat.format(latest.totalMembers)} 人`,
+              detail: `${latest.period} 新增 ${integerFormat.format(latest.newMembers)} 人`,
+              tone: 'neutral',
+            }
+          : { label: '累積會員數', value: UNAVAILABLE_VALUE, detail: UNAVAILABLE_DETAIL, tone: 'neutral', kind: 'unavailable' },
+        availability.infrastructure
+          ? {
+              label: '全網站點 / 充電樁',
+              value: `${integerFormat.format(latest.stations)} 站 / ${integerFormat.format(latest.chargers)} 樁`,
+              detail: `期間增加 ${integerFormat.format(latest.stations - first.stations)} 站 / ${integerFormat.format(latest.chargers - first.chargers)} 樁`,
+              tone: 'neutral',
+            }
+          : { label: '全網站點 / 充電樁', value: UNAVAILABLE_VALUE, detail: UNAVAILABLE_DETAIL, tone: 'neutral', kind: 'unavailable' },
         {
           label: '營收最高站點',
           value: topStation.name,
@@ -997,7 +1015,7 @@
         },
       })
 
-      new Chart(document.getElementById('charge-chart'), {
+      if (availability.charge) new Chart(document.getElementById('charge-chart'), {
         type: 'bar',
         data: {
           labels,
@@ -1042,7 +1060,23 @@
         },
       })
 
-      new Chart(document.getElementById('member-chart'), {
+      // 缺資料的圖表以文字說明取代，避免貼地的 0 折線被讀成「會員／站點數為零」。
+      const markChartUnavailable = (frameKey, message) => {
+        const frame = document.querySelector(`[data-chart-frame="${frameKey}"]`)
+        if (!frame) return false
+        frame.replaceChildren()
+        const fallback = document.createElement('p')
+        fallback.className = 'chart-fallback'
+        fallback.dataset.unavailable = 'true'
+        fallback.textContent = message
+        frame.append(fallback)
+        return true
+      }
+      if (!availability.charge) markChartUnavailable('charge', '本期未提供充電度數與次數資料，未繪製圖表。')
+      if (!availability.members) markChartUnavailable('members', '本期未提供會員資料，未繪製圖表。')
+      if (!availability.infrastructure) markChartUnavailable('infrastructure', '本期未提供站點與充電樁資料，未繪製圖表。')
+
+      if (availability.members) new Chart(document.getElementById('member-chart'), {
         type: 'bar',
         data: {
           labels,
@@ -1097,7 +1131,7 @@
         },
       })
 
-      new Chart(document.getElementById('infrastructure-chart'), {
+      if (availability.infrastructure) new Chart(document.getElementById('infrastructure-chart'), {
         type: 'bar',
         data: {
           labels,
