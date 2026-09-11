@@ -53,7 +53,8 @@ use crate::runtime::turn::{
     TurnEvent,
 };
 use crate::server::authz::{
-    authorize_pipeline, authorize_ss_chat, greeting_scope_allows, AuthorizationDecision,
+    authorize_pipeline, authorize_ss_chat, greeting_capabilities, greeting_scope_allows,
+    AuthorizationDecision,
 };
 
 /// SSE keep-alive interval.
@@ -137,26 +138,35 @@ impl GreetingScope {
 /// - header present and the permissions unlock every greeting-fetcher tool → `Full`;
 /// - header present but malformed, unverifiable, or narrower than the greeting grant → `Neutral`
 ///   (fail closed on *content*, never on availability — the response is still `200`).
-async fn resolve_greeting_scope(state: &AppState, headers: &HeaderMap) -> GreetingScope {
-    let Some(header) = headers.get(FALCON_AUTHORIZATION_HEADER) else {
-        return GreetingScope::Full;
-    };
-    let Some(token) = parse_bearer(header) else {
-        return GreetingScope::Neutral;
-    };
-    let permissions = match state.permissions_provider.permissions(token).await {
-        Ok(permissions) => permissions,
-        Err(err) => {
-            warn!(error = ?err, "greeting: identity unavailable, serving neutral greeting");
-            return GreetingScope::Neutral;
-        }
-    };
+///
+/// Returns the scope plus the capability list that goes out with every greeting response.
+async fn resolve_greeting_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> (GreetingScope, Vec<String>) {
     let advertised = state
         .tools
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect::<Vec<_>>();
-    if greeting_scope_allows(
+    let Some(header) = headers.get(FALCON_AUTHORIZATION_HEADER) else {
+        return (
+            GreetingScope::Full,
+            greeting_capabilities(&state.authz, None, &advertised),
+        );
+    };
+    let Some(token) = parse_bearer(header) else {
+        return (GreetingScope::Neutral, Vec::new());
+    };
+    let permissions = match state.permissions_provider.permissions(token).await {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            warn!(error = ?err, "greeting: identity unavailable, serving neutral greeting");
+            return (GreetingScope::Neutral, Vec::new());
+        }
+    };
+    let capabilities = greeting_capabilities(&state.authz, Some(&permissions.codes), &advertised);
+    let scope = if greeting_scope_allows(
         &state.authz,
         &permissions.codes,
         &state.insight_grants.fetcher,
@@ -165,7 +175,8 @@ async fn resolve_greeting_scope(state: &AppState, headers: &HeaderMap) -> Greeti
         GreetingScope::Full
     } else {
         GreetingScope::Neutral
-    }
+    };
+    (scope, capabilities)
 }
 
 #[instrument(skip(state, headers))]
@@ -173,11 +184,12 @@ pub async fn greeting(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<GreetingResponse>, AppError> {
-    let scope = resolve_greeting_scope(&state, &headers).await;
+    let (scope, capabilities) = resolve_greeting_scope(&state, &headers).await;
     if scope == GreetingScope::Neutral {
         return Ok(Json(GreetingResponse {
             greeting: NEUTRAL_GREETING.to_string(),
             scope: scope.as_str(),
+            capabilities,
         }));
     }
     let picked = {
@@ -188,6 +200,7 @@ pub async fn greeting(
         Some(greeting) => Ok(Json(GreetingResponse {
             greeting,
             scope: scope.as_str(),
+            capabilities,
         })),
         None => Err(AppError::ServiceUnavailable(
             "greeting not ready, retry shortly".into(),

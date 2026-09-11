@@ -702,6 +702,12 @@ mod tests {
         let page_only = greeting_for(&[ENGPROJ], true).await;
         assert_eq!(page_only["greeting"], NEUTRAL_GREETING);
         assert_eq!(page_only["scope"], "neutral");
+        // engproj unlocks no data tools: only the tool-free `site-build` intent is advertised.
+        assert_eq!(
+            page_only["capabilities"],
+            serde_json::json!(["site-build"]),
+            "a page-only role must not be offered revenue / charging / member topics"
+        );
         assert!(
             !page_only["greeting"]
                 .as_str()
@@ -713,6 +719,16 @@ mod tests {
         let full = greeting_for(&ALL, true).await;
         assert_eq!(full["greeting"], DATA_GREETING);
         assert_eq!(full["scope"], "full");
+        for intent in ["revenue", "charging", "member"] {
+            assert!(
+                full["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == intent),
+                "{intent} should be a capability for the fully-permitted role"
+            );
+        }
 
         let legacy = greeting_for(&[ENGPROJ], false).await;
         assert_eq!(

@@ -171,6 +171,12 @@ pub struct GreetingResponse {
     /// `"full"` when the caller may see the data-aware greeting, `"neutral"` when the runtime
     /// substituted the permission-safe greeting (see [`crate::server::handler::greeting`]).
     pub scope: &'static str,
+    /// Intents this caller can actually run: every `[authz.intent_tools]` intent (except
+    /// `unknown` / `report`) whose required tools are all unlocked by their permissions, plus
+    /// `ss-chat` when any `[authz].ss_chat_permissions` code is held. Without
+    /// `X-Falcon-Authorization` this is the full list. Empty means the caller has no usable
+    /// analysis topic — the client should say so instead of offering topics that will be refused.
+    pub capabilities: Vec<String>,
 }
 
 // ──── /ready ───

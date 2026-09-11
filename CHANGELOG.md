@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   greeting. Found during the 2026-09-11 acceptance walk-through: a restricted account was refused
   `revenue` data on its first question but had already been told the month's revenue by the
   greeting. Decision helper `authz::greeting_scope_allows`; falcon-client forwards the user's
-  access token on its greeting route from the same change set.
+  access token on its greeting route from the same change set. The response also carries
+  `capabilities` — the intents the caller can actually run (`authz::greeting_capabilities`) plus
+  `ss-chat` when held — so the client can hide topics that would only be refused.
 - **Report template no longer renders missing data as `0`.** When a report's periods carry no
   member (`newMembers` / `totalMembers` / `activeMembers`), infrastructure (`stations` /
   `chargers`) or charge (`kwh` / `sessions`) figures at all — the composer received no material

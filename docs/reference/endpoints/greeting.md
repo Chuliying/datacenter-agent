@@ -23,10 +23,14 @@ pipeline**（`fetcher → analyst`），把結果存進 `AppState::greetings`；
 
 ### 回應 body
 ```json
-{ "greeting": "...", "scope": "full" }
+{ "greeting": "...", "scope": "full", "capabilities": ["revenue", "charging", "member", "site-build"] }
 ```
 
 `scope` 為 `"full"`（資料感知問候）或 `"neutral"`（權限不足時的中性問候，不含任何數字）。
+`capabilities` 列出此使用者**實際能跑**的分析意圖：`[authz.intent_tools]` 中所需工具全部被其權限解鎖的意圖
+（不含 `unknown` / `report`；所需工具為空的意圖一律列入），持有任一 `[authz].ss_chat_permissions` 時另加 `"ss-chat"`。
+未帶 `X-Falcon-Authorization` 時為完整清單；空陣列代表此帳號沒有任何可用主題，前端應直接說明而非列出會被拒絕的主題
+（判定：`authz::greeting_capabilities`）。
 
 ### 依權限縮放（`X-Falcon-Authorization` 選用）
 本端點不在 identity middleware 之內（探測與歡迎詞必須在解析使用者前就能用），但**若請求帶
