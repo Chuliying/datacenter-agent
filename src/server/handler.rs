@@ -42,8 +42,12 @@ use crate::agent::config::PipelineId;
 use crate::agent::engine::Orchestrator;
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
-use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id, ss_chat_pipeline_id};
-use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline, build_ss_chat_pipeline};
+use crate::agent::pipeline::{
+    agent_pipeline_id, report_pipeline_id, ss_chat_pipeline_id, ss_report_pipeline_id,
+};
+use crate::agent::wiring::{
+    build_insight_pipeline, build_report_pipeline, build_ss_chat_pipeline, build_ss_report_pipeline,
+};
 use crate::runtime::audit::{hash_identifier, AuditCtx, AuditEvent, AuditWriter};
 use crate::runtime::guardrails::answer_policy::{AlwaysAnswerPolicy, AnswerPolicy};
 use crate::runtime::schema::{AgentTurnFrame, AgentTurnInput, NormalizedInput};
@@ -135,6 +139,15 @@ fn wants_report_pipeline(normalized: &NormalizedInput) -> bool {
             .candidate_intents
             .iter()
             .any(|candidate| candidate == REPORT_INTENT)
+}
+
+/// Whether `route` is one of the 星星電力 front doors.
+///
+/// Memory replay is route-family-scoped (see the `ss_route` comment at its call site), and the two
+/// SS routes are one family: a turn from `/ss-chat/stream` should be visible to `/ss-report` and
+/// vice versa, because both answer over the same investor-platform data under the same permissions.
+fn is_ss_route(route: &str) -> bool {
+    matches!(route, "/ss-chat/stream" | "/ss-report")
 }
 
 fn insufficient_permission_copy(decision: &AuthorizationDecision) -> String {
@@ -272,6 +285,50 @@ pub async fn ss_chat_stream(
         Some(&AlwaysAnswerPolicy),
         authorize_ss_chat_route,
         select_ss_chat_pipeline,
+    )
+    .instrument(span)
+    .await
+}
+
+/// `POST /ss-report` — the 星星電力 **HTML report** front door (SSE).
+///
+/// [`ss_chat_stream`]'s report counterpart, and the SS analogue of the report branch of
+/// [`agent_stream`]. It runs the same runtime prelude and the same identity/authorization gate as
+/// `/ss-chat/stream` — it reaches the same six `ss_*` tools and the same investor-platform data, so
+/// it must be gated by the same Falcon permissions — but always drives the four-stage
+/// `fetcher → analyst → composer → renderer` report pipeline, terminating in a
+/// ```` ```falcon-report ```` HTML block instead of markdown prose.
+///
+/// Unlike `/agent/stream`, this route does **not** choose between a chat and a report pipeline: the
+/// endpoint *is* the report. What the request's wording still decides is how hard the fetcher's
+/// grant binds — see [`select_ss_report_pipeline`].
+///
+/// The answer policy is `AlwaysAnswerPolicy` for the same reason `/ss-chat/stream` uses it: the
+/// runtime's intent pack is EV-charging-specific, so every SS prompt resolves to `unknown` and the
+/// configured policy would refuse the whole route. The SS fetcher prompt carries the domain
+/// boundary instead.
+pub async fn ss_report_stream(
+    State(state): State<AppState>,
+    Extension(identity): Extension<IdentityContext>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, AppError> {
+    let Json(req) = req?;
+    let span = tracing::info_span!(
+        "ss-report-stream",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
+    );
+    run_chat_stream(
+        state,
+        identity,
+        req,
+        "/ss-report",
+        // Intent filtering off: see the doc comment above.
+        Some(&AlwaysAnswerPolicy),
+        authorize_ss_report_route,
+        select_ss_report_pipeline,
     )
     .instrument(span)
     .await
@@ -416,6 +473,79 @@ fn select_ss_chat_pipeline(
     Ok((orch, ss_chat_pipeline_id()))
 }
 
+/// `/ss-report`'s gate: the same SS permission check as `/ss-chat/stream`, over the SS **report**
+/// ceiling.
+///
+/// The permission codes are identical on purpose — both routes reach the same investor-platform
+/// data, so a caller who may chat about it may report on it and vice versa. Only the ceiling
+/// differs (`[ss_report.grants]` rather than `[ss_chat.grants]`), which is what lets a report draw
+/// on the whole tool set without widening what a chat turn reaches.
+fn authorize_ss_report_route(
+    state: &AppState,
+    identity: &IdentityContext,
+    _normalized: &NormalizedInput,
+) -> AuthorizationDecision {
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    authorize_ss_chat(
+        &state.authz,
+        &state.ss_report_grants.fetcher,
+        &identity.permissions.codes,
+        &advertised,
+        // No charter stage on this pipeline — the report renders charts from the emitted data, so
+        // there is no `emit_chart` grant to authorize.
+        &[],
+    )
+}
+
+/// The report keywords that make the SS fetcher sweep **every** granted tool.
+///
+/// `/ss-report` is reached for narrow asks too ("只要日照資料"), and forcing all six tools on those
+/// would waste six upstream calls and bury the answer. So the request's own wording decides, the
+/// same way `wants_report_pipeline` decides which pipeline `/agent/stream` runs: an explicit ask
+/// for a *report* gets the full sweep, anything narrower fetches what it needs.
+///
+/// Matched case-insensitively against the normalized prompt.
+const SS_REPORT_SWEEP_KEYWORDS: &[&str] = &["report", "報告", "報表", "完整", "整體", "各條業務線"];
+
+/// Whether this turn should sweep every granted `ss_*` tool.
+///
+/// See [`SS_REPORT_SWEEP_KEYWORDS`]. An empty prompt sweeps nothing.
+fn wants_full_ss_sweep(normalized: &NormalizedInput) -> bool {
+    let prompt = normalized.prompt.to_lowercase();
+    SS_REPORT_SWEEP_KEYWORDS
+        .iter()
+        .any(|keyword| prompt.contains(keyword))
+}
+
+/// `/ss-report`'s selector: always the SS report pipeline, with the fetcher's sweep decided by
+/// [`wants_full_ss_sweep`].
+fn select_ss_report_pipeline(
+    state: &AppState,
+    normalized: &NormalizedInput,
+    decision: &AuthorizationDecision,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError> {
+    let orch = build_ss_report_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.prompts.ss_fetcher_system,
+        &state.prompts.ss_report_analyst_system,
+        &state.prompts.ss_report_composer_system,
+        &decision.effective_data_grant,
+        wants_full_ss_sweep(normalized),
+        &state.llm.resolved(),
+        state.ss_report_template.clone(),
+        Some(sink),
+    )
+    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+    Ok((orch, ss_report_pipeline_id()))
+}
+
 /// The streaming body shared by every SSE chat front door ([`agent_stream`], [`ss_chat_stream`]).
 ///
 /// Runs the runtime prelude, acts on the resulting [`StreamPlan`], drives `select_pipeline`'s
@@ -494,7 +624,11 @@ async fn run_chat_stream(
             advertised_tools: &advertised,
             insight_grant: &state.insight_grants.fetcher,
             ss_grant: &state.ss_chat_grants.fetcher,
-            ss_route: route == "/ss-chat/stream",
+            // Both SS front doors are one memory family. `/ss-report` must be in here: the replay
+            // filter drops any turn whose `ss_pipeline` tag disagrees with this flag, so leaving it
+            // out would make the SS report route silently single-turn while its fetcher prompt
+            // instructs the model to reuse earlier turns.
+            ss_route: is_ss_route(route),
             report_grant: &state.report_grants.fetcher,
         };
         plan_stream_turn(input, &audit_ctx, deps)
@@ -574,8 +708,10 @@ async fn run_chat_stream(
         select_pipeline(&state, &normalized, &decision, sink.clone())?;
     // The pipeline that actually ran, not the top intent: the memory replay filter keys its
     // stricter report rule off this (a mixed-topic report can be stored under a topic intent).
-    let ran_report_pipeline = pipeline_id == report_pipeline_id();
-    let ran_ss_pipeline = pipeline_id == ss_chat_pipeline_id();
+    let ran_report_pipeline =
+        pipeline_id == report_pipeline_id() || pipeline_id == ss_report_pipeline_id();
+    let ran_ss_pipeline =
+        pipeline_id == ss_chat_pipeline_id() || pipeline_id == ss_report_pipeline_id();
 
     // The memory-augmented prompt/history drive the pipeline; the full
     // agent_input (raw_input preserved) is kept for the post-stream memory append.
@@ -2114,5 +2250,60 @@ mod tests {
             crate::server::codes::AUTHZ_INSUFFICIENT
         );
         assert_eq!(body["choices"][0]["message"]["content"], "權限不足");
+    }
+
+    /// The `/ss-report` sweep predicate. A narrow ask on the report endpoint must NOT burn six
+    /// upstream calls, and an explicit report ask must never be left to the model's discretion —
+    /// that discretion is exactly what left the starcharger report with empty sections (0.5.2).
+    #[test]
+    fn ss_report_sweep_fires_on_report_wording_and_not_on_a_narrow_ask() {
+        // The predicate reads only the normalized prompt, so the intent fields are irrelevant here
+        // — which is the point: the sweep decision must not depend on the EV intent pack, under
+        // which every SS prompt resolves to `unknown`.
+        let normalized = |prompt: &str| NormalizedInput {
+            prompt: prompt.to_string(),
+            ..normalized_with("unknown", &[])
+        };
+
+        // The wordings the user asked us to treat as "fetch everything".
+        for prompt in [
+            "請產生完整的報告",
+            "報告",
+            "give me the full report",
+            "REPORT",
+            "本季營運報表",
+            "整體營運概況",
+            "各條業務線的狀況",
+            "完整資料",
+        ] {
+            assert!(
+                wants_full_ss_sweep(&normalized(prompt)),
+                "`{prompt}` should sweep every granted tool"
+            );
+        }
+
+        // …and the narrow asks that must stay narrow.
+        for prompt in [
+            "只要日照資料",
+            "儲能投標得標率是多少",
+            "哪些案子卡在談判中",
+            "",
+        ] {
+            assert!(
+                !wants_full_ss_sweep(&normalized(prompt)),
+                "`{prompt}` should fetch only what it needs"
+            );
+        }
+    }
+
+    /// Memory replay is route-family-scoped, and both SS front doors are one family. If
+    /// `/ss-report` fell outside it, the replay filter would drop every SS turn on that route and
+    /// silently make it single-turn — while its fetcher prompt tells the model to reuse history.
+    #[test]
+    fn both_ss_front_doors_are_one_memory_family() {
+        assert!(is_ss_route("/ss-chat/stream"));
+        assert!(is_ss_route("/ss-report"));
+        assert!(!is_ss_route("/agent/stream"));
+        assert!(!is_ss_route("/v1/chat/completions"));
     }
 }

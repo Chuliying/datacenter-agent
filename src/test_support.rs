@@ -213,6 +213,8 @@ fn prompt_bank() -> PromptBank {
         analyst_system: String::new(),
         charter_system: String::new(),
         report_analyst_system: String::new(),
+        ss_report_analyst_system: String::new(),
+        ss_report_composer_system: String::new(),
         report_composer_system: String::new(),
         ss_fetcher_system: String::new(),
         ss_analyst_system: String::new(),
@@ -366,6 +368,8 @@ pub(crate) async fn app_state_with_provider(
         insight_grants: InsightGrants::default(),
         ss_chat_grants: crate::config::SsChatGrants::default(),
         report_template: Arc::new(String::new()),
+        ss_report_template: Arc::new(String::new()),
+        ss_report_grants: crate::config::SsReportGrants::default(),
         rate_limit: crate::config::RateLimitConfig::default(),
         authz: config.authz.expect("shipped config declares authz"),
         report_grants: config
@@ -468,6 +472,8 @@ pub(crate) async fn runtime_app_state_with_fixtures(
         })),
         insight_grants: config.insight_grants.clone(),
         report_template: Arc::new(config.report_template.clone()),
+        ss_report_template: Arc::new(config.ss_report_template.clone()),
+        ss_report_grants: config.ss_report_grants.clone(),
         rate_limit: config.rate_limit.clone(),
         authz: config.authz.expect("shipped config declares authz"),
         report_grants: config

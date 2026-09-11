@@ -25,7 +25,9 @@ use async_openai::types::chat::ChatCompletionTool;
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use crate::config::{AppConfig, AuthzConfig, IdentityConfig, ReportGrants, ResolvedIdentityConfig};
+use crate::config::{
+    AppConfig, AuthzConfig, IdentityConfig, ReportGrants, ResolvedIdentityConfig, SsReportGrants,
+};
 use crate::mcp_client::McpHandle;
 use crate::model::{GenerationConfig, History};
 use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
@@ -211,6 +213,11 @@ pub struct PromptBank {
     pub ss_analyst_system: String,
     /// `/ss-chat` pipeline — the charter stage's system prompt (decides 0–2 charts).
     pub ss_charter_system: String,
+    /// `/ss-report` pipeline — the analyst stage's system prompt (writes the insight narrative).
+    pub ss_report_analyst_system: String,
+    /// `/ss-report` pipeline — the composer stage's system prompt (maps data into
+    /// `emit_ss_report`).
+    pub ss_report_composer_system: String,
 }
 
 impl PromptBank {
@@ -237,6 +244,12 @@ impl PromptBank {
             ss_fetcher_system: cfg.get_prompt_by_id("ss_fetcher_system")?.to_string(),
             ss_analyst_system: cfg.get_prompt_by_id("ss_analyst_system")?.to_string(),
             ss_charter_system: cfg.get_prompt_by_id("ss_charter_system")?.to_string(),
+            ss_report_analyst_system: cfg
+                .get_prompt_by_id("ss_report_analyst_system")?
+                .to_string(),
+            ss_report_composer_system: cfg
+                .get_prompt_by_id("ss_report_composer_system")?
+                .to_string(),
         })
     }
 }
@@ -299,6 +312,11 @@ pub struct AppState {
     pub authz: AuthzConfig,
     /// Boot-validated report-specific data grant.
     pub report_grants: ReportGrants,
+    /// The boot-loaded `/ss-report` HTML template, shared read-only. Contains the
+    /// `__REPORT_DATA_JSON__` placeholder the SS renderer fills.
+    pub ss_report_template: Arc<String>,
+    /// The `/ss-report` pipeline's tool ceiling (`[ss_report.grants]`).
+    pub ss_report_grants: SsReportGrants,
 }
 
 /// Runtime dependencies assembled at boot.
@@ -398,17 +416,26 @@ impl AppState {
         )
         .context("validate /ss-chat tool grants")?;
 
-        // Fail fast at boot if the /report template can never be filled — a template without the
+        // Fail fast at boot if either report template can never be filled — a template without the
         // data placeholder would render an empty report on every request.
-        if !app_config
-            .report_template
-            .contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER)
-        {
-            anyhow::bail!(
-                "report template is missing the `{}` placeholder — the renderer would have nothing to fill",
-                crate::agent::pipeline::REPORT_DATA_PLACEHOLDER
-            );
+        for (what, template) in [
+            ("report", &app_config.report_template),
+            ("ss report", &app_config.ss_report_template),
+        ] {
+            if !template.contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER) {
+                anyhow::bail!(
+                    "{what} template is missing the `{}` placeholder — the renderer would have nothing to fill",
+                    crate::agent::pipeline::REPORT_DATA_PLACEHOLDER
+                );
+            }
         }
+
+        // The /ss-report ceiling, validated against the advertised set exactly as the other grants
+        // are: a typo here would otherwise become a permanently, invisibly missing report section.
+        app_config
+            .ss_report_grants
+            .validate(&advertised)
+            .context("validate /ss-report tool grants")?;
 
         Ok(Self {
             mcp,
@@ -425,6 +452,8 @@ impl AppState {
             insight_grants: app_config.insight_grants.clone(),
             ss_chat_grants: app_config.ss_chat_grants.clone(),
             report_template: Arc::new(app_config.report_template.clone()),
+            ss_report_template: Arc::new(app_config.ss_report_template.clone()),
+            ss_report_grants: app_config.ss_report_grants.clone(),
             rate_limit: app_config.rate_limit.clone(),
             authz,
             report_grants,

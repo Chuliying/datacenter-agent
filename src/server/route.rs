@@ -134,8 +134,10 @@ pub fn build_router(state: AppState) -> Router {
     //
     // `/ss-chat/stream` is the 星星電力 (SS) investor-platform front door: the same four-stage chat
     // pipeline over the `ss_*` tools, with intent filtering off (see `handler::ss_chat_stream`).
-    // It shares the limiter with `/agent/stream` — both drive the same LLM/MCP cost — so the two
-    // sit on one nested router.
+    // `/ss-report` is its report counterpart: the same six `ss_*` tools and the same SS permission
+    // gate, but always the fetcher → analyst → composer → renderer pipeline, terminating in a
+    // `falcon-report` HTML block (see `handler::ss_report_stream`). All three share the limiter
+    // with `/agent/stream` — they drive the same LLM/MCP cost — so they sit on one nested router.
     //
     // Both are **prompt routes**, so both carry the identity layer and the per-actor limiter. A
     // prompt entrypoint without identity resolution would be an end-user-unauthenticated way into
@@ -143,7 +145,8 @@ pub fn build_router(state: AppState) -> Router {
     // without adding it to this router is therefore a security regression, not a routing detail.
     let mut streaming = Router::new()
         .route("/agent/stream", post(handler::agent_stream))
-        .route("/ss-chat/stream", post(handler::ss_chat_stream));
+        .route("/ss-chat/stream", post(handler::ss_chat_stream))
+        .route("/ss-report", post(handler::ss_report_stream));
     if let Some(limiter) = &actor_limiter {
         let limiter = limiter.clone();
         streaming = streaming.layer(middleware::from_fn(move |req, next| {
@@ -635,6 +638,83 @@ mod tests {
         );
 
         // A startrade-power permission passes both gates: no 401, no refusal frame.
+        let allowed = app.oneshot(request(Some("user-b"))).await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let allowed_body = axum::body::to_bytes(allowed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let allowed_text = String::from_utf8_lossy(&allowed_body);
+        assert!(
+            !allowed_text.contains(crate::server::codes::AUTHZ_INSUFFICIENT),
+            "a startrade-power user must pass the SS gate: {allowed_text}"
+        );
+    }
+
+    /// `/ss-report` reaches the same investor-platform data as `/ss-chat/stream`, so it must carry
+    /// the identical two gates. A prompt route added to the router without the identity layer would
+    /// be an end-user-unauthenticated way into the same pipeline — exactly the hole the identity
+    /// slice closes — so this is a security regression test, not a routing detail.
+    #[tokio::test]
+    async fn ss_report_route_requires_identity_and_a_startrade_permission() {
+        use crate::server::falcon::Permissions;
+
+        let starcharger_only = Permissions {
+            user_id: 11,
+            codes: ["hdrenewables:elecsvc:starcharger:finance".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let startrade = Permissions {
+            user_id: 12,
+            codes: ["hdrenewables:elecsvc:startrade-power:finance".to_string()]
+                .into_iter()
+                .collect(),
+        };
+        let provider = crate::test_support::ScriptedPermissionsProvider::new([
+            Ok(starcharger_only),
+            Ok(startrade),
+        ]);
+        let (state, _mcp) = crate::test_support::runtime_app_state(provider).await;
+        let app = build_router(state);
+
+        let request = |identity: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/ss-report")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                )
+                .header("content-type", "application/json");
+            if let Some(token) = identity {
+                builder = builder.header("x-falcon-authorization", format!("Bearer {token}"));
+            }
+            builder
+                .body(Body::from(r#"{"prompt":"請產生完整的營運報告"}"#))
+                .unwrap()
+        };
+
+        // No identity header: refused by the identity layer before anything else.
+        let missing = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(
+            missing.status(),
+            StatusCode::UNAUTHORIZED,
+            "the report route must sit behind the identity layer"
+        );
+
+        // Identity resolves, but the permission set is starcharger-only: the SS gate refuses.
+        let denied = app.clone().oneshot(request(Some("user-a"))).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::OK);
+        let denied_body = axum::body::to_bytes(denied.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let denied_text = String::from_utf8_lossy(&denied_body);
+        assert!(
+            denied_text.contains(crate::server::codes::AUTHZ_INSUFFICIENT),
+            "a starcharger-only user must hit the SS permission gate: {denied_text}"
+        );
+
+        // A startrade-power permission passes both gates.
         let allowed = app.oneshot(request(Some("user-b"))).await.unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
         let allowed_body = axum::body::to_bytes(allowed.into_body(), usize::MAX)

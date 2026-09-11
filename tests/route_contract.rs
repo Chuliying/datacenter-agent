@@ -61,7 +61,7 @@ fn build_router_registers_exactly_the_surviving_paths() {
     let mut paths = registered_paths();
     paths.sort();
 
-    // Six routes: five standard (three probes plus the two streaming front doors) and the
+    // Seven routes: six standard (three probes plus the three streaming front doors) and the
     // OpenAI-compatible endpoint. Update this list together with docs/reference/endpoints/index.md
     // when a route is added or removed on purpose.
     let mut expected = vec![
@@ -70,6 +70,7 @@ fn build_router_registers_exactly_the_surviving_paths() {
         "/health",
         "/ready",
         "/ss-chat/stream",
+        "/ss-report",
         "/v1/chat/completions",
     ];
     expected.sort();

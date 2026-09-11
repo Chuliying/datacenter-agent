@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`POST /ss-report` — the 星星電力 HTML report agent.** The SS counterpart to `/agent/stream`'s
+  report branch: the same four-stage `fetcher → analyst → composer → renderer` pipeline, over the
+  six `ss_*` investor-platform tools, terminating in a `falcon-report` HTML block. It carries the
+  identical identity layer, Falcon permission gate (`[authz].ss_chat_permissions`), rate limiters
+  and answer-policy override as `/ss-chat/stream` — both routes reach the same data — and shares its
+  memory-replay family, so multi-turn context crosses between the two. New `[ss_report]` config
+  section (template + its own `[ss_report.grants]` ceiling, separate from `[ss_chat.grants]` so a
+  report can widen without widening chat).
+- **A section-shaped report protocol** (`agent::ss_report`) and its template
+  (`config/report_template/ss_report.html`, eight charts, sharing the starcharger design tokens
+  verbatim). Deliberately *not* a generalization of `ReportData`: four of the six SS tools return a
+  current-stage snapshot with no time axis, so a `periods[]` spine would have meant inventing a
+  month axis they do not have. Instead there is one section per tool, each with its own period
+  label, and `report.periodLabel` / `report.snapshotLabel` are separate fields because the six tools
+  do not share one window.
+  - **An unfetched tool yields an empty section, which the template hides** — applying the lesson
+    from the 0.5.2 chart fix directly. The SS grant is narrowed per caller by their Falcon
+    permissions, so a partial report is the normal case; the composer is forbidden from zero-filling
+    an absent topic and must name it in `report.dataNote`, which is the reader's only signal that a
+    section is missing. Verified live: a narrow ask ("只要日照資料") fetches one tool, renders one
+    section, hides five, and discloses all five by name.
+  - **FTM construction progress is three flat vectors joined by project name**, not a nested
+    `projects[].stages[]` tree — a minimal-reasoning composer fills flat tables reliably and
+    truncates nested ones. The template re-groups them, and lists an orphaned row under its own
+    heading rather than dropping it.
+  - `wheeling.sites` is the one capped section (`ss_power_wheeling` returns 100+ rows); the cap is
+    disclosed by `wheeling.totalRows`, and the wheeling KPI labels itself as covering only the shown
+    rows rather than claiming a platform-wide total it derived from a subset.
+- `examples/render_report_ss.rs` — writes a real `/ss-report` run to an HTML file for inspection,
+  reporting per section whether the tool was called *and* whether the section got rows (a tool
+  called but a section left empty being the interesting failure). `tests/ss_report_render.rs` pins
+  the render contract offline: every field the template reads is emitted, every id it addresses
+  exists, and an empty section survives to the page as an empty section.
+
+### Changed
+- `examples/render_report.rs` is now `examples/render_report_st.rs` (its output files are
+  `report-st-N.*`), pairing with the new `render_report_ss`.
+- `Renderer` takes the artifact key it injects, so both report pipelines share one pure-logic
+  terminal stage. The distinct keys (`report.data` / `ss_report.data`) are the isolation guarantee:
+  the two payload schemas are incompatible, so a mis-wired pipeline fails as a missing artifact
+  rather than handing one template the other's data.
+
 ## [0.5.2] - 2026-09-09
 
 ### Fixed

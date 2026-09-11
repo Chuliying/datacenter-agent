@@ -69,9 +69,10 @@ use crate::agent::llm::{OpenAiLlm, StreamingOpenAiLlm};
 use crate::agent::payload::{ArtifactKey, LlmCapability, PayloadKind, Tool};
 use crate::agent::pipeline::{
     agent_pipeline_id, analyst_config, charter_config, fetcher_config, report_analyst_config,
-    report_composer_config, report_pipeline_id, ss_chat_pipeline_id, Finalizer, Renderer,
+    report_composer_config, report_pipeline_id, ss_chat_pipeline_id, ss_report_analyst_config,
+    ss_report_composer_config, ss_report_pipeline_id, Finalizer, Renderer,
 };
-use crate::agent::tools::{emit_chart_tool, emit_report_tool, McpTool};
+use crate::agent::tools::{emit_chart_tool, emit_report_tool, emit_ss_report_tool, McpTool};
 use crate::mcp_client::McpHandle;
 
 /// The wildcard grant: "every tool the MCP server advertises".
@@ -79,6 +80,8 @@ const ALL_MCP_TOOLS: &str = "*";
 
 /// The report `composer`'s fixed grant: the built-in `emit_report` sink (code-backed, not MCP).
 const EMIT_REPORT: &str = "emit_report";
+/// The 星星電力 report composer's built-in sink (see [`emit_ss_report_tool`]).
+const EMIT_SS_REPORT: &str = "emit_ss_report";
 
 /// The reasoning budget for **mechanical** stages — a data `fetcher` (fetch args, no analysis) and
 /// the report `composer` (transcribe fetched numbers into a fixed shape). These tasks need no
@@ -410,6 +413,139 @@ pub fn build_report_pipeline(
     };
     let stages = resolve_pipeline(&pipeline, &agents)
         .map_err(|e| anyhow!("resolve report pipeline: {e}"))?;
+
+    let mut orchestrator = Orchestrator::new();
+    orchestrator.insert(pipeline.id, stages);
+    Ok(orchestrator)
+}
+
+/// Assembles the **`/ss-report`** pipeline: `fetcher → analyst → composer → renderer`.
+///
+/// [`build_report_pipeline`]'s sibling, and deliberately the same four stages in the same order:
+/// the `fetcher` pulls the 星星電力 investor-platform data with the caller-provided grant, the
+/// `analyst` writes the executive narrative, the `composer` maps data + narrative into a
+/// schema-validated [`SsReportData`](crate::agent::ss_report::SsReportData) via its built-in
+/// `emit_ss_report` sink, and the **terminal** pure-logic [`Renderer`] injects that
+/// `ss_report.data` into the boot-loaded SS HTML `template`. The LLM never writes HTML.
+///
+/// Three things differ from the starcharger report, all of them arguments or data rather than
+/// structure — which is the point of the sub-agent decomposition:
+///
+/// - the stage prompts (`ss_report_*`, investor-platform framing);
+/// - the tool grant (the six `ss_*` tools);
+/// - the payload protocol and its template — section-shaped rather than period-shaped, because
+///   four of the six SS tools return a current-stage snapshot with no time axis
+///   (see [`crate::agent::ss_report`]).
+///
+/// # Arguments
+///
+/// - `mcp` / `discovered` / `mcp_instructions`: as for [`build_insight_pipeline`].
+/// - `fetcher_instruction` / `analyst_instruction` / `composer_instruction`: the three LLM stages'
+///   system prompts, resolved at boot from `config.toml`'s `[prompts.*]` section.
+/// - `fetcher_grant`: the `ss_*` tools the report fetcher may call, after the SS report ceiling and
+///   the caller's permission intersection have been applied.
+/// - `sweep_all_tools`: whether this turn is a **report** turn, in which case the fetcher is told
+///   outright to call every granted tool. Passed in rather than inferred because the caller
+///   (`select_ss_report_pipeline`) is what reads the request's report keywords — see
+///   [`report_sweep_directive`] for why the sweep has to be an instruction and not a hope.
+/// - `resolved`: the fully-resolved LLM every LLM stage runs on.
+/// - `template`: the boot-loaded SS HTML template (its `__REPORT_DATA_JSON__` placeholder is
+///   validated present at boot, see [`AppState::new`](crate::appstate::AppState)).
+/// - `sink`: `Some` selects the streaming shape; `None` is fully buffered.
+///
+/// # Errors
+///
+/// As for [`build_report_pipeline`]: a granted MCP tool absent from the server, an LLM client that
+/// fails to build, or an unresolvable stage reference.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ss_report_pipeline(
+    mcp: McpHandle,
+    discovered: &[ChatCompletionTool],
+    mcp_instructions: Option<&str>,
+    fetcher_instruction: &str,
+    analyst_instruction: &str,
+    composer_instruction: &str,
+    fetcher_grant: &[String],
+    sweep_all_tools: bool,
+    resolved: &ResolvedLlm,
+    template: Arc<String>,
+    sink: Option<Arc<dyn EventSink>>,
+) -> Result<Orchestrator> {
+    // ── resolve each tool-bearing stage's grant into concrete tools ──
+    let fetcher_tools = build_stage_tools("fetcher", fetcher_grant, &mcp, discovered)?;
+    // The composer's only tool is the built-in `emit_ss_report` sink (code-backed, no MCP).
+    let composer_tools =
+        build_stage_tools("composer", &[EMIT_SS_REPORT.to_string()], &mcp, discovered)?;
+
+    // ── the reasoning analyst on the default budget; the mechanical fetcher + composer lowered.
+    //    Same split, and same reasoning, as `build_report_pipeline`: the composer transcribes
+    //    fetched numbers into a fixed shape, so full reasoning is wasted output and the direct
+    //    cause of token-limit truncations on a payload this wide. ──
+    let llm = build_stage_llm(resolved, &sink).context("build ss report LLM")?;
+    let llm_low = build_stage_llm(&resolved.with_reasoning_effort(MECHANICAL_REASONING), &sink)
+        .context("build minimal-reasoning ss report LLM")?;
+
+    // ── the fetcher instruction, composed with the MCP conventions and this turn's task ──
+    let mut fetcher_cfg = fetcher_config(fetcher_instruction);
+    fetcher_cfg.instruction = compose_fetcher_instruction(
+        &fetcher_cfg.instruction,
+        fetcher_grant,
+        discovered,
+        mcp_instructions,
+        if sweep_all_tools {
+            FetchTask::Report
+        } else {
+            FetchTask::Chat
+        },
+    );
+
+    // ── the four stages; upstream shapes are Intermediate, the renderer is the terminal Final ──
+    let fetcher: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &fetcher_cfg,
+        llm_low.clone(), // mechanical fetch — minimal reasoning
+        fetcher_tools,
+        OutputShape::Intermediate,
+    ));
+    let analyst: Arc<dyn SubAgent> = Arc::new(ConfiguredAgent::new(
+        &ss_report_analyst_config(analyst_instruction),
+        llm,    // the analyst genuinely reasons — keep the default budget
+        vec![], // the analyst only reasons over provided material
+        OutputShape::Intermediate,
+    ));
+    let composer: Arc<dyn SubAgent> = Arc::new(
+        ConfiguredAgent::new(
+            &ss_report_composer_config(composer_instruction),
+            llm_low, // mechanical transcription — minimal reasoning
+            composer_tools,
+            OutputShape::Intermediate,
+        )
+        // The composer's whole job is the `emit_ss_report` sink. Require its output so a model that
+        // ends without calling the tool is retried, and ultimately fails *here* (not cryptically at
+        // the renderer) if it never produces `ss_report.data`.
+        .with_required_output(ArtifactKey::ss_report_data()),
+    );
+    let renderer: Arc<dyn SubAgent> = Arc::new(Renderer::with_ss_template(template));
+
+    let agents: HashMap<SubAgentId, Arc<dyn SubAgent>> = [
+        (SubAgentId("fetcher".into()), fetcher),
+        (SubAgentId("analyst".into()), analyst),
+        (SubAgentId("composer".into()), composer),
+        (SubAgentId("renderer".into()), renderer),
+    ]
+    .into_iter()
+    .collect();
+
+    let pipeline = PipelineConfig {
+        id: ss_report_pipeline_id(),
+        stages: vec![
+            SubAgentId("fetcher".into()),
+            SubAgentId("analyst".into()),
+            SubAgentId("composer".into()),
+            SubAgentId("renderer".into()),
+        ],
+    };
+    let stages = resolve_pipeline(&pipeline, &agents)
+        .map_err(|e| anyhow!("resolve ss report pipeline: {e}"))?;
 
     let mut orchestrator = Orchestrator::new();
     orchestrator.insert(pipeline.id, stages);
@@ -765,6 +901,7 @@ fn code_tool(name: &str) -> Option<Box<dyn Tool>> {
     match name {
         "emit_chart" => Some(Box::new(emit_chart_tool())),
         EMIT_REPORT => Some(Box::new(emit_report_tool())),
+        EMIT_SS_REPORT => Some(Box::new(emit_ss_report_tool())),
         _ => None,
     }
 }

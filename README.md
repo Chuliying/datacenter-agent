@@ -19,6 +19,12 @@ LLM against live data with the power of MCP server.
   refusal, audit and prompt caps are unchanged; session memory is written with a per-pipeline
   tag so multi-turn context survives the identity slice's replay filter. See
   [ss-chat-stream](docs/reference/endpoints/ss-chat-stream.md).
+- `/ss-report`: SSE stream — the 星星電力 **HTML report** front door. Same six `ss_*` tools and the
+  same Falcon permission gate as `/ss-chat/stream`, but always the four-stage
+  `fetcher → analyst → composer → renderer` report pipeline, terminating in a `falcon-report` HTML
+  block. Its payload is section-shaped (one section per tool), so a tool the caller's permissions do
+  not cover simply yields no section rather than a chart of zeros. See
+  [ss-report](docs/reference/endpoints/ss-report.md).
 - `/v1/chat/completions`: OpenAI-compatible (agentgateway Path C), streaming and non-streaming.
 - `/greeting`: a random pre-generated, data-aware welcome message
 - `/health`: liveness probe
@@ -27,9 +33,9 @@ LLM against live data with the power of MCP server.
 `POST /agent`, `/insight`, `/insight/stream`, `/report` and `/report/stream` have been retired;
 they return `404`. Use `/agent/stream` (streaming) or `/v1/chat/completions` (non-streaming).
 
-All routes, including `/health` and `/ready`, require the service bearer token. The three prompt
-routes (`/agent/stream`, `/ss-chat/stream`, `/v1/chat/completions`) additionally require a Falcon
-end-user token — see [Authentication](#authentication). See
+All routes, including `/health` and `/ready`, require the service bearer token. The four prompt
+routes (`/agent/stream`, `/ss-chat/stream`, `/ss-report`, `/v1/chat/completions`) additionally
+require a Falcon end-user token — see [Authentication](#authentication). See
 [the endpoint contract](docs/reference/endpoints/index.md) for middleware and probe caveats.
 
 ## Authentication
@@ -41,8 +47,8 @@ via an `Authorization: Bearer <token>` header, provides basic safety so the upst
 won't be abused by some random weirdos. The failure response is `418 I'm a teapot` on the standard
 routes, and `401` with the OpenAI error envelope on `/v1/chat/completions`.
 
-**2. Falcon end-user identity — the three prompt routes.** `/agent/stream`, `/ss-chat/stream` and
-`/v1/chat/completions` additionally require `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`.
+**2. Falcon end-user identity — the four prompt routes.** `/agent/stream`, `/ss-chat/stream`,
+`/ss-report` and `/v1/chat/completions` additionally require `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`.
 The runtime verifies it against Falcon's permissions endpoint, derives a pseudonymous `actor_key`
 from it, and narrows the pipeline's tool grant to `boot ∩ permission ∩ intent-required` **before**
 any LLM or MCP call — so a caller only ever reaches the data their Falcon permissions cover. A
