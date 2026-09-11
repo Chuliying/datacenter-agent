@@ -273,7 +273,7 @@ mod tests {
         [code.to_string()].into_iter().collect()
     }
 
-    const ENGPROJ: &str = "hdrenewables/elecsvc/starcharger/engproj";
+    const ENGPROJ: &str = "hdrenewables:elecsvc:starcharger:engproj";
 
     /// The data-aware greeting requires every greeting-fetcher tool to be unlocked.
     #[test]
@@ -346,7 +346,7 @@ mod tests {
 
         let ss = greeting_capabilities(
             &config,
-            Some(&permissions("hdrenewables/elecsvc/startrade-power/finance")),
+            Some(&permissions("hdrenewables:elecsvc:startrade-power:finance")),
             &adv,
         );
         assert!(ss.contains(&SS_CHAT_CAPABILITY.to_string()));

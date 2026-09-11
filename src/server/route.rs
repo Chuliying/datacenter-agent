@@ -655,11 +655,11 @@ mod tests {
     #[tokio::test]
     async fn greeting_is_scoped_by_falcon_permissions_when_the_header_is_present() {
         use crate::server::handler::NEUTRAL_GREETING;
-        const ENGPROJ: &str = "hdrenewables/elecsvc/starcharger/engproj";
+        const ENGPROJ: &str = "hdrenewables:elecsvc:starcharger:engproj";
         const ALL: [&str; 3] = [
-            "hdrenewables/elecsvc/starcharger/finance",
-            "hdrenewables/elecsvc/starcharger/opperf",
-            "hdrenewables/elecsvc/starcharger/bizdev",
+            "hdrenewables:elecsvc:starcharger:finance",
+            "hdrenewables:elecsvc:starcharger:opperf",
+            "hdrenewables:elecsvc:starcharger:bizdev",
         ];
         const DATA_GREETING: &str = "八月營收達 6,314,185，會員總數達 53,555。";
 
