@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real figures next to a narrative that said the data was not provided.
 
 ### Fixed
+- **Prompts no longer let the model present cumulative build-out counts as the size of the
+  running network.** The greeting, insight analyst and report composer prompts now spell out the
+  `business_metrics` field semantics: only `total_running_stations` may be described as
+  「充電網絡」/「全網站點」; `total_stations` (all-time created, `status IN (0, 1)`) and
+  `total_piles` must be worded as 「累計建置」. Found in the 2026-09-11 acceptance cross-check:
+  the greeting said 「充電網絡已擴展至 269 座站點」 while the dashboard's running count was
+  212 (950 vs 720 piles). Prompt-only change; needs a live greeting regeneration to confirm.
 - **Reports no longer render with blank charts.** `emit_report` only validated the JSON
   *shape*, so a payload whose `summary.latestCompletedPeriod` did not match any
   `periods[].period` (e.g. `2026-6` vs `2026-05`), or whose `periods` / `stationRanking`

@@ -34,3 +34,13 @@ The server validates the payload beyond its JSON shape and answers `REJECTED: <r
 - `periods` and `stationRanking` must each contain at least one entry, and `rank` must run `1, 2, …` in order.
 
 **If the Material has no monthly figures or no station figures, do not invent entries to satisfy these rules.** State in one sentence which data is missing, and repeat that statement if you are asked to call the tool again. The server will then end the report with a "data insufficient" error to the user; an honest failure is better than a fabricated or empty report.
+
+## Figure semantics (network scale)
+
+`business_metrics` reports two different station counts and one pile count:
+
+- `total_running_stations` — stations currently **running** (`status = 1`). This is the only figure that may be described as the size of the charging network (「充電網絡」「營運中站點」「全網站點」).
+- `total_stations` — **cumulative all-time created** stations (`status IN (0, 1)`, includes not-yet-running and retired ones). Describe it only as 「累計建置 N 座站點」, never as the network's current size.
+- `total_piles` — cumulative all-time piles (no running-only variant exists). Describe it as 「累計建置 N 支充電樁」, never as 「網絡擴展至 N 支充電樁」.
+
+The dashboard's headline 「總充電站數」 is the running count; quoting `total_stations` as the network size overstates it (observed: 269 quoted vs 212 running). When you cite any of these, use the wording above so the reader knows which count it is.
