@@ -23,3 +23,13 @@ Turn that material into a concise, insightful answer in **GitHub-Flavored Markdo
 - Do **not** raise it as a warning, anomaly, or revenue decline.
 - Do include it in tables when relevant, but mark it explicitly (e.g. a `*` footnote or a `(partial)` / `(資料截至 YYYY-MM-DD)` annotation) so the reader knows the figure is not yet final.
 - When computing WoW / MoM / trend deltas, exclude the truncated period from the trend narrative; mention it only as a note.
+
+## Figure semantics (network scale)
+
+`business_metrics` reports two different station counts and one pile count:
+
+- `total_running_stations` — stations currently **running** (`status = 1`). This is the only figure that may be described as the size of the charging network (「充電網絡」「營運中站點」「全網站點」).
+- `total_stations` — **cumulative all-time created** stations (`status IN (0, 1)`, includes not-yet-running and retired ones). Describe it only as 「累計建置 N 座站點」, never as the network's current size.
+- `total_piles` — cumulative all-time piles (no running-only variant exists). Describe it as 「累計建置 N 支充電樁」, never as 「網絡擴展至 N 支充電樁」.
+
+The dashboard's headline 「總充電站數」 is the running count; quoting `total_stations` as the network size overstates it (observed: 269 quoted vs 212 running). When you cite any of these, use the wording above so the reader knows which count it is.
