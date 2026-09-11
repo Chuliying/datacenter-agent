@@ -56,6 +56,12 @@ file = "prompt_guide/greeting_user.md"
 [prompts.fetcher_system]
 file = "prompt_guide/fetcher_system.md"
 
+# Report pipeline fetcher: unlike the insight fetcher ("fetch only what the question needs"),
+# it must call every granted tool once so no template section renders as 資料未提供.
+# Optional — when absent the report pipeline falls back to `fetcher_system`.
+[prompts.report_fetcher_system]
+file = "prompt_guide/report_fetcher_system.md"
+
 [prompts.analyst_system]
 file = "prompt_guide/analyst_system.md"
 

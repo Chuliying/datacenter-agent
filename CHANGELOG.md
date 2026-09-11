@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real figures next to a narrative that said the data was not provided.
 
 ### Fixed
+- **The report fetcher now calls every granted tool once.** The report pipeline reused the insight
+  fetcher prompt ("fetch only what the question needs"), so a 「營收報告」 request often fetched
+  revenue alone (2 of 4 acceptance runs skipped `member_analysis` / `business_metrics`), leaving the
+  member and build-out sections empty. A dedicated `report_fetcher_system` prompt maps each granted
+  tool to its template section, requires one call per tool over one shared monthly window, and
+  falls back to `fetcher_system` when the config predates it.
 - **Prompts no longer let the model present cumulative build-out counts as the size of the
   running network.** The greeting, insight analyst and report composer prompts now spell out the
   `business_metrics` field semantics: only `total_running_stations` may be described as

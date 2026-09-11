@@ -210,6 +210,7 @@ fn prompt_bank() -> PromptBank {
         greeting_analyst_system: String::new(),
         greeting_user: String::new(),
         fetcher_system: String::new(),
+        report_fetcher_system: String::new(),
         analyst_system: String::new(),
         charter_system: String::new(),
         report_analyst_system: String::new(),

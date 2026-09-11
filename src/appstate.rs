@@ -195,8 +195,11 @@ pub struct PromptBank {
     pub greeting_analyst_system: String,
     /// Greeting pipeline — the boot-time request prompt (the `Initial` payload's prompt).
     pub greeting_user: String,
-    /// `/insight` + `/report` pipelines — the shared data-fetch stage's system prompt.
+    /// `/insight` pipeline — the data-fetch stage's system prompt ("fetch only what the question needs").
     pub fetcher_system: String,
+    /// `/report` pipeline — the data-fetch stage's system prompt ("call every granted tool once").
+    /// Falls back to `fetcher_system` when the config has no `report_fetcher_system` prompt.
+    pub report_fetcher_system: String,
     /// `/insight` pipeline — the analyst stage's system prompt (writes the markdown report).
     pub analyst_system: String,
     /// `/insight` pipeline — the charter stage's system prompt (decides 0–2 charts).
@@ -230,6 +233,17 @@ impl PromptBank {
             greeting_analyst_system: cfg.get_prompt_by_id("greeting_analyst_system")?.to_string(),
             greeting_user: cfg.get_prompt_by_id("greeting_user")?.to_string(),
             fetcher_system: cfg.get_prompt_by_id("fetcher_system")?.to_string(),
+            report_fetcher_system: cfg
+                .get_prompt_by_id("report_fetcher_system")
+                .map(str::to_string)
+                .unwrap_or_else(|_| {
+                    tracing::warn!(
+                        "config has no `report_fetcher_system` prompt; report pipeline falls back to `fetcher_system`"
+                    );
+                    cfg.get_prompt_by_id("fetcher_system")
+                        .map(str::to_string)
+                        .unwrap_or_default()
+                }),
             analyst_system: cfg.get_prompt_by_id("analyst_system")?.to_string(),
             charter_system: cfg.get_prompt_by_id("charter_system")?.to_string(),
             report_analyst_system: cfg.get_prompt_by_id("report_analyst_system")?.to_string(),
@@ -577,6 +591,18 @@ pub fn load_mcp_url() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The report pipeline gets its own fetcher prompt; it must load from the shipped config and
+    /// differ from the insight fetcher prompt (whose "fetch only what the question needs" rule is
+    /// exactly what left report sections empty).
+    #[test]
+    fn prompt_bank_loads_a_dedicated_report_fetcher_prompt() {
+        let cfg = crate::config::AppConfig::load("config/config.toml").expect("shipped config");
+        let bank = PromptBank::from_app_config(&cfg).expect("prompt bank");
+        assert!(bank
+            .report_fetcher_system
+            .contains("call every granted tool"));
+        assert_ne!(bank.report_fetcher_system, bank.fetcher_system);
+    }
 
     /// AC-021: with the identity layer present, a disabled outer limiter must stop the boot
     /// rather than quietly ship a deployment where identity-failing traffic is unthrottled.
