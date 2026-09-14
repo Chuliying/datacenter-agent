@@ -204,6 +204,55 @@ pub fn report_pipeline_id() -> PipelineId {
 }
 
 // ===========================================================================
+// SS report stage configs — the `/ss-report` pipeline's LLM-driven stages
+// ===========================================================================
+
+/// The `/ss-report` `analyst` config: no tools, consumes the fetched 星星電力 data, writes the
+/// insight narrative.
+///
+/// Structurally identical to [`report_analyst_config`] — same stage id, same accepts, same captured
+/// message. Only the instruction differs (investor-platform framing instead of EV-charging), which
+/// is exactly the axis the config is meant to vary.
+pub fn ss_report_analyst_config(instruction: &str) -> SubAgentConfig {
+    SubAgentConfig {
+        id: SubAgentId("analyst".into()),
+        instruction: instruction.to_string(),
+        llm: None,
+        tools: vec![],
+        accepts: vec![PayloadKind::Intermediate],
+        output: None,
+        capture_message: true, // the analyst's message *is* the insight narrative — keep it
+    }
+}
+
+/// The `/ss-report` `composer` config: the `emit_ss_report` sink, consumes the data + narrative,
+/// emits `ss_report.data`.
+///
+/// Its tool grant is the built-in `emit_ss_report` sink (wired by
+/// [`build_ss_report_pipeline`](crate::agent::wiring::build_ss_report_pipeline)); the `tools` field
+/// here is left empty because that path never reads it.
+pub fn ss_report_composer_config(instruction: &str) -> SubAgentConfig {
+    SubAgentConfig {
+        id: SubAgentId("composer".into()),
+        instruction: instruction.to_string(),
+        llm: None,
+        tools: vec![], // grant is wired in code; see `build_ss_report_pipeline`
+        accepts: vec![PayloadKind::Intermediate],
+        output: None,
+        capture_message: false, // its output is the `ss_report.data` artifact, not its message
+    }
+}
+
+/// The pipeline id that selects the `/ss-report` pipeline in the
+/// [`Orchestrator`](crate::agent::engine::Orchestrator).
+///
+/// Its own id, like [`ss_chat_pipeline_id`]: an `Orchestrator` could hold every pipeline at once,
+/// and stage traces then name the pipeline that actually ran.
+pub fn ss_report_pipeline_id() -> PipelineId {
+    PipelineId("ss-report".into())
+}
+
+// ===========================================================================
 // render_report — the finalizer's pure, deterministic assembly
 // ===========================================================================
 
@@ -377,17 +426,42 @@ pub struct Renderer {
     id: SubAgentId,
     /// The boot-loaded HTML template, shared read-only. Contains [`REPORT_DATA_PLACEHOLDER`].
     template: Arc<String>,
+    /// The artifact slot holding the payload to inject — `report.data` for the starcharger report,
+    /// `ss_report.data` for the 星星電力 one.
+    ///
+    /// Parameterized rather than hard-coded so both report pipelines share this one pure-logic
+    /// terminal stage. The key is also the isolation guarantee: the two payloads have incompatible
+    /// schemas, so a mis-wired pipeline fails here as a missing artifact instead of handing one
+    /// template the other's data.
+    data_key: ArtifactKey,
 }
 
 impl Renderer {
-    /// Builds a renderer that injects `report.data` into `template`.
-    pub fn new(id: SubAgentId, template: Arc<String>) -> Self {
-        Self { id, template }
+    /// Builds a renderer that injects `data_key`'s payload into `template`.
+    pub fn new(id: SubAgentId, template: Arc<String>, data_key: ArtifactKey) -> Self {
+        Self {
+            id,
+            template,
+            data_key,
+        }
     }
 
-    /// Builds the renderer with its canonical `renderer` id.
+    /// Builds the starcharger renderer: the canonical `renderer` id, injecting `report.data`.
     pub fn with_template(template: Arc<String>) -> Self {
-        Self::new(SubAgentId("renderer".into()), template)
+        Self::new(
+            SubAgentId("renderer".into()),
+            template,
+            ArtifactKey::report_data(),
+        )
+    }
+
+    /// Builds the 星星電力 renderer: the canonical `renderer` id, injecting `ss_report.data`.
+    pub fn with_ss_template(template: Arc<String>) -> Self {
+        Self::new(
+            SubAgentId("renderer".into()),
+            template,
+            ArtifactKey::ss_report_data(),
+        )
     }
 }
 
@@ -415,21 +489,22 @@ impl SubAgent for Renderer {
         };
 
         // The structured report is required — the renderer's whole job is to inject it. A non-JSON
-        // value at `report.data` is a wiring fault, surfaced as missing (typed, never a panic).
-        let key = ArtifactKey::report_data();
+        // value at the data key is a wiring fault, surfaced as missing (typed, never a panic).
+        let key = self.data_key.clone();
         // DEBUG PROBE (report.data GET path): dump the full artifact map the renderer sees. When the
         // error reproduces, `report.data` is absent here (composer never Produced it) or present but
         // not `Json` — this line disambiguates the two.
         tracing::debug!(
             target: "agent::probe",
             available_keys = ?data.artifacts.keys().map(|k| k.to_string()).collect::<Vec<_>>(),
-            report_data_present = data.artifacts.contains_key(&key),
-            report_data_variant = ?data.artifacts.get(&key).map(|v| match v {
+            artifact = %key,
+            data_present = data.artifacts.contains_key(&key),
+            data_variant = ?data.artifacts.get(&key).map(|v| match v {
                 ArtifactValue::Json(_) => "Json",
                 ArtifactValue::Text(_) => "Text",
                 ArtifactValue::Number(_) => "Number",
             }),
-            "renderer: looking up report.data before injection"
+            "renderer: looking up its report payload before injection"
         );
         let report_json = match data.artifacts.get(&key) {
             Some(ArtifactValue::Json(v)) => v.clone(),
@@ -437,7 +512,7 @@ impl SubAgent for Renderer {
                 tracing::warn!(
                     target: "agent::probe",
                     artifact = %key,
-                    "renderer: report.data MISSING or non-Json — failing with MissingArtifact"
+                    "renderer: report payload MISSING or non-Json — failing with MissingArtifact"
                 );
                 return Err(AgentError::MissingArtifact(key));
             }

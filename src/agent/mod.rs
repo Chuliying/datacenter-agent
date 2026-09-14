@@ -80,5 +80,6 @@ pub mod llm;
 pub mod payload;
 pub mod pipeline;
 pub mod report;
+pub mod ss_report;
 pub mod tools;
 pub mod wiring;

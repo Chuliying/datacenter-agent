@@ -33,6 +33,8 @@ version = 1
 #   * charter_system            — /insight pipeline: the chart selector (0–2 charts).
 #   * report_analyst_system     — /report pipeline: the insight-narrative analyst.
 #   * report_composer_system    — /report pipeline: the emit_report composer.
+#   * ss_report_analyst_system  — /ss-report pipeline: the insight-narrative analyst.
+#   * ss_report_composer_system — /ss-report pipeline: the emit_ss_report composer.
 #   * ss_fetcher_system         — /ss-chat pipeline: the 星星電力 data-fetch stage.
 #   * ss_analyst_system         — /ss-chat pipeline: the 星星電力 management analyst.
 #   * ss_charter_system         — /ss-chat pipeline: the 星星電力 chart selector (0–2 charts).
@@ -67,6 +69,17 @@ file = "prompt_guide/report_analyst_system.md"
 
 [prompts.report_composer_system]
 file = "prompt_guide/report_composer_system.md"
+
+# ── /ss-report pipeline stage prompts ──
+# The SS report reuses `ss_fetcher_system` for its fetch stage (the same six-tool prompt the
+# /ss-chat pipeline uses; the report sweep directive is appended per turn by the wiring), and has
+# its own analyst + composer prompts because the payload it targets is section-shaped.
+
+[prompts.ss_report_analyst_system]
+file = "prompt_guide/ss_report_analyst_system.md"
+
+[prompts.ss_report_composer_system]
+file = "prompt_guide/ss_report_composer_system.md"
 
 # ── /ss-chat pipeline stage prompts (星星電力 investor platform) ──
 [prompts.ss_fetcher_system]
@@ -165,6 +178,39 @@ fetcher = [
     "business_metrics",
     "member_analysis",
     "bill_member_analysis",
+]
+
+
+# ──── SS report pipeline assets ───
+# `/ss-report` runs the same four stages as `/report` (fetcher → analyst → composer → renderer)
+# over the six 星星電力 investor-platform tools, rendering THIS template instead of the starcharger
+# one. The two templates are separate files on purpose: the payloads have different schemas (the SS
+# report is section-shaped, one section per tool, because four of the six tools are current-stage
+# snapshots with no time axis), so one template could never read both.
+#
+# The template must contain the `__REPORT_DATA_JSON__` placeholder (checked at boot). Omitting this
+# section defaults to `report_template/ss_report.html` and the six `ss_*` tools below.
+
+[ss_report]
+template = "report_template/ss_report.html"
+
+# The SS report's own tool ceiling, separate from `[ss_chat.grants].fetcher` for the same reason
+# `[report.grants]` is separate from `[insight.grants].fetcher`: a report may draw on the whole
+# tool set without widening what a chat turn reaches.
+#
+# An EXPLICIT list, never `"*"` — the MCP server advertises the starcharger tools alongside these,
+# so a wildcard would hand the SS fetcher six EV-charging tools its prompt and template know
+# nothing about. It is a ceiling, not a guarantee: per-request narrowing intersects it with the
+# caller's Falcon permissions, and a report covering only some business lines degrades (the
+# unfetched sections are simply absent from the rendered report) rather than refusing.
+[ss_report.grants]
+fetcher = [
+    "ss_sunshine_hours",
+    "ss_energy_storage",
+    "ss_power_wheeling",
+    "ss_power_pipeline",
+    "ss_btm_projects",
+    "ss_ftm_projects",
 ]
 
 

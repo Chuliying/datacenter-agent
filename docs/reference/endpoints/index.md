@@ -7,7 +7,7 @@
 
 Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth layer。**共 6 條。**
 
-### Standard group（5 條，120 s timeout，`require_bearer` → 418）
+### Standard group（6 條，120 s timeout，`require_bearer` → 418）
 
 | Method | Path | Handler | Runtime prelude | Detail |
 |---|---|---|---|---|
@@ -16,6 +16,7 @@ Router 由兩個 sub-router `merge` 而成，各自帶自己的 timeout 與 auth
 | GET | `/greeting` | `greeting` | — | [greeting](./greeting.md) |
 | POST | `/agent/stream` | `agent_stream` | ✅ | [agent-stream](./agent-stream.md) |
 | POST | `/ss-chat/stream` | `ss_chat_stream` | ✅（answer policy 覆寫） | [ss-chat-stream](./ss-chat-stream.md) |
+| POST | `/ss-report` | `ss_report_stream` | ✅（answer policy 覆寫） | [ss-report](./ss-report.md) |
 
 ### OpenAI group（1 條，600 s timeout，`require_bearer_openai` → 401）
 
@@ -90,16 +91,17 @@ timeout 砍掉。
 
 ## 三條 agent 執行路徑
 
-三者都經過 runtime prelude（`plan_stream_turn`：guardrails → intent → answer policy → memory
+四者都經過 runtime prelude（`plan_stream_turn`：guardrails → intent → answer policy → memory
 → audit），差別在對外形狀、pipeline 選擇方式，以及 answer policy：
 
 | 路徑 | 端點 | Pipeline 選擇 | 對外形狀 |
 |---|---|---|---|
 | 原生串流（EOMC） | `/agent/stream` | 依 resolved intent 路由（`wants_report_pipeline`） | 專案 SSE frame（含 `stage` / `usage` / `intent.resolved`） |
 | 原生串流（星星電力） | `/ss-chat/stream` | 固定 SS chat pipeline，不做 intent routing | 同上（同一段 `run_chat_stream`） |
+| 報表串流（星星電力） | `/ss-report` | 固定 SS report pipeline；只有 fetcher 的 sweep 由關鍵字決定 | 同上，terminal frame 為 ```` ```falcon-report ```` HTML |
 | OpenAI 相容 | `/v1/chat/completions` | 同 `/agent/stream` | `chat.completion` 或偽串流 `chat.completion.chunk` |
 
-`/ss-chat/stream` 是唯一覆寫 answer policy 的端點：它用 `AlwaysAnswerPolicy` 取代配置的
+`/ss-chat/stream` 與 `/ss-report` 是覆寫 answer policy 的兩個端點：它們用 `AlwaysAnswerPolicy` 取代配置的
 `RuleAnswerPolicy`，因為 runtime 的 intent pack 是 EV 充電領域的，SS 問題會被當成 `off_scope`
 拒答。prompt injection 拒答仍然保留，prelude 其餘部分不變。詳見
 [ss-chat-stream](./ss-chat-stream.md#與-agentstream-的兩點差異)。

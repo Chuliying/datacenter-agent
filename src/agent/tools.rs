@@ -45,6 +45,7 @@ use crate::agent::payload::{
     AgentError, ArtifactKey, ArtifactValue, Tool, ToolOutcome, ToolSchema,
 };
 use crate::agent::report::ReportData;
+use crate::agent::ss_report::SsReportData;
 use crate::mcp_client::McpHandle;
 
 // ===========================================================================
@@ -549,6 +550,31 @@ pub fn emit_report_tool() -> SchemaTool<ReportData> {
          — all built strictly from the fetched numbers, never invented. Do NOT write HTML; the \
          server renders it from this data.",
         ArtifactKey::report_data(),
+    )
+}
+
+/// Builds the `emit_ss_report` sink: a [`SchemaTool`] over [`SsReportData`] whose validated value
+/// lands at [`ArtifactKey::ss_report_data()`].
+///
+/// The `/ss-report` composer's only tool, and [`emit_report_tool`]'s sibling — same mechanism
+/// (code-backed, schema-validated, `Rejected` and fed back until valid), different protocol. The
+/// SS payload is **section-shaped** rather than period-shaped, one field per `ss_*` tool, because
+/// four of the six tools return a current-stage snapshot with no time axis at all. See
+/// [`crate::agent::ss_report`] for why that is a separate type rather than a generalization.
+///
+/// The description leans on the section model deliberately: the composer must understand that
+/// omitting a section is a *legitimate* outcome (the caller's Falcon permissions may not cover that
+/// tool), which is what stops it inventing rows to fill a shape it thinks is mandatory.
+pub fn emit_ss_report_tool() -> SchemaTool<SsReportData> {
+    SchemaTool::<SsReportData>::sink(
+        "emit_ss_report",
+        "Emit the whole 星星電力 investor-platform report as structured data. Call exactly once. \
+         Each section (solar, storage, wheeling, pipeline, btm, ftm) carries the rows of ONE data \
+         tool, built strictly from the fetched figures and never invented. Leave a section's arrays \
+         EMPTY when that tool returned nothing or was not called — an empty section is hidden, \
+         which is correct; do not fill it with zeros or guesses. Do NOT write HTML; the server \
+         renders it from this data.",
+        ArtifactKey::ss_report_data(),
     )
 }
 

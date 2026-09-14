@@ -132,6 +132,17 @@ impl ArtifactKey {
         Self::new("report", "data")
     }
 
+    /// The 星星電力 composer's schema-validated report payload (`ss_report.data`), a serialized
+    /// [`SsReportData`](crate::agent::ss_report::SsReportData) from the `emit_ss_report` sink — the
+    /// single artifact the `/ss-report` renderer injects into its HTML template.
+    ///
+    /// A distinct key from [`report_data`](Self::report_data) on purpose: the two payloads have
+    /// different schemas, so a mis-wired pipeline fails as a missing artifact rather than handing
+    /// the SS template a starcharger payload it cannot read.
+    pub fn ss_report_data() -> Self {
+        Self::new("ss_report", "data")
+    }
+
     /// The producer namespace (the `agent` half).
     pub fn agent(&self) -> &str {
         &self.agent

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Run the `/report` pipeline once (or several times) and write each report to an **HTML file you
-//! can open in a browser**.
+//! Run the **starcharger** `/report` pipeline once (or several times) and write each report to an
+//! **HTML file you can open in a browser**.
+//!
+//! Its 星星電力 counterpart is `render_report_ss`, which drives the `/ss-report` pipeline.
 //!
 //! This is the by-hand counterpart to `tests/report_pipeline_coverage.rs`: the same real pipeline
 //! (real MCP tools, real model, real `emit_report` sink, real renderer), but it *keeps the output*
@@ -23,16 +25,16 @@
 //! developer tool cannot end up in the shipped image.
 //!
 //! ```sh
-//! # one report, written to ./report.html
-//! cargo run --example render_report
+//! # one report, written to ./report-st-1.html
+//! cargo run --example render_report_st
 //!
 //! # three reports over a custom window, written into /tmp/reports/
-//! cargo run --example render_report -- --runs 3 --out-dir /tmp/reports \
+//! cargo run --example render_report_st -- --runs 3 --out-dir /tmp/reports \
 //!     --prompt "請產生 2026 年上半年的營運報表"
 //! ```
 //!
-//! Each run writes `report-N.html` (the standalone document, fence stripped) and
-//! `report-N.json` (the composer's `report.data` — the exact payload the template reads), then
+//! Each run writes `report-st-N.html` (the standalone document, fence stripped) and
+//! `report-st-N.json` (the composer's `report.data` — the exact payload the template reads), then
 //! prints a coverage line per chart so a gap is visible without opening the file.
 //!
 //! Required environment (a `.env` at the repo root is loaded automatically, like `main`):
@@ -54,7 +56,7 @@ use datacenter_agent::config::AppConfig;
 use datacenter_agent::mcp_client::McpClient;
 
 #[derive(Debug, Parser)]
-#[command(about = "Generate a real EOMC report and write it to an HTML file")]
+#[command(about = "Generate a real starcharger (EOMC) report and write it to an HTML file")]
 struct Args {
     /// The user request to run the report pipeline on.
     #[arg(long, default_value = "請產生最近六個月的充電網路營運報表。")]
@@ -169,7 +171,7 @@ async fn main() -> Result<()> {
 
         // The composer's payload is what the template reads, so write it beside the HTML: it is far
         // easier to see "every `stations` is 0" here than in a rendered chart.
-        let json_path = args.out_dir.join(format!("report-{run}.json"));
+        let json_path = args.out_dir.join(format!("report-st-{run}.json"));
         if let Some(ArtifactValue::Json(raw)) =
             final_result.artifacts.get(&ArtifactKey::report_data())
         {
@@ -185,7 +187,7 @@ async fn main() -> Result<()> {
 
         // The pipeline's answer is a ```falcon-report fenced block (the frontend wire shape);
         // strip the fence so the file is a standalone document a browser can open.
-        let html_path = args.out_dir.join(format!("report-{run}.html"));
+        let html_path = args.out_dir.join(format!("report-st-{run}.html"));
         std::fs::write(&html_path, strip_report_fence(&final_result.assistant))
             .with_context(|| format!("write {}", html_path.display()))?;
 

@@ -134,6 +134,9 @@ struct Manifest {
     /// Optional `/report` pipeline assets (the HTML template; default path applied when absent).
     #[serde(default)]
     report: Option<ReportManifest>,
+    /// Optional `/ss-report` pipeline assets (the SS HTML template + its own tool ceiling).
+    #[serde(default)]
+    ss_report: Option<SsReportManifest>,
     /// Optional `[server]` section (ingress policy; defaults applied when absent).
     #[serde(default)]
     server: Option<ServerManifest>,
@@ -389,6 +392,96 @@ impl ReportGrants {
     }
 }
 
+/// Optional `[ss_report]` section: assets for the `/ss-report` HTML pipeline.
+///
+/// Separate from `[report]` because the two pipelines render **different templates from different
+/// payload schemas** — the SS report is section-shaped, one section per `ss_*` tool. Sharing one
+/// section would make it impossible to retune one report's brand without touching the other.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsReportManifest {
+    /// Path to the SS HTML report template (relative to the manifest's parent directory, or
+    /// absolute). Must contain the `__REPORT_DATA_JSON__` placeholder.
+    #[serde(default = "default_ss_report_template")]
+    template: PathBuf,
+    /// Optional `[ss_report.grants]`: the SS report pipeline's own tool ceiling. Absent defaults to
+    /// the six `ss_*` tools.
+    #[serde(default)]
+    grants: Option<SsReportGrants>,
+}
+
+/// `[ss_report.grants]`: the `/ss-report` pipeline's tool ceiling.
+///
+/// Separate from `[ss_chat.grants].fetcher` for the same reason `[report.grants]` is separate from
+/// `[insight.grants].fetcher`: a report may draw on the full tool set without widening what a chat
+/// turn can reach. It is a ceiling, not a guarantee — per-request narrowing intersects it with the
+/// caller's Falcon permissions, and a report covering only some business lines degrades (its
+/// unfetched sections are simply absent) rather than refusing.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SsReportGrants {
+    /// The SS report fetcher's granted data tools, by MCP wire name.
+    pub fetcher: Vec<String>,
+}
+
+impl SsReportGrants {
+    /// Boot-time validation that every granted name is actually advertised.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` naming the first tool the MCP server does not advertise.
+    pub fn validate(&self, advertised: &[String]) -> Result<()> {
+        reject_unadvertised(&self.fetcher, advertised, "[ss_report.grants].fetcher")
+    }
+}
+
+impl Default for SsReportGrants {
+    /// The six `ss_*` investor-platform tools — the whole SS surface.
+    ///
+    /// An explicit list rather than the `"*"` wildcard: the MCP server advertises the starcharger
+    /// tools alongside the SS ones, so a wildcard default would hand the SS report fetcher six
+    /// EV-charging tools its prompt and its template say nothing about.
+    fn default() -> Self {
+        Self {
+            fetcher: [
+                "ss_sunshine_hours",
+                "ss_energy_storage",
+                "ss_power_wheeling",
+                "ss_power_pipeline",
+                "ss_btm_projects",
+                "ss_ftm_projects",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+/// The default SS report template path, relative to the config root.
+fn default_ss_report_template() -> PathBuf {
+    PathBuf::from("report_template/ss_report.html")
+}
+
+/// Resolves `[ss_report].template` (or [`default_ss_report_template`] when the section is absent)
+/// against the config root and loads it.
+fn load_ss_report_template(root: &Path, manifest: Option<&SsReportManifest>) -> Result<String> {
+    let relative = manifest
+        .map(|m| m.template.clone())
+        .unwrap_or_else(default_ss_report_template);
+    let path = if relative.is_absolute() {
+        relative
+    } else {
+        root.join(relative)
+    };
+    std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "config_error: cannot read ss report template {}",
+            path.display()
+        )
+    })
+}
+
 /// Fail on the first granted name the MCP server does not advertise.
 ///
 /// A typo here would otherwise become a permanent, invisible default-deny for that topic:
@@ -626,6 +719,11 @@ pub struct AppConfig {
     pub authz: Option<AuthzConfig>,
     /// Resolved `[report.grants]` ceiling. `None` when absent (legacy shared-grant behavior).
     pub report_grants: Option<ReportGrants>,
+    /// The `/ss-report` HTML template body, read at load from `[ss_report].template` (or its
+    /// default path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
+    pub ss_report_template: String,
+    /// Resolved `[ss_report.grants]` ceiling — the six `ss_*` tools when the section is absent.
+    pub ss_report_grants: SsReportGrants,
 }
 
 /// Resolved `/insight` pipeline tool grants — which tools each sub-agent exposes to its LLM.
@@ -808,6 +906,13 @@ impl AppConfig {
 
         let report_grants = manifest.report.as_ref().and_then(|r| r.grants.clone());
 
+        let ss_report_template = load_ss_report_template(&root, manifest.ss_report.as_ref())?;
+        let ss_report_grants = manifest
+            .ss_report
+            .as_ref()
+            .and_then(|r| r.grants.clone())
+            .unwrap_or_default();
+
         let rate_limit = manifest
             .server
             .and_then(|server| server.rate_limit)
@@ -835,6 +940,8 @@ impl AppConfig {
             identity,
             authz,
             report_grants,
+            ss_report_template,
+            ss_report_grants,
         })
     }
 
@@ -1335,6 +1442,61 @@ request_timeout_ms = 5000
                 "{source} grants the SS fetcher a non-`ss_` tool: {grant:?}"
             );
         }
+    }
+
+    #[test]
+    fn ss_report_fetcher_grant_never_uses_the_wildcard() {
+        // Same invariant as the SS chat grant above, and it matters more here: the SS report
+        // template has one section per `ss_*` tool, so an EV-charging tool leaking into this grant
+        // would be fetched, paid for, and then have nowhere to render — while the section it was
+        // mistaken for stays empty.
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        for (source, grant) in [
+            ("config/config.toml", &cfg.ss_report_grants.fetcher),
+            (
+                "SsReportGrants::default()",
+                &SsReportGrants::default().fetcher,
+            ),
+        ] {
+            assert!(
+                !grant.iter().any(|name| name == "*"),
+                "{source} grants the SS report fetcher the `*` wildcard, which would expose the \
+                 EV-charging tools to the 星星電力 report pipeline"
+            );
+            assert!(
+                grant.iter().all(|name| name.starts_with("ss_")),
+                "{source} grants the SS report fetcher a non-`ss_` tool: {grant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_report_grants_default_to_the_six_ss_tools_when_section_absent() {
+        // The report ceiling and the chat ceiling happen to list the same six tools today, but they
+        // are separate settings on purpose — a report may widen without widening chat.
+        let mut report = SsReportGrants::default().fetcher;
+        let mut chat = SS_FETCHER_TOOLS.to_vec();
+        report.sort();
+        chat.sort();
+        assert_eq!(report, chat);
+    }
+
+    #[test]
+    fn config_loads_the_ss_report_template_with_the_data_placeholder() {
+        // The renderer replaces exactly this token; a template without it would render an empty
+        // report on every request, which is why `AppState::new` refuses to boot without it.
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        assert!(
+            cfg.ss_report_template
+                .contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER),
+            "the shipped SS report template must carry the data placeholder"
+        );
+        // …and it must be a different document from the starcharger one: the two payload schemas
+        // are incompatible, so sharing a template would render one report from the other's data.
+        assert_ne!(
+            cfg.ss_report_template, cfg.report_template,
+            "the SS report must not be pointed at the starcharger template"
+        );
     }
 
     #[test]
