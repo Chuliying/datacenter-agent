@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **streaming LLM: an empty, finish-less stream is now a stage failure, not a blank answer.**
+  `StreamingOpenAiLlm::chat` returned `LlmResponse::Message("")` when the provider closed the
+  stream with no content, no tool call and no `finish_reason` (how an upstream failure looks when
+  the gateway keeps the HTTP 200 — keep-alive comments then close, a provider error never turned
+  into a choice, an aborted relay). Every stage then "succeeded" on the blank and the browser got
+  `token ""` + `done`; observed on dev 2026-09-14 as 0/10 data questions answered while all stage
+  dots were green. `ensure_stream_completed` now rejects that shape with
+  `AgentError::Capability("chat stream ended without a completion …")`, so the stage closes with
+  `failure` and an `error` frame the UI can act on. A finish-less turn that did stream content or
+  a tool call still passes (partial relay); an explicit `stop` on an empty turn is left alone.
 ### Changed
 - **`/greeting` is scoped by Falcon permissions when `X-Falcon-Authorization` is sent.** The
   pre-generated welcome line quotes revenue, member and station figures; a role whose permissions

@@ -480,6 +480,11 @@ struct StreamAccumulator {
 }
 
 impl StreamAccumulator {
+    /// `true` when nothing was folded — no content and no tool-call fragment.
+    fn is_empty(&self) -> bool {
+        self.content.is_empty() && self.tools.is_empty()
+    }
+
     /// Folds one frame, emitting an [`AgentEvent::ContentDelta`] per non-empty content chunk and
     /// an [`AgentEvent::ToolArgsDelta`] per non-empty argument fragment.
     fn push(&mut self, frame: DeltaFrame, sink: &dyn EventSink) {
@@ -651,8 +656,35 @@ impl LlmCapability for StreamingOpenAiLlm {
             _ => {}
         }
 
+        ensure_stream_completed(finish_reason.as_ref(), &acc)?;
+
         Ok(acc.finish(sink))
     }
+}
+
+/// Rejects a stream that closed without ever completing a turn.
+///
+/// A healthy turn always carries a `finish_reason` on its last choice. A stream that ends with *no*
+/// stop reason, *no* content and *no* tool-call fragment is not an answer — it is how an upstream
+/// failure looks when the provider keeps the HTTP 200 (OpenRouter's keep-alive comments followed by
+/// a close, a provider error the gateway never turned into a choice, an aborted relay). Before this
+/// check such a turn folded into `LlmResponse::Message("")`, every stage then "succeeded" on the
+/// blank, and the browser received `token ""` + `done` — a silent blank answer instead of a
+/// `stage failure` + `error` frame the UI can act on (observed on dev, 2026-09-14).
+///
+/// A finish-less turn that *did* stream content or a tool call is left alone: that is a partial
+/// relay the caller may still use, and the truncation cases are already handled above.
+fn ensure_stream_completed(
+    finish_reason: Option<&FinishReason>,
+    acc: &StreamAccumulator,
+) -> Result<(), AgentError> {
+    if finish_reason.is_none() && acc.is_empty() {
+        return Err(AgentError::Capability(
+            "chat stream ended without a completion (no content, no tool call, no finish_reason)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -866,6 +898,37 @@ mod tests {
                 AgentEvent::ContentDelta { text: "lo".into() },
             ]
         );
+    }
+
+    #[test]
+    fn empty_finish_less_stream_is_a_capability_error_not_a_blank_message() {
+        // No frame ever arrived and no stop reason was seen: the upstream failed silently.
+        let acc = StreamAccumulator::default();
+        let err = ensure_stream_completed(None, &acc).expect_err("must reject an empty stream");
+        assert!(matches!(err, AgentError::Capability(m) if m.contains("without a completion")));
+    }
+
+    #[test]
+    fn finish_less_stream_with_content_or_tool_call_still_passes() {
+        let sink = CollectingSink::new();
+        // Content arrived (a partial relay): usable, not an error.
+        let mut acc = StreamAccumulator::default();
+        acc.push(content_frame("partial"), &sink);
+        ensure_stream_completed(None, &acc).expect("content without finish_reason passes");
+        // A tool call arrived: same.
+        let mut acc = StreamAccumulator::default();
+        acc.push(
+            tool_frame(0, Some("call_1"), Some("bill_revenue"), Some("{}")),
+            &sink,
+        );
+        ensure_stream_completed(None, &acc).expect("tool call without finish_reason passes");
+    }
+
+    #[test]
+    fn empty_stream_with_an_explicit_stop_reason_is_left_to_the_caller() {
+        // The provider *did* finish (an intentionally empty assistant turn). Not this check's call.
+        let acc = StreamAccumulator::default();
+        ensure_stream_completed(Some(&FinishReason::Stop), &acc).expect("stop reason passes");
     }
 
     #[test]
