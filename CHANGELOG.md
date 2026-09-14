@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-14
+
 ### Fixed
 
 - **streaming LLM: an empty, finish-less stream is now a stage failure, not a blank answer.**
@@ -19,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AgentError::Capability("chat stream ended without a completion …")`, so the stage closes with
   `failure` and an `error` frame the UI can act on. A finish-less turn that did stream content or
   a tool call still passes (partial relay); an explicit `stop` on an empty turn is left alone.
+- **Prompts no longer let the model present cumulative build-out counts as the size of the
+  running network.** The greeting, insight analyst and report composer prompts now spell out the
+  `business_metrics` field semantics: only `total_running_stations` may be described as
+  「充電網絡」/「全網站點」; `total_stations` (all-time created, `status IN (0, 1)`) and
+  `total_piles` must be worded as 「累計建置」. Found in the 2026-09-11 acceptance cross-check:
+  the greeting said 「充電網絡已擴展至 269 座站點」 while the dashboard's running count was
+  212 (950 vs 720 piles). Prompt-only change; needs a live greeting regeneration to confirm.
+- **Greeting scope tests now use the colon-form permission codes.** `0.5.1` changed the
+  `[authz.permission_tools]` keys to Falcon's actual colon form
+  (`hdrenewables:elecsvc:starcharger:opperf`); the greeting scope / capabilities tests rebuilt onto
+  `main` still carried the slash form, so their permission lookups silently missed and the tests no
+  longer exercised the gate they were written for.
+- **`config.rs`'s module doc example compiles again.** It used `?` inside a non-`Result` function,
+  so `cargo test --doc -- --ignored` failed to build it; the example is now wrapped in a hidden
+  `fn main() -> anyhow::Result<()>`.
 ### Changed
 - **`/greeting` is scoped by Falcon permissions when `X-Falcon-Authorization` is sent.** The
   pre-generated welcome line quotes revenue, member and station figures; a role whose permissions
@@ -82,13 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.5.2] - 2026-09-09
 
 ### Fixed
-- **Prompts no longer let the model present cumulative build-out counts as the size of the
-  running network.** The greeting, insight analyst and report composer prompts now spell out the
-  `business_metrics` field semantics: only `total_running_stations` may be described as
-  「充電網絡」/「全網站點」; `total_stations` (all-time created, `status IN (0, 1)`) and
-  `total_piles` must be worded as 「累計建置」. Found in the 2026-09-11 acceptance cross-check:
-  the greeting said 「充電網絡已擴展至 269 座站點」 while the dashboard's running count was
-  212 (950 vs 720 piles). Prompt-only change; needs a live greeting regeneration to confirm.
 - **Report sections rendered empty because the fetcher skipped tools.** The `/report` fetcher was
   told to "fetch only what the question needs", with a report caveat it had to infer from the
   user's wording — so it routinely stopped after four or five of its six granted tools. The topics
