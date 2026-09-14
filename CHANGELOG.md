@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`/greeting` is scoped by Falcon permissions when `X-Falcon-Authorization` is sent.** The
+  pre-generated welcome line quotes revenue, member and station figures; a role whose permissions
+  do not unlock every greeting-fetcher tool (`[insight.grants].fetcher`) — e.g. a page-only
+  `engproj` role — now receives a neutral, figure-free greeting instead, with `"scope": "neutral"`
+  in the response (`"full"` otherwise). Callers that send no header keep the legacy global
+  greeting. Found during the 2026-09-11 acceptance walk-through: a restricted account was refused
+  `revenue` data on its first question but had already been told the month's revenue by the
+  greeting. Decision helper `authz::greeting_scope_allows`; falcon-client forwards the user's
+  access token on its greeting route from the same change set. The response also carries
+  `capabilities` — the intents the caller can actually run (`authz::greeting_capabilities`) plus
+  `ss-chat` when held — so the client can hide topics that would only be refused.
+- **Report template no longer renders missing data as `0`.** When a report's periods carry no
+  member (`newMembers` / `totalMembers` / `activeMembers`), infrastructure (`stations` /
+  `chargers`) or charge (`kwh` / `sessions`) figures at all — the composer received no material
+  for them — the KPI card shows `—` with `本期資料未提供` and the corresponding chart frame shows
+  a text note instead of a flat zero line. Previously `累積會員數 0 人` and `0 站 / 0 樁` read as
+  real figures next to a narrative that said the data was not provided.
+  - `examples/render_report.rs` is now `examples/render_report_st.rs` (its output files are
+  `report-st-N.*`), pairing with the new `render_report_ss`.
+- `Renderer` takes the artifact key it injects, so both report pipelines share one pure-logic
+  terminal stage. The distinct keys (`report.data` / `ss_report.data`) are the isolation guarantee:
+  the two payload schemas are incompatible, so a mis-wired pipeline fails as a missing artifact
+  rather than handing one template the other's data.
+
 ### Added
 - **`POST /ss-report` — the 星星電力 HTML report agent.** The SS counterpart to `/agent/stream`'s
   report branch: the same four-stage `fetcher → analyst → composer → renderer` pipeline, over the
@@ -42,17 +67,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the render contract offline: every field the template reads is emitted, every id it addresses
   exists, and an empty section survives to the page as an empty section.
 
-### Changed
-- `examples/render_report.rs` is now `examples/render_report_st.rs` (its output files are
-  `report-st-N.*`), pairing with the new `render_report_ss`.
-- `Renderer` takes the artifact key it injects, so both report pipelines share one pure-logic
-  terminal stage. The distinct keys (`report.data` / `ss_report.data`) are the isolation guarantee:
-  the two payload schemas are incompatible, so a mis-wired pipeline fails as a missing artifact
-  rather than handing one template the other's data.
-
 ## [0.5.2] - 2026-09-09
 
 ### Fixed
+- **Prompts no longer let the model present cumulative build-out counts as the size of the
+  running network.** The greeting, insight analyst and report composer prompts now spell out the
+  `business_metrics` field semantics: only `total_running_stations` may be described as
+  「充電網絡」/「全網站點」; `total_stations` (all-time created, `status IN (0, 1)`) and
+  `total_piles` must be worded as 「累計建置」. Found in the 2026-09-11 acceptance cross-check:
+  the greeting said 「充電網絡已擴展至 269 座站點」 while the dashboard's running count was
+  212 (950 vs 720 piles). Prompt-only change; needs a live greeting regeneration to confirm.
 - **Report sections rendered empty because the fetcher skipped tools.** The `/report` fetcher was
   told to "fetch only what the question needs", with a report caveat it had to infer from the
   user's wording — so it routinely stopped after four or five of its six granted tools. The topics
