@@ -26,6 +26,81 @@ pub struct AuthorizationDecision {
     pub report_pipeline: bool,
 }
 
+/// Whether a caller may see the **data-aware** greeting.
+///
+/// Greetings are pre-generated at boot from everything the greeting fetcher may call
+/// (`[insight.grants].fetcher`), so a single greeting can quote revenue, member and station
+/// figures. A caller therefore only qualifies when their Falcon permissions unlock *every* tool
+/// in that grant; anyone narrower gets the neutral greeting instead. Conservative on purpose: a
+/// finance-only role loses the data greeting rather than risk seeing a member figure it may not
+/// query. An empty grant never qualifies.
+pub fn greeting_scope_allows(
+    config: &AuthzConfig,
+    permission_codes: &HashSet<String>,
+    greeting_fetcher_grant: &[String],
+    advertised: &[String],
+) -> bool {
+    let required = expand_grant(greeting_fetcher_grant, advertised);
+    if required.is_empty() {
+        return false;
+    }
+    let granted = permission_codes
+        .iter()
+        .filter_map(|code| config.permission_tools.get(code))
+        .flat_map(|grant| expand_grant(grant, advertised))
+        .collect::<HashSet<_>>();
+    required.iter().all(|tool| granted.contains(tool))
+}
+
+/// The `ss-chat` capability id advertised by `/greeting`.
+pub const SS_CHAT_CAPABILITY: &str = "ss-chat";
+
+/// Intents whose meta-role makes them meaningless as a user-facing capability.
+const NON_CAPABILITY_INTENTS: [&str; 2] = ["unknown", "report"];
+
+/// The analysis topics a caller can actually run, for `/greeting`'s `capabilities`.
+///
+/// An intent qualifies when every tool it requires is unlocked by the caller's permission
+/// grant (an intent that requires no tools always qualifies); `unknown` and `report` are
+/// never listed. `ss-chat` is appended when any `[authz].ss_chat_permissions` code is held.
+/// Pass `None` for an unauthenticated caller to get the full list (legacy behaviour).
+pub fn greeting_capabilities(
+    config: &AuthzConfig,
+    permission_codes: Option<&HashSet<String>>,
+    advertised: &[String],
+) -> Vec<String> {
+    let granted = permission_codes.map(|codes| {
+        codes
+            .iter()
+            .filter_map(|code| config.permission_tools.get(code))
+            .flat_map(|grant| expand_grant(grant, advertised))
+            .collect::<HashSet<_>>()
+    });
+    let mut capabilities = config
+        .intent_tools
+        .iter()
+        .filter(|(intent, _)| !NON_CAPABILITY_INTENTS.contains(&intent.as_str()))
+        .filter(|(_, required)| match &granted {
+            None => true,
+            Some(granted) => expand_grant(required, advertised)
+                .iter()
+                .all(|tool| granted.contains(tool)),
+        })
+        .map(|(intent, _)| intent.clone())
+        .collect::<Vec<_>>();
+    let ss_chat = match permission_codes {
+        None => !config.ss_chat_permissions.is_empty(),
+        Some(codes) => config
+            .ss_chat_permissions
+            .iter()
+            .any(|code| codes.contains(code)),
+    };
+    if ss_chat {
+        capabilities.push(SS_CHAT_CAPABILITY.to_string());
+    }
+    capabilities
+}
+
 /// Intersect boot data grants, Falcon permission grants, and required intent tools.
 #[allow(clippy::too_many_arguments)]
 pub fn authorize_pipeline(
@@ -196,6 +271,102 @@ mod tests {
 
     fn permissions(code: &str) -> HashSet<String> {
         [code.to_string()].into_iter().collect()
+    }
+
+    const ENGPROJ: &str = "hdrenewables:elecsvc:starcharger:engproj";
+
+    /// The data-aware greeting requires every greeting-fetcher tool to be unlocked.
+    #[test]
+    fn greeting_scope_requires_the_whole_greeting_grant() {
+        let config = config();
+        let grant = shipped_insight_fetcher_grant();
+        let all = [FINANCE, OPPERF, BIZDEV]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert!(greeting_scope_allows(&config, &all, &grant, &advertised()));
+    }
+
+    /// A page-only role (engproj maps to no tools) and a partial role both get the neutral greeting.
+    #[test]
+    fn greeting_scope_is_neutral_for_page_only_and_partial_roles() {
+        let config = config();
+        let grant = shipped_insight_fetcher_grant();
+        assert!(!greeting_scope_allows(
+            &config,
+            &permissions(ENGPROJ),
+            &grant,
+            &advertised()
+        ));
+        assert!(!greeting_scope_allows(
+            &config,
+            &permissions(FINANCE),
+            &grant,
+            &advertised()
+        ));
+        assert!(!greeting_scope_allows(
+            &config,
+            &HashSet::new(),
+            &grant,
+            &advertised()
+        ));
+    }
+
+    /// Capabilities list exactly the intents a caller can run; page-only roles get none.
+    #[test]
+    fn greeting_capabilities_follow_the_permission_grant() {
+        let config = config();
+        let adv = advertised();
+        let all = [FINANCE, OPPERF, BIZDEV]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let full = greeting_capabilities(&config, Some(&all), &adv);
+        for intent in ["revenue", "charging", "member", "site-build"] {
+            assert!(
+                full.contains(&intent.to_string()),
+                "{intent} missing from {full:?}"
+            );
+        }
+        assert!(!full.contains(&"unknown".to_string()));
+        assert!(!full.contains(&"report".to_string()));
+        assert!(!full.contains(&SS_CHAT_CAPABILITY.to_string()));
+
+        let finance_only = greeting_capabilities(&config, Some(&permissions(FINANCE)), &adv);
+        assert!(finance_only.contains(&"revenue".to_string()));
+        assert!(!finance_only.contains(&"charging".to_string()));
+        assert!(!finance_only.contains(&"member".to_string()));
+
+        // engproj maps to no tools: only the tool-free `site-build` intent survives.
+        let page_only = greeting_capabilities(&config, Some(&permissions(ENGPROJ)), &adv);
+        assert_eq!(page_only, vec!["site-build".to_string()]);
+
+        let none = greeting_capabilities(&config, Some(&HashSet::new()), &adv);
+        assert_eq!(none, vec!["site-build".to_string()]);
+
+        let ss = greeting_capabilities(
+            &config,
+            Some(&permissions("hdrenewables:elecsvc:startrade-power:finance")),
+            &adv,
+        );
+        assert!(ss.contains(&SS_CHAT_CAPABILITY.to_string()));
+
+        let legacy = greeting_capabilities(&config, None, &adv);
+        assert!(
+            legacy.contains(&"revenue".to_string())
+                && legacy.contains(&SS_CHAT_CAPABILITY.to_string())
+        );
+    }
+
+    /// An empty greeting grant can never qualify, whatever the caller holds.
+    #[test]
+    fn greeting_scope_denies_on_empty_grant() {
+        let config = config();
+        let all = [FINANCE, OPPERF, BIZDEV]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert!(!greeting_scope_allows(&config, &all, &[], &advertised()));
     }
 
     /// The SS gate: any configured startrade-power sub-page unlocks the full SS grant.

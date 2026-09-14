@@ -23,8 +23,27 @@ pipeline**（`fetcher → analyst`），把結果存進 `AppState::greetings`；
 
 ### 回應 body
 ```json
-{ "greeting": "..." }
+{ "greeting": "...", "scope": "full", "capabilities": ["revenue", "charging", "member", "site-build"] }
 ```
+
+`scope` 為 `"full"`（資料感知問候）或 `"neutral"`（權限不足時的中性問候，不含任何數字）。
+`capabilities` 列出此使用者**實際能跑**的分析意圖：`[authz.intent_tools]` 中所需工具全部被其權限解鎖的意圖
+（不含 `unknown` / `report`；所需工具為空的意圖一律列入），持有任一 `[authz].ss_chat_permissions` 時另加 `"ss-chat"`。
+未帶 `X-Falcon-Authorization` 時為完整清單；空陣列代表此帳號沒有任何可用主題，前端應直接說明而非列出會被拒絕的主題
+（判定：`authz::greeting_capabilities`）。
+
+### 依權限縮放（`X-Falcon-Authorization` 選用）
+本端點不在 identity middleware 之內（探測與歡迎詞必須在解析使用者前就能用），但**若請求帶
+`X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`**，handler 會向 Falcon 解析權限並決定：
+
+| 情況 | 回應 |
+|---|---|
+| 未帶 header | 全域資料感知問候（舊行為） |
+| 權限解鎖 `[insight.grants].fetcher` 的**每一個**工具 | 全域資料感知問候，`scope: "full"` |
+| 權限只解鎖部分工具、無工具（如僅 `engproj`）、header 格式錯誤、Falcon 無法驗證 | 中性問候 `請選擇事業單位，或直接輸入想了解的營運問題。`，`scope: "neutral"`，仍是 `200` |
+
+判定為 `authz::greeting_scope_allows`。保守設計：預生成的問候可能同時引用營收、會員與站點數字，
+只要有一類工具不在使用者權限內就整句換掉，避免使用者在歡迎詞先看到自己提問會被拒絕的數字。
 
 ## 行為註記
 - 從 `state.greetings`（`Mutex<Vec<String>>`）隨機 `choose`。
@@ -36,8 +55,13 @@ pipeline**（`fetcher → analyst`），把結果存進 `AppState::greetings`；
 ```bash
 curl -s http://localhost:8080/greeting \
   -H "Authorization: Bearer $GLOBAL_TOKEN"
-# → {"greeting":"..."}
+# → {"greeting":"...","scope":"full"}
 # 尚未就緒 → 503 Service Unavailable
+
+curl -s http://localhost:8080/greeting \
+  -H "Authorization: Bearer $GLOBAL_TOKEN" \
+  -H "X-Falcon-Authorization: Bearer $FALCON_ACCESS_TOKEN"
+# 權限不足的角色 → {"greeting":"請選擇事業單位，或直接輸入想了解的營運問題。","scope":"neutral"}
 ```
 
 ## 相關
