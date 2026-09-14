@@ -1,6 +1,6 @@
 # datacenter-agent 現況測試與 Coverage
 
-**QA 版本**：v1.4.0（對應 crate 0.4.0，2026-08-20 同步）
+**QA 版本**：v1.5.0（對應 crate 0.5.0，2026-09-09 fresh run；inventory 章節 §3–§9 仍以 0.4.0 為基準，0.5.0 新增的 identity / authz / rate_limit / report 測試尚未逐條收錄）
 **對應 Target PRD**：[`../prd.md`](../prd.md) v1.4.0
 **對應 Spec**：[`../spec/spec.md`](../spec/spec.md) v1.4.0
 **狀態**：Current test inventory；不是未實作測試的完成聲明  
@@ -8,18 +8,22 @@
 
 > 本頁區分「test fn 存在」、「test 被一般 CI 執行」與「test 真正證明某個 production contract」。未覆蓋項目明確列為 gap，不以讀碼或 middleware 名稱冒充測試。
 
-## 1. 2026-08-20 可重現快照
+## 1. 2026-09-09 可重現快照（crate 0.5.0，HEAD `9fa2653`，branch `fix/report-blank-charts`）
 
 | Command | Result |
 |---|---|
 | `cargo fmt --all -- --check` | exit 0 |
+| `cargo check --all-targets` | exit 0 |
 | `cargo clippy --all-targets --all-features -- -D warnings` | exit 0 |
-| `cargo test` | **220 passed、0 failed、6 ignored** |
+| `cargo test --no-fail-fast` | **351 passed、0 failed、7 ignored**（lib 316、`bin/eval` 4、`tests/**` 31：deployment_contract 1、eval_cli 1、route_contract 2、runtime_contract 4、runtime_store_sqlite 23） |
 | `cargo run --bin eval -- --pipeline-only` | reported passed=3、failed=0；exit 0 |
-| `cargo run --bin eval -- --response --replay config/runtime/evals/replay-smoke.json` | reported passed=2、failed=0；exit 0 |
+| `cargo run --bin eval -- --response --replay config/runtime/evals/replay-smoke.json` | reported passed=2、failed=0、refusals=1；exit 0 |
+| `cargo test -- --ignored --test-threads=1`（live，需 `./env` 的 OpenRouter key 與 MCP URL） | 7 個 ignored 項目：**5 passed、2 failed**。通過：`agent_pipeline_fetch_analyse_chart_finalize_against_the_datacenter`（17.2s）、`fetcher_fetches_real_data_from_the_datacenter`（6.1s）、`live_generates_markdown_via_mcp`（20.0s）、`reproduce_missing_report_data`（196.7s）、`terminal_stage_streams_its_answer_from_the_datacenter`（6.1s）。失敗：`ss_chat_pipeline_answers_the_manager_question_set` — 本機 `DATACENTER_MCP_URL` 指向 EV 充電 MCP，未 advertise `ss_sunshine_hours`，屬環境不符，需指向星星電力 MCP 才能驗；`src/config.rs` 第 27 行 doctest — 範例在非 `Result` 函式中使用 `?`，本次已修正（隱藏 `fn main() -> anyhow::Result<()>`） |
 | synthetic failing replay | `tests/eval_cli.rs` 驗證 reported failed=1 時 process exit nonzero（隨 `cargo test` 執行） |
 
-六個 ignored 項目：5 個外部 LLM/MCP live test 與 1 個 doc test。一般 `cargo test` 不執行 live test。docker build 證據停在 v1.3.x（0.3.x image），未隨本次重驗。
+七個 ignored 項目：6 個外部 LLM/MCP live test 與 1 個 doc test。一般 `cargo test` 不執行 live test。docker build 證據停在 v1.3.x（0.3.x image），未隨本次重驗。
+
+上一次快照（2026-08-20，crate 0.4.0）：fmt / clippy exit 0、`cargo test` 220 passed / 0 failed / 6 ignored、pipeline-only eval 3/0、replay 2/0。0.4.0 → 0.5.0 新增 131 個 test fn，主要來自 `server/identity.rs`、`server/authz.rs`、`server/rate_limit.rs`、`server/falcon.rs`、`server/openai.rs`、`agent/report.rs`、`runtime/store/**` 與 `tests/runtime_store_sqlite.rs`。
 
 ## 2. 測試層級定義
 
