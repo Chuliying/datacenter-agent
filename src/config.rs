@@ -1195,7 +1195,10 @@ request_timeout_ms = 5000
             );
         }
         assert_eq!(authz.intent_tools["unknown"].len(), 0);
-        assert_eq!(authz.intent_tools["site-build"].len(), 0);
+        assert_eq!(
+            authz.intent_tools["site-build"],
+            vec!["business_metrics".to_string()]
+        );
         assert_eq!(
             authz.intent_tools["report"].len(),
             6,

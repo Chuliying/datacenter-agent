@@ -337,12 +337,18 @@ mod tests {
         assert!(!finance_only.contains(&"charging".to_string()));
         assert!(!finance_only.contains(&"member".to_string()));
 
-        // engproj maps to no tools: only the tool-free `site-build` intent survives.
+        // engproj maps to no tools, and `site-build` now requires `business_metrics`: a page-only
+        // role has no capability at all (the greeting no longer advertises a topic it will refuse).
         let page_only = greeting_capabilities(&config, Some(&permissions(ENGPROJ)), &adv);
-        assert_eq!(page_only, vec!["site-build".to_string()]);
+        assert!(page_only.is_empty(), "{page_only:?}");
 
         let none = greeting_capabilities(&config, Some(&HashSet::new()), &adv);
-        assert_eq!(none, vec!["site-build".to_string()]);
+        assert!(none.is_empty(), "{none:?}");
+
+        // opperf unlocks `business_metrics`, so it carries both `charging` and `site-build`.
+        let opperf_only = greeting_capabilities(&config, Some(&permissions(OPPERF)), &adv);
+        assert!(opperf_only.contains(&"charging".to_string()));
+        assert!(opperf_only.contains(&"site-build".to_string()));
 
         let ss = greeting_capabilities(
             &config,

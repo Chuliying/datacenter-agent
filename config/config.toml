@@ -262,8 +262,13 @@ unknown = []
 revenue = ["bill_revenue", "station_revenue_ranking"]
 charging = ["bill_charge", "business_metrics"]
 member = ["member_analysis", "bill_member_analysis"]
-# No engineering-project endpoint yet, so this intent always refuses (FU-003).
-site-build = []
+# Site-build: `business_metrics` carries the network-scale series (total / running stations,
+# total piles, new stations and piles per period), which is exactly what a 站點建置 question
+# asks for. Until 2026-09-14 this row was empty (FU-003: "no engineering-project endpoint
+# yet"), so every 站點建置 question — even from an admin — hit `authz.insufficient` while the
+# greeting still advertised the topic. CONFIRM? domain owner: keep on `business_metrics`
+# (opperf permission) or add an engineering-project tool when one exists.
+site-build = ["business_metrics"]
 # A full report spans every topic. Its gate is the one exception to the strict rule:
 # a non-empty intersection is enough, and the report degrades to the permitted topics
 # rather than refusing outright.

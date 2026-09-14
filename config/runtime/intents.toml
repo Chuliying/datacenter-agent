@@ -22,11 +22,11 @@ keywords = ["未知", "其他"]
 
 [[intents]]
 id = "revenue"
-keywords = ["營收", "收入", "賺多少", "revenue"]
+keywords = ["營收", "收入", "賺多少", "客單價", "帳單", "單價", "折扣", "折扣率", "revenue"]
 
 [[intents]]
 id = "charging"
-keywords = ["充電", "度數", "電量", "charging"]
+keywords = ["充電", "度數", "電量", "充電次數", "充電時數", "使用率", "charging"]
 
 [[intents]]
 id = "site-build"
@@ -37,7 +37,7 @@ keywords = ["建置", "站點", "場站", "site"]
 # like `營收成長` stays on `revenue` instead of colliding here.
 [[intents]]
 id = "member"
-keywords = ["會員", "會員數", "會員成長", "註冊", "留存", "活躍會員", "membership", "member"]
+keywords = ["會員", "會員數", "會員成長", "註冊", "留存", "活躍會員", "用戶", "充電用戶", "新用戶", "membership", "member"]
 
 # Full HTML report — a routing intent, orthogonal to the topic above. When the
 # user asks for a "報告" the `/agent/stream` front door runs the `/report`

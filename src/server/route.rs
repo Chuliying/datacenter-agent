@@ -782,11 +782,12 @@ mod tests {
         let page_only = greeting_for(&[ENGPROJ], true).await;
         assert_eq!(page_only["greeting"], NEUTRAL_GREETING);
         assert_eq!(page_only["scope"], "neutral");
-        // engproj unlocks no data tools: only the tool-free `site-build` intent is advertised.
+        // engproj unlocks no data tools, and `site-build` now requires `business_metrics`, so a
+        // page-only role is offered no topic at all (nothing the runtime would then refuse).
         assert_eq!(
             page_only["capabilities"],
-            serde_json::json!(["site-build"]),
-            "a page-only role must not be offered revenue / charging / member topics"
+            serde_json::json!([]),
+            "a page-only role must not be offered any topic it cannot use"
         );
         assert!(
             !page_only["greeting"]
