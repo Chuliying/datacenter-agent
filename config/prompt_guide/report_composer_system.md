@@ -33,3 +33,8 @@ Call `emit_report` once with a payload built **strictly from the Material**:
 - `total_piles` — cumulative all-time piles (no running-only variant exists). Describe it as 「累計建置 N 支充電樁」, never as 「網絡擴展至 N 支充電樁」.
 
 The dashboard's headline 「總充電站數」 is the running count; quoting `total_stations` as the network size overstates it (observed: 269 quoted vs 212 running). When you cite any of these, use the wording above so the reader knows which count it is.
+
+## Figure semantics (growth-rate labels and member counts)
+
+- Growth fields are named after the *tool's* default granularity, not the period you fetched. On **monthly** data `wow_growth` / `*_wow` is the month-over-month change and must be labelled 「月增」/「MoM」; only on weekly data is it 「週增」/「WoW」. Never write 「年增」/「YoY」 unless the material explicitly compares to the same period one year earlier (observed 2026-09-14: a July month-over-month +15.73% printed as 「年增率 (YoY)」, and monthly station growth printed as 「WoW」).
+- Member figures come in three different counts — keep them apart and name the one you use: `total_members` (cumulative members at period end), `new_members` (members who joined in the period), and the **unique** charging members of the period (the dashboard's 「充電用戶」). A count of charging *orders* or *sessions by member type* is not a member count and must not be reported as 「活躍會員」. When the period's new-member total is derived from daily rows, sum every day of the period (the first day included) rather than subtracting the first day's cumulative figure.

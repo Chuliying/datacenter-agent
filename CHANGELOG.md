@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Intent lexicon: 客單價 / 折扣率 / 用戶 questions no longer fall off-scope.** `intents.toml` only knew
+  `營收 / 收入 / 賺多少` for revenue, so 「8 月的平均客單價與折扣率是多少？」 scored zero keywords and
+  hit the rule-layer refusal (observed 2026-09-14: 4 of 30 acceptance questions refused this way).
+  `revenue` gains 客單價 / 帳單 / 單價 / 折扣 / 折扣率, `charging` gains 充電次數 / 充電時數 / 使用率,
+  `member` gains 用戶 / 充電用戶 / 新用戶.
+- **`site-build` intent now requires `business_metrics` instead of nothing.** With an empty
+  required-tool row the authz gate (`boot ∩ permission ∩ intent`) was always empty, so every
+  站點建置 question — even from an admin — answered `authz.insufficient`, while `/greeting`
+  advertised `site-build` as a capability to everyone (a tool-free intent "survived" the
+  intersection). `business_metrics` carries the station / pile build-out series, so the intent
+  now works for any role holding the opperf permission, and a page-only role is offered no topic
+  it would then be refused. Marked CONFIRM? in `config.toml` for the domain owner.
+- **Prompts: growth-rate labels and member counts.** `analyst` / `report_composer` /
+  `greeting_analyst` gain a second figure-semantics section: `wow_growth` on monthly data is MoM
+  (never 「WoW」 / 「YoY」), and the three member counts (cumulative, new, unique charging members)
+  must not be conflated — a July report had printed 27,436 member-type orders as 活躍會員 while the
+  August report used the 9,568 unique count.
+
+### Fixed
+
 - **streaming LLM: an empty, finish-less stream is now a stage failure, not a blank answer.**
   `StreamingOpenAiLlm::chat` returned `LlmResponse::Message("")` when the provider closed the
   stream with no content, no tool call and no `finish_reason` (how an upstream failure looks when
