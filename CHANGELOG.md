@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-09-14
+## [0.6.1] - 2026-09-15
 
 ### Fixed
 
@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (never 「WoW」 / 「YoY」), and the three member counts (cumulative, new, unique charging members)
   must not be conflated — a July report had printed 27,436 member-type orders as 活躍會員 while the
   August report used the 9,568 unique count.
+
+## [0.6.0] - 2026-09-14
 
 ### Fixed
 
