@@ -14,7 +14,7 @@ use tracing::error;
 use super::actor::ActorKey;
 use super::codes;
 use super::error::ErrorBody;
-use super::falcon::{Permissions, PermissionsFailure};
+use super::falcon::{HostSelectionError, Permissions, PermissionsFailure};
 use super::openai::{error_type_for_status, OpenAiErrorBody};
 use super::AppState;
 use crate::runtime::audit::{
@@ -24,11 +24,21 @@ use crate::runtime::audit::{
 /// Header carrying the Falcon access token delegated by the caller.
 pub const FALCON_AUTHORIZATION_HEADER: &str = "x-falcon-authorization";
 
+/// Optional request header naming the Falcon that issued the forwarded token, as that Falcon's
+/// base URL (the BFF sends its own `API_BASE_URL`). One runtime serves several Falcon
+/// environments; the value must normalize to an entry of the boot-time allowlist
+/// (`[identity].allowed_base_urls` / `FALCON_API_ALLOWED_BASE_URLS`), otherwise the request is
+/// refused with `401 identity.falcon_host_unknown` before the token goes anywhere. Absent, the
+/// default host is used, so a consumer that predates this header keeps working.
+pub const FALCON_API_BASE_URL_HEADER: &str = "x-falcon-api-base-url";
+
 /// Request-scoped, verified Falcon identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityContext {
     /// Opaque, peppered actor identifier used for rate limits, memory, and audit.
     pub actor_key: ActorKey,
+    /// Normalized base URL of the Falcon that verified this request's token.
+    pub falcon_host: String,
     /// The effective Falcon permissions for this request.
     pub permissions: Permissions,
 }
@@ -49,7 +59,7 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         .and_then(parse_bearer)
         .map(str::to_owned)
     else {
-        audit_identity_refused(&state, req.uri().path().to_string(), "header_missing").await;
+        audit_identity_refused(&state, req.uri().path().to_string(), "header_missing", None).await;
         return identity_error(
             &req,
             StatusCode::UNAUTHORIZED,
@@ -58,10 +68,33 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         );
     };
 
-    let permissions = match state.permissions_provider.permissions(&token).await {
+    // Which Falcon issued the token. Resolved BEFORE the upstream call so an unknown host never
+    // sees the token.
+    let requested_host = requested_falcon_host(req.headers());
+    let (falcon_host, provider) = match state.falcon_hosts.select(requested_host) {
+        Ok((host, provider)) => (host.to_string(), provider.clone()),
+        Err(err) => {
+            audit_host_selection_refused(&state, req.uri().path().to_string(), &err).await;
+            return identity_error(
+                &req,
+                StatusCode::UNAUTHORIZED,
+                codes::IDENTITY_HOST_UNKNOWN,
+                "X-Falcon-Api-Base-Url names a Falcon host this runtime is not configured to verify against",
+            );
+        }
+    };
+    let host = Some(falcon_host.as_str());
+
+    let permissions = match provider.permissions(&token).await {
         Ok(permissions) => permissions,
         Err(PermissionsFailure::UnauthorizedRefreshable) => {
-            audit_identity_refused(&state, req.uri().path().to_string(), "token_refreshable").await;
+            audit_identity_refused(
+                &state,
+                req.uri().path().to_string(),
+                "token_refreshable",
+                host,
+            )
+            .await;
             return identity_error(
                 &req,
                 StatusCode::UNAUTHORIZED,
@@ -70,7 +103,8 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
             );
         }
         Err(PermissionsFailure::UnauthorizedTerminal) => {
-            audit_identity_refused(&state, req.uri().path().to_string(), "token_terminal").await;
+            audit_identity_refused(&state, req.uri().path().to_string(), "token_terminal", host)
+                .await;
             return identity_error(
                 &req,
                 StatusCode::UNAUTHORIZED,
@@ -82,7 +116,13 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
             // Terminal for the caller, canary for us: the endpoint verifies the token's
             // platform claim, and this design forwards browser-issued tokens on the strength
             // of one ops confirmation. This code showing up means that allowlist changed.
-            audit_identity_alarm(&state, req.uri().path().to_string(), "invalid_platform").await;
+            audit_identity_alarm(
+                &state,
+                req.uri().path().to_string(),
+                "invalid_platform",
+                host,
+            )
+            .await;
             return identity_error(
                 &req,
                 StatusCode::UNAUTHORIZED,
@@ -93,7 +133,13 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         Err(PermissionsFailure::UpstreamConflict) => {
             // We only ever send a Bearer header, so a conflicting-credentials report is a
             // runtime request-construction bug — 500, alarmed, and never negative-cached.
-            audit_identity_alarm(&state, req.uri().path().to_string(), "upstream_conflict").await;
+            audit_identity_alarm(
+                &state,
+                req.uri().path().to_string(),
+                "upstream_conflict",
+                host,
+            )
+            .await;
             return identity_error(
                 &req,
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -102,8 +148,13 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
             );
         }
         Err(PermissionsFailure::Unavailable) => {
-            audit_identity_refused(&state, req.uri().path().to_string(), "upstream_unavailable")
-                .await;
+            audit_identity_refused(
+                &state,
+                req.uri().path().to_string(),
+                "upstream_unavailable",
+                host,
+            )
+            .await;
             return identity_error(
                 &req,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -113,32 +164,86 @@ pub async fn enforce(State(state): State<AppState>, mut req: Request, next: Next
         }
     };
 
-    let actor_key = match ActorKey::derive(permissions.user_id, &state.actor_key_pepper) {
-        Ok(actor_key) => actor_key,
-        Err(err) => {
-            // This is a boot-time invariant in production. Keep the request fail-closed if a
-            // hand-built state violates it in a test or an embedding application.
-            error!(error = %err, "identity: actor key derivation failed");
-            audit_identity_alarm(
-                &state,
-                req.uri().path().to_string(),
-                "actor_key_derivation_failed",
-            )
-            .await;
-            return identity_error(
-                &req,
-                StatusCode::SERVICE_UNAVAILABLE,
-                codes::IDENTITY_UPSTREAM_UNAVAILABLE,
-                "identity service is unavailable",
-            );
-        }
-    };
+    let actor_key =
+        match ActorKey::derive(permissions.user_id, &falcon_host, &state.actor_key_pepper) {
+            Ok(actor_key) => actor_key,
+            Err(err) => {
+                // This is a boot-time invariant in production. Keep the request fail-closed if a
+                // hand-built state violates it in a test or an embedding application.
+                error!(error = %err, "identity: actor key derivation failed");
+                audit_identity_alarm(
+                    &state,
+                    req.uri().path().to_string(),
+                    "actor_key_derivation_failed",
+                    host,
+                )
+                .await;
+                return identity_error(
+                    &req,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    codes::IDENTITY_UPSTREAM_UNAVAILABLE,
+                    "identity service is unavailable",
+                );
+            }
+        };
 
     req.extensions_mut().insert(IdentityContext {
         actor_key,
+        falcon_host,
         permissions,
     });
     next.run(req).await
+}
+
+/// The requested Falcon host from `X-Falcon-Api-Base-Url`, as the allowlist lookup wants it.
+///
+/// `None` when the header is absent (→ default host). `Some("")` — which normalizes to
+/// `Malformed`, i.e. a refusal — when the value is not visible ASCII (`HeaderValue::to_str`
+/// rejects anything else, so an IDNA host must be sent as punycode) or when the header appears
+/// more than once: two values would make "which Falcon issued this token" ambiguous, and the
+/// answer to ambiguity here is refusal, not first-wins.
+pub(crate) fn requested_falcon_host(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(FALCON_API_BASE_URL_HEADER).iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return Some("");
+    }
+    Some(first.to_str().unwrap_or(""))
+}
+
+/// Audit a refused Falcon host selection. Shared by the identity middleware and `/greeting`.
+///
+/// A well-formed but unlisted host is an **alarm**: it means a consumer is deployed against a
+/// Falcon this runtime was not configured for, which someone has to fix. A malformed value is an
+/// ordinary refusal: any service-bearer holder can send garbage, and garbage must not page anyone.
+/// The rejected host is truncated before it enters the log so a caller cannot use the header as
+/// an unbounded log-injection channel; it is never the token.
+pub(crate) async fn audit_host_selection_refused(
+    state: &AppState,
+    route: String,
+    err: &HostSelectionError,
+) {
+    match err {
+        HostSelectionError::Malformed => {
+            audit_identity_refused(state, route, err.audit_kind(), None).await;
+        }
+        HostSelectionError::Unknown(host) => {
+            let shown = truncate_for_audit(host);
+            audit_identity_alarm(state, route, err.audit_kind(), Some(&shown)).await;
+        }
+    }
+}
+
+/// Upper bound on a caller-controlled string written to the audit stream.
+const AUDIT_VALUE_MAX_CHARS: usize = 256;
+
+fn truncate_for_audit(value: &str) -> String {
+    if value.chars().count() <= AUDIT_VALUE_MAX_CHARS {
+        return value.to_string();
+    }
+    let mut shown: String = value.chars().take(AUDIT_VALUE_MAX_CHARS).collect();
+    shown.push('…');
+    shown
 }
 
 /// Parse exactly the `Bearer <token>` transport documented by Falcon.
@@ -172,15 +277,31 @@ fn identity_error(req: &Request, status: StatusCode, code: &str, message: &str) 
     }
 }
 
-async fn audit_identity_refused(state: &AppState, route: String, kind: &str) {
-    audit_identity_event(state, route, kind, false).await;
+async fn audit_identity_refused(
+    state: &AppState,
+    route: String,
+    kind: &str,
+    falcon_host: Option<&str>,
+) {
+    audit_identity_event(state, route, kind, falcon_host, false).await;
 }
 
-async fn audit_identity_alarm(state: &AppState, route: String, kind: &str) {
-    audit_identity_event(state, route, kind, true).await;
+async fn audit_identity_alarm(
+    state: &AppState,
+    route: String,
+    kind: &str,
+    falcon_host: Option<&str>,
+) {
+    audit_identity_event(state, route, kind, falcon_host, true).await;
 }
 
-async fn audit_identity_event(state: &AppState, route: String, kind: &str, alarm: bool) {
+async fn audit_identity_event(
+    state: &AppState,
+    route: String,
+    kind: &str,
+    falcon_host: Option<&str>,
+    alarm: bool,
+) {
     let sink: std::sync::Arc<dyn AuditSink> = state
         .runtime
         .as_ref()
@@ -194,13 +315,16 @@ async fn audit_identity_event(state: &AppState, route: String, kind: &str, alarm
         actor_key: None,
         actor: None,
     };
+    let falcon_host = falcon_host.map(str::to_string);
     let event = if alarm {
         AuditEvent::IdentityAlarm {
             kind: kind.to_string(),
+            falcon_host,
         }
     } else {
         AuditEvent::IdentityRefused {
             kind: kind.to_string(),
+            falcon_host,
         }
     };
     if let Err(err) = writer.write(&ctx, event).await {
@@ -240,6 +364,7 @@ mod tests {
     ) -> Json<serde_json::Value> {
         Json(json!({
             "actor_key": identity.actor_key.as_str(),
+            "falcon_host": identity.falcon_host,
             "user_id": identity.permissions.user_id,
             "permissions": identity.permissions.codes,
         }))
@@ -419,12 +544,170 @@ mod tests {
         let actor = body["actor_key"]
             .as_str()
             .expect("actor key should be text");
-        assert!(actor.starts_with("v1:"));
+        assert!(actor.starts_with("v2:"));
         assert!(!actor.contains("123"), "actor key must not expose user id");
         assert!(
             !actor.contains("delegated-token"),
             "token must not enter actor key"
         );
+        assert_eq!(body["falcon_host"], crate::test_support::TEST_FALCON_HOST);
+    }
+
+    #[tokio::test]
+    async fn identity_routes_the_token_to_the_named_host_only_and_keys_the_actor_per_host() {
+        let default_provider =
+            crate::test_support::ScriptedPermissionsProvider::documented(123, &[]);
+        let dev_provider = crate::test_support::ScriptedPermissionsProvider::documented(123, &[]);
+        let hosts = crate::server::falcon::FalconHosts::single(
+            crate::test_support::TEST_FALCON_HOST,
+            default_provider.clone(),
+        )
+        .with_host("https://dev.falcon.test", dev_provider.clone());
+        let (state, _mcp) = crate::test_support::app_state_with_hosts(hosts).await;
+        let app = Router::new()
+            .route("/prompt", post(identity_echo))
+            .layer(middleware::from_fn_with_state(state.clone(), enforce))
+            .with_state(state);
+
+        let on_default = app
+            .clone()
+            .oneshot(request("/prompt", Some("Bearer delegated-token")))
+            .await
+            .expect("request should complete");
+        assert_eq!(on_default.status(), StatusCode::OK);
+        let default_body = response_json(on_default).await;
+        assert_eq!((default_provider.calls(), dev_provider.calls()), (1, 0));
+
+        let on_dev = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prompt")
+                    .header(FALCON_AUTHORIZATION_HEADER, "Bearer delegated-token")
+                    .header(FALCON_API_BASE_URL_HEADER, "https://dev.falcon.test/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(on_dev.status(), StatusCode::OK);
+        let dev_body = response_json(on_dev).await;
+        assert_eq!(
+            (default_provider.calls(), dev_provider.calls()),
+            (1, 1),
+            "the token must reach only the named host's provider"
+        );
+        assert_eq!(dev_body["falcon_host"], "https://dev.falcon.test");
+        assert_ne!(
+            default_body["actor_key"], dev_body["actor_key"],
+            "the same user_id on two Falcons must be two actors"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_refuses_a_duplicated_host_header_even_when_both_values_are_listed() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(123, &[]);
+        let app = identity_app(provider.clone()).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prompt")
+                    .header(FALCON_AUTHORIZATION_HEADER, "Bearer delegated-token")
+                    .header(
+                        FALCON_API_BASE_URL_HEADER,
+                        crate::test_support::TEST_FALCON_HOST,
+                    )
+                    .header(
+                        FALCON_API_BASE_URL_HEADER,
+                        crate::test_support::TEST_FALCON_HOST,
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], codes::IDENTITY_HOST_UNKNOWN);
+        assert_eq!(provider.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_refuses_an_unlisted_falcon_host_before_calling_any_provider() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(123, &[]);
+        let app = identity_app(provider.clone()).await;
+
+        for bad in ["https://evil.example", "not a url", ""] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/prompt")
+                        .header("content-type", "application/json")
+                        .header(FALCON_AUTHORIZATION_HEADER, "Bearer delegated-token")
+                        .header(FALCON_API_BASE_URL_HEADER, bad)
+                        .body(Body::empty())
+                        .expect("request should build"),
+                )
+                .await
+                .expect("identity request should complete");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{bad:?}");
+            let body = response_json(response).await;
+            assert_eq!(body["code"], codes::IDENTITY_HOST_UNKNOWN, "{bad:?}");
+        }
+        assert_eq!(
+            provider.calls(),
+            0,
+            "an unlisted host must never see the user's token"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_accepts_the_allowlisted_host_in_any_spelling_and_v1_paths_use_openai_envelope(
+    ) {
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(7, &[]);
+        let app = identity_app(provider.clone()).await;
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prompt")
+                    .header(FALCON_AUTHORIZATION_HEADER, "Bearer delegated-token")
+                    .header(FALCON_API_BASE_URL_HEADER, "HTTPS://Falcon.test/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = response_json(ok).await;
+        assert_eq!(body["falcon_host"], crate::test_support::TEST_FALCON_HOST);
+        assert_eq!(provider.calls(), 1);
+
+        let denied = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/prompt")
+                    .header(FALCON_AUTHORIZATION_HEADER, "Bearer delegated-token")
+                    .header(FALCON_API_BASE_URL_HEADER, "https://other.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let body = response_json(denied).await;
+        assert_eq!(body["error"]["code"], codes::IDENTITY_HOST_UNKNOWN);
+        assert_eq!(
+            body["error"]["type"],
+            crate::server::openai::ERR_INVALID_REQUEST
+        );
+        assert_eq!(provider.calls(), 1, "the unlisted host must not add a call");
     }
 
     #[tokio::test]

@@ -57,9 +57,21 @@ any LLM or MCP call — so a caller only ever reaches the data their Falcon perm
 missing header is `401 identity.header_missing`; probes are unaffected, and `/greeting` treats the
 header as optional (present → permission-scoped greeting, absent → the global one).
 
+**Which Falcon?** One runtime serves every Falcon environment (the dev / stage / prod front-ends
+all call the same agent), but a token only verifies against the Falcon that issued it. The BFF
+therefore also sends `X-Falcon-Api-Base-Url: <its own API_BASE_URL>` on those routes and on
+`/greeting`. The value must normalize to an entry of the boot-time allowlist —
+`[identity].allowed_base_urls` in `config/config.toml` (shipped with dev / stage / prod), or
+`FALCON_API_ALLOWED_BASE_URLS` as a comma-separated override — otherwise the request is refused
+with `401 identity.falcon_host_unknown` **before** the token is sent anywhere (`/greeting` falls
+back to the neutral greeting). Without the header the default host is used, so older consumers
+keep working. One permissions client and cache is built per host, and the `actor_key` is derived
+per host (`v2:` scheme), so the same `user_id` on two Falcons never shares memory or a rate-limit
+bucket.
+
 This means the service bearer alone is no longer enough to reach a pipeline. Boot also now requires
-`ACTOR_KEY_PEPPER` (≥32 bytes) and a Falcon host from `FALCON_API_BASE_URL` or `[identity].base_url`
-— there is no default host on purpose. For local testing, `scripts/dev-falcon-stub.md` stands up a
+`ACTOR_KEY_PEPPER` (≥32 bytes) and a default Falcon host from `FALCON_API_BASE_URL` or
+`[identity].base_url` — there is no default host on purpose. For local testing, `scripts/dev-falcon-stub.md` stands up a
 loopback permissions endpoint.
 
 The target authentication/CORS/probe policy is tracked, with build status, in the

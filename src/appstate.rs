@@ -37,7 +37,7 @@ use crate::runtime::input::pipeline::InputPipeline;
 use crate::runtime::llm_normalizer::LlmInputNormalizer;
 use crate::runtime::memory::store::SessionMemoryStore;
 use crate::runtime::registry::BuiltinRegistry;
-use crate::server::falcon::{FalconPermissionsClient, PermissionsProvider};
+use crate::server::falcon::{normalize_base_url, FalconHosts};
 
 /// Helper to parse optional env vars with a fallback.
 fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -82,20 +82,68 @@ pub(crate) fn require_rate_limit_for_identity(
 /// config, else boot fails. There is no checked-in default host (finding #1) — a forgotten
 /// override must stop the service, never silently point production tokens at the wrong Falcon.
 fn resolve_identity_config(config: &IdentityConfig) -> Result<ResolvedIdentityConfig> {
-    let env = match std::env::var("FALCON_API_BASE_URL") {
-        Ok(value) => Some(value),
-        Err(VarError::NotUnicode(_)) => {
-            anyhow::bail!("env_error: FALCON_API_BASE_URL is not valid UTF-8")
-        }
-        Err(VarError::NotPresent) => None,
-    };
+    let env = read_env_utf8("FALCON_API_BASE_URL")?;
+    let env_allowed = read_env_utf8("FALCON_API_ALLOWED_BASE_URLS")?;
     let base_url = resolve_identity_base_url(env.as_deref(), config.base_url.as_deref())?;
+    let (base_url, allowed_base_urls) =
+        resolve_identity_hosts(&base_url, env_allowed.as_deref(), &config.allowed_base_urls)?;
     Ok(ResolvedIdentityConfig {
         base_url,
+        allowed_base_urls,
         positive_ttl_ms: config.positive_ttl_ms,
         negative_ttl_ms: config.negative_ttl_ms,
         request_timeout_ms: config.request_timeout_ms,
     })
+}
+
+fn read_env_utf8(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(VarError::NotUnicode(_)) => anyhow::bail!("env_error: {name} is not valid UTF-8"),
+        Err(VarError::NotPresent) => Ok(None),
+    }
+}
+
+/// Pure seam for the per-request Falcon host allowlist: normalize the default host, then the
+/// list — `FALCON_API_ALLOWED_BASE_URLS` (comma-separated) replaces `[identity].allowed_base_urls`
+/// when set, and a set-but-blank env value is a deliberate mistake (error). The default host is
+/// always allowed and comes first; duplicates after normalization collapse. Every entry must be
+/// a well-formed base URL, so a typo stops the boot instead of silently shrinking the allowlist.
+fn resolve_identity_hosts(
+    default_base_url: &str,
+    env_allowed: Option<&str>,
+    config_allowed: &[String],
+) -> Result<(String, Vec<String>)> {
+    let default = normalize_base_url(default_base_url).context(
+        "config_error: Falcon base URL (FALCON_API_BASE_URL / [identity].base_url) is not a valid base URL",
+    )?;
+    let raw: Vec<String> = match env_allowed {
+        Some(value) => {
+            let entries: Vec<String> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            if entries.is_empty() {
+                anyhow::bail!(
+                    "env_error: FALCON_API_ALLOWED_BASE_URLS is set but names no host (blank or only separators)"
+                );
+            }
+            entries
+        }
+        None => config_allowed.to_vec(),
+    };
+    let mut allowed = vec![default.clone()];
+    for entry in raw {
+        let normalized = normalize_base_url(&entry).with_context(|| {
+            format!("config_error: allowed Falcon base URL {entry:?} is not a valid base URL")
+        })?;
+        if !allowed.contains(&normalized) {
+            allowed.push(normalized);
+        }
+    }
+    Ok((default, allowed))
 }
 
 /// Pure resolution seam for the Falcon base URL, split out so the precedence can be unit-tested
@@ -283,9 +331,11 @@ pub struct AppState {
     pub auth_token: Arc<String>,
     /// HMAC pepper used to derive opaque actor keys from Falcon user ids.
     pub actor_key_pepper: Arc<Vec<u8>>,
-    /// Falcon permissions provider. The concrete HTTP client owns the bounded positive/negative
-    /// cache; tests replace it with an in-process provider without changing the router seam.
-    pub permissions_provider: Arc<dyn PermissionsProvider>,
+    /// Falcon hosts this runtime may verify end-user tokens against, one permissions provider
+    /// (and one bounded positive/negative cache) per host. The identity middleware picks the
+    /// host from `X-Falcon-Api-Base-Url`, defaulting to the resolved `base_url`; tests replace
+    /// the providers with in-process ones without changing the router seam.
+    pub falcon_hosts: Arc<FalconHosts>,
     /// Pre-generated greeting strings populated by background tasks at boot.
     ///
     /// `GET /greeting` picks one at random.
@@ -355,9 +405,14 @@ impl AppState {
             .as_ref()
             .context("config_error: [identity] section is required")?;
         let identity_config = resolve_identity_config(identity_config)?;
-        let permissions_provider: Arc<dyn PermissionsProvider> = Arc::new(
-            FalconPermissionsClient::from_config(&identity_config)
-                .context("build Falcon permissions provider")?,
+        let falcon_hosts = Arc::new(
+            FalconHosts::from_config(&identity_config)
+                .context("build Falcon permissions providers")?,
+        );
+        tracing::info!(
+            default_host = %falcon_hosts.default_host(),
+            allowed_hosts = ?identity_config.allowed_base_urls,
+            "identity: Falcon host allowlist"
         );
         let http = Client::builder()
             .timeout(Duration::from_secs(2))
@@ -446,7 +501,7 @@ impl AppState {
             http,
             auth_token: Arc::new(auth_token),
             actor_key_pepper,
-            permissions_provider,
+            falcon_hosts,
             greetings: Arc::new(Mutex::new(Vec::new())),
             runtime,
             insight_grants: app_config.insight_grants.clone(),
@@ -656,6 +711,68 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn resolve_identity_hosts_normalizes_and_always_includes_the_default_first() {
+        let config_list = vec![
+            "https://dev.hdre-eomc.com/".to_string(),
+            "HTTPS://Stage.hdre-eomc.com".to_string(),
+            "https://hdre-eomc.com".to_string(), // duplicate of the default
+        ];
+        let (default, allowed) =
+            resolve_identity_hosts("https://HDRE-eomc.com/", None, &config_list)
+                .expect("config list should resolve");
+        assert_eq!(default, "https://hdre-eomc.com");
+        assert_eq!(
+            allowed,
+            [
+                "https://hdre-eomc.com",
+                "https://dev.hdre-eomc.com",
+                "https://stage.hdre-eomc.com",
+            ]
+        );
+
+        // Env list replaces the config list entirely.
+        let (_, allowed) = resolve_identity_hosts(
+            "http://127.0.0.1:8787",
+            Some(" https://dev.hdre-eomc.com , ,https://qa.example/ "),
+            &config_list,
+        )
+        .expect("env list should resolve");
+        assert_eq!(
+            allowed,
+            [
+                "http://127.0.0.1:8787",
+                "https://dev.hdre-eomc.com",
+                "https://qa.example",
+            ]
+        );
+
+        // No list at all: the default alone is the allowlist (pre-header consumers keep working).
+        let (_, allowed) =
+            resolve_identity_hosts("https://hdre-eomc.com", None, &[]).expect("default only");
+        assert_eq!(allowed, ["https://hdre-eomc.com"]);
+
+        // A set-but-blank env list (blank, or only separators) and a malformed entry all stop
+        // the boot — an env override that names no host must not silently shrink the allowlist.
+        for blank in ["  ", ",", " , , "] {
+            assert!(
+                resolve_identity_hosts("https://hdre-eomc.com", Some(blank), &[])
+                    .expect_err("env list naming no host must fail")
+                    .to_string()
+                    .contains("FALCON_API_ALLOWED_BASE_URLS"),
+                "{blank:?}"
+            );
+        }
+        let err = resolve_identity_hosts(
+            "https://hdre-eomc.com",
+            None,
+            &["dev.hdre-eomc.com".to_string()],
+        )
+        .expect_err("a schemeless entry must fail");
+        assert!(err.to_string().contains("dev.hdre-eomc.com"), "{err}");
+        assert!(resolve_identity_hosts("not a url", None, &[]).is_err());
+    }
 
     #[test]
     fn resolve_identity_base_url_prefers_env_then_config_then_fails() {

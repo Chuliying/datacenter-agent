@@ -1167,8 +1167,13 @@ mod tests {
 
     fn identity(user_id: i64, permission_codes: &[&str]) -> IdentityContext {
         IdentityContext {
-            actor_key: ActorKey::derive(user_id, b"0123456789abcdef0123456789abcdef")
-                .expect("test actor key should derive"),
+            actor_key: ActorKey::derive(
+                user_id,
+                crate::test_support::TEST_FALCON_HOST,
+                b"0123456789abcdef0123456789abcdef",
+            )
+            .expect("test actor key should derive"),
+            falcon_host: crate::test_support::TEST_FALCON_HOST.to_string(),
             permissions: Permissions {
                 user_id,
                 codes: permission_codes

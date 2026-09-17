@@ -54,8 +54,11 @@ use crate::runtime::config::RuntimeConfig;
 use crate::runtime::input::pipeline::InputPipeline;
 use crate::runtime::registry::BuiltinRegistry;
 use crate::server::falcon::{
-    Permissions, PermissionsFailure, PermissionsProvider, PermissionsResult,
+    FalconHosts, Permissions, PermissionsFailure, PermissionsProvider, PermissionsResult,
 };
+
+/// The single (default) Falcon host every test `AppState` is configured with.
+pub(crate) const TEST_FALCON_HOST: &str = "https://falcon.test";
 
 /// The stub MCP server. It can advertise a caller-supplied tool set and return deterministic text
 /// for each call, while still using the production rmcp client path over an in-memory transport.
@@ -346,10 +349,15 @@ pub(crate) async fn app_state() -> (AppState, StubMcpSession) {
     app_state_with_provider(Arc::new(UnusedPermissionsProvider)).await
 }
 
-/// A full app state with an injectable permissions provider.
+/// A full app state with an injectable permissions provider on the single test host.
 pub(crate) async fn app_state_with_provider(
     provider: Arc<dyn PermissionsProvider>,
 ) -> (AppState, StubMcpSession) {
+    app_state_with_hosts(FalconHosts::single(TEST_FALCON_HOST, provider)).await
+}
+
+/// A full app state with an injectable Falcon host table (several hosts, several providers).
+pub(crate) async fn app_state_with_hosts(hosts: FalconHosts) -> (AppState, StubMcpSession) {
     let session = stub_mcp().await;
     let config = AppConfig::load("config/config.toml").expect("shipped config should load");
 
@@ -362,7 +370,7 @@ pub(crate) async fn app_state_with_provider(
         http: Client::new(),
         auth_token: Arc::new(TEST_TOKEN.to_string()),
         actor_key_pepper: Arc::new(b"test-actor-key-pepper-0123456789".to_vec()),
-        permissions_provider: provider,
+        falcon_hosts: Arc::new(hosts),
         greetings: Arc::new(Mutex::new(Vec::new())),
         runtime: None,
         insight_grants: InsightGrants::default(),
@@ -457,7 +465,7 @@ pub(crate) async fn runtime_app_state_with_fixtures(
         http: Client::new(),
         auth_token: Arc::new(TEST_TOKEN.to_string()),
         actor_key_pepper: Arc::new(b"test-actor-key-pepper-0123456789".to_vec()),
-        permissions_provider: provider,
+        falcon_hosts: Arc::new(FalconHosts::single(TEST_FALCON_HOST, provider)),
         ss_chat_grants: crate::config::SsChatGrants::default(),
         greetings: Arc::new(Mutex::new(Vec::new())),
         runtime: Some(Arc::new(AppRuntime {

@@ -38,6 +38,12 @@ report pipeline，同時它的 topic intent（`revenue`）繼續驅動 answer po
 - Required headers：`Authorization: Bearer <GLOBAL_TOKEN>` 與
   `X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`。前者失敗回 418；後者由 Falcon
   permissions endpoint 驗證。
+- Optional header：`X-Falcon-Api-Base-Url: <發出該 token 的 Falcon base URL>`（BFF 送自己的
+  `API_BASE_URL`）。值正規化後必須精準命中開機白名單 `[identity].allowed_base_urls`／
+  `FALCON_API_ALLOWED_BASE_URLS`（dev / stage / prod），否則在 token 送出前回
+  `401 identity.falcon_host_unknown`。名單外的合法 URL 是告警級 `IdentityAlarm`（`host_unknown`），
+  格式錯誤、非 ASCII（IDNA 請用 punycode）或 header 重複則是一般 `IdentityRefused`
+  （`host_malformed`）。缺 header 走預設 host。
 - 成功建立 stream 後為 `text/event-stream`，keep-alive interval 15 秒。
 - prompt cap 為 runtime config `thresholds.input.max_prompt_chars`（目前 4 000），
   由 prelude 執行。這是全服務唯一的 prompt cap。

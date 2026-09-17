@@ -302,6 +302,20 @@ report = [
 # whatever host the repo carried. Set FALCON_API_BASE_URL in every environment; boot fails if
 # neither the env var nor a base_url here is present.
 # base_url = "https://falcon.example.com"   # or supply via FALCON_API_BASE_URL
+#
+# One runtime serves every Falcon environment: the dev / stage / prod front-ends all call the
+# same agent, but a user's token only verifies against the Falcon that issued it. The BFF names
+# that Falcon per request in `X-Falcon-Api-Base-Url` (its own API_BASE_URL); the value must
+# normalize to an entry below or the request is refused with `401 identity.falcon_host_unknown`
+# BEFORE the token is sent anywhere — this list is the allowlist, not a hint. The resolved default
+# host (base_url / FALCON_API_BASE_URL) is always allowed too, and a request without the header
+# uses it, so older consumers keep working. `FALCON_API_ALLOWED_BASE_URLS` (comma-separated)
+# replaces this list at boot; one permissions client + cache is built per host.
+allowed_base_urls = [
+    "https://dev.hdre-eomc.com",     # dev
+    "https://stage.hdre-eomc.com",   # stage
+    "https://hdre-eomc.com",         # production
+]
 positive_ttl_ms = 60000     # successful lookup reuse window
 negative_ttl_ms = 10000     # failed lookup replay window
 request_timeout_ms = 5000   # per-request timeout for the permissions call

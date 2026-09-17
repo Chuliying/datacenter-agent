@@ -70,6 +70,7 @@ drain 出來的。answer policy 要求 disclaimer 時，disclaimer 會被 prepen
 |---|---|---|
 | service bearer 失敗 | 401 | `invalid_request_error` / `auth.service_token_invalid` |
 | Falcon header 缺失或格式錯誤 | 401 | `invalid_request_error` / `identity.header_missing` |
+| `X-Falcon-Api-Base-Url` 不在白名單或格式錯誤 | 401 | `invalid_request_error` / `identity.falcon_host_unknown`（消費端／runtime 設定不一致；refresh 無用）|
 | Falcon permissions 401，body `error_code` 為 `auth.token_invalid` | 401 | `invalid_request_error` / `identity.token_refreshable`（可花一次 refresh 並重送一次）|
 | Falcon permissions 401，其餘／未知／無 `error_code` | 401 | `invalid_request_error` / `identity.token_terminal`（**不得** refresh）|
 | Falcon timeout／連線失敗／5xx／畸形 200 | 503 | `server_error` / `identity.upstream_unavailable` |

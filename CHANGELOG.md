@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-request Falcon environment selection (`X-Falcon-Api-Base-Url`).** One runtime now serves
+  the dev / stage / prod front-ends at once: the BFF names the Falcon that issued the forwarded
+  token by sending its own `API_BASE_URL`, and the identity layer verifies the token against that
+  host. The value is normalized and must match the boot-time allowlist exactly —
+  `[identity].allowed_base_urls` in `config/config.toml` (shipped with
+  `https://dev.hdre-eomc.com`, `https://stage.hdre-eomc.com`, `https://hdre-eomc.com`) or the
+  `FALCON_API_ALLOWED_BASE_URLS` env override — otherwise `401 identity.falcon_host_unknown` is
+  returned **before** the token goes anywhere — an `IdentityAlarm` for a well-formed but unlisted
+  host (`host_unknown`), an ordinary `IdentityRefused` for a malformed, non-ASCII or duplicated
+  header (`host_malformed`). Requests without the header keep using the default host, so consumers that
+  predate the header are unaffected. `/greeting` uses the same table and falls back to the
+  neutral greeting on an unlisted host. One `FalconPermissionsClient` (and cache) is built per
+  host; boot logs the allowlist. Audit `identity_refused` / `identity_alarm` events carry a
+  `falcon_host` field.
+
+### Changed
+
+- **`actor_key` is now host-qualified (`v2:`).** The HMAC message includes the normalized Falcon
+  base URL, so the same `user_id` on two Falcon environments derives two different keys and never
+  shares session memory or a per-actor rate-limit bucket. `v1:` keys are no longer produced; a
+  persistent memory store keyed by `v1:` keys (the shipped config uses the in-memory backend)
+  starts fresh after this upgrade.
+
 ## [0.6.1] - 2026-09-15
 
 ### Fixed

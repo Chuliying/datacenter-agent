@@ -41,6 +41,7 @@ pipeline**（`fetcher → analyst`），把結果存進 `AppState::greetings`；
 | 未帶 header | 全域資料感知問候（舊行為） |
 | 權限解鎖 `[insight.grants].fetcher` 的**每一個**工具 | 全域資料感知問候，`scope: "full"` |
 | 權限只解鎖部分工具、無工具（如僅 `engproj`）、header 格式錯誤、Falcon 無法驗證 | 中性問候 `請選擇事業單位，或直接輸入想了解的營運問題。`，`scope: "neutral"`，仍是 `200` |
+| `X-Falcon-Api-Base-Url` 指向白名單外（或格式錯誤）的 Falcon | 同上，中性問候、`scope: "neutral"`、`200`；token 不會送往任何 Falcon |
 
 判定為 `authz::greeting_scope_allows`。保守設計：預生成的問候可能同時引用營收、會員與站點數字，
 只要有一類工具不在使用者權限內就整句換掉，避免使用者在歡迎詞先看到自己提問會被拒絕的數字。

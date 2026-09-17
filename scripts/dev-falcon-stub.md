@@ -143,6 +143,11 @@ The checkout reads the identity URL from `[identity].base_url` in
 `config/config.toml`, with `FALCON_API_BASE_URL` taking precedence when set.
 The runtime always appends `/api/auth/me/permissions` to the resolved base URL.
 
+A request may name a different Falcon in `X-Falcon-Api-Base-Url`, but only one that is in the
+allowlist (`[identity].allowed_base_urls`, or `FALCON_API_ALLOWED_BASE_URLS`); the default host
+is always allowed. Requests without the header use the default host, so a stub-only setup needs
+no extra configuration — just leave the allowlist alone or point it at the stub as well.
+
 The whole service also needs its existing local prerequisites, including
 `GLOBAL_TOKEN`, `DATACENTER_MCP_URL`, and the OpenRouter settings. The outer
 global limiter is enabled in the shipped config; do not disable it when
@@ -164,7 +169,7 @@ send both bearer headers: the service `Authorization` header and
 3. Roll the service instances with the new value and verify each instance
    passes boot validation. `ACTOR_KEY_PEPPER` must be present, non-empty, and
    at least 32 bytes.
-4. Confirm logs contain neither pepper value. Actor keys keep the `v1:`
+4. Confirm logs contain neither pepper value. Actor keys keep the `v2:`
    format but change for every user after the pepper changes; never log the
    full key to prove this.
 5. After every instance has restarted and the smoke check is green, revoke

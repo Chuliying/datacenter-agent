@@ -15,12 +15,19 @@ pub struct ActorKey(String);
 
 impl ActorKey {
     /// Derive an actor key from a Falcon user id and the configured pepper.
-    pub fn derive(user_id: i64, pepper: &[u8]) -> Result<Self> {
+    /// Derive the opaque actor key for a Falcon user.
+    ///
+    /// `falcon_host` is the normalized base URL of the Falcon that verified the token. It is part
+    /// of the message because one runtime serves several Falcon environments and their `user_id`
+    /// spaces are independent: dev user 42 and prod user 42 are different people, and must not
+    /// share session memory or a per-actor rate-limit bucket. `v2` marks the host-qualified
+    /// scheme; `v1` keys (user id only) are no longer produced.
+    pub fn derive(user_id: i64, falcon_host: &str, pepper: &[u8]) -> Result<Self> {
         let pepper = validate_pepper(pepper)?;
-        let message = format!("falcon-user:{user_id}");
+        let message = format!("falcon-user:v2:{falcon_host}:{user_id}");
         let digest = hmac_sha256(&pepper, message.as_bytes());
         let encoded = base64url_without_padding(&digest);
-        Ok(Self(format!("v1:{}", &encoded[..32])))
+        Ok(Self(format!("v2:{}", &encoded[..32])))
     }
 
     /// Borrow the serialized actor key.
@@ -121,11 +128,26 @@ mod tests {
     /// S-RUNTIME-SEC-02 AC-004
     fn derives_the_pinned_actor_key_for_a_known_input() {
         let pepper = b"0123456789abcdef0123456789abcdef";
-        let key = ActorKey::derive(123, pepper).expect("known input should derive");
+        let key = ActorKey::derive(123, "https://hdre-eomc.com", pepper)
+            .expect("known input should derive");
         assert_eq!(
             key.as_str(),
-            "v1:tbuxT4ncZRJaObivzRDrhCemI-PK3GjT",
+            "v2:HIrpfigeBNqT4p2toNJ9qO6VkJKuRMXU",
             "actor key format must be stable and opaque"
+        );
+    }
+
+    #[test]
+    fn the_same_user_id_on_different_falcon_hosts_derives_different_keys() {
+        let pepper = b"0123456789abcdef0123456789abcdef";
+        let prod = ActorKey::derive(42, "https://hdre-eomc.com", pepper).expect("derive");
+        let dev = ActorKey::derive(42, "https://dev.hdre-eomc.com", pepper).expect("derive");
+        assert_ne!(prod, dev, "user id spaces are per Falcon environment");
+        assert!(prod.as_str().starts_with("v2:"));
+        assert!(!prod.as_str().contains("42"));
+        assert!(
+            !prod.as_str().contains("hdre-eomc"),
+            "host must not leak into the key"
         );
     }
 

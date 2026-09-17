@@ -610,11 +610,15 @@ mod tests {
             &actor_policy(1, 4),
             sink.clone() as Arc<dyn AuditSink>,
         ));
-        let actor_key =
-            crate::server::actor::ActorKey::derive(123, b"0123456789abcdef0123456789abcdef")
-                .expect("test actor key should derive");
+        let actor_key = crate::server::actor::ActorKey::derive(
+            123,
+            crate::test_support::TEST_FALCON_HOST,
+            b"0123456789abcdef0123456789abcdef",
+        )
+        .expect("test actor key should derive");
         let identity = IdentityContext {
             actor_key: actor_key.clone(),
+            falcon_host: crate::test_support::TEST_FALCON_HOST.to_string(),
             permissions: crate::server::falcon::Permissions {
                 user_id: 123,
                 codes: std::collections::HashSet::new(),

@@ -269,6 +269,15 @@ pub struct IdentityConfig {
     /// treatment a missing pepper gets.
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Every Falcon host a request may select through `X-Falcon-Api-Base-Url`, as base URLs.
+    ///
+    /// One runtime serves several Falcon environments (dev / stage / prod front-ends call the
+    /// same agent), and a token only verifies against the Falcon that issued it. This list is
+    /// the allowlist the header is checked against; the resolved default `base_url` is always
+    /// allowed as well. `FALCON_API_ALLOWED_BASE_URLS` (comma-separated) replaces this list at
+    /// boot. Entries are normalized at boot (scheme/host lowercased, trailing slash dropped).
+    #[serde(default)]
+    pub allowed_base_urls: Vec<String>,
     /// How long a successful permission lookup is reused, in milliseconds. Also the upper
     /// bound on how long a Falcon-side permission revocation takes to take effect.
     pub positive_ttl_ms: std::num::NonZeroU64,
@@ -283,8 +292,10 @@ pub struct IdentityConfig {
 /// else boot already failed), so nothing downstream has to handle its absence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIdentityConfig {
-    /// Resolved Falcon API base URL.
+    /// Resolved default Falcon API base URL, normalized.
     pub base_url: String,
+    /// Normalized allowlist of Falcon base URLs, `base_url` included and first, deduplicated.
+    pub allowed_base_urls: Vec<String>,
     /// See [`IdentityConfig::positive_ttl_ms`].
     pub positive_ttl_ms: std::num::NonZeroU64,
     /// See [`IdentityConfig::negative_ttl_ms`].
@@ -1084,6 +1095,43 @@ request_timeout_ms = 5000
         );
     }
 
+    #[test]
+    fn identity_allowed_base_urls_is_optional_and_parses_as_a_list() {
+        let without: Manifest = toml::from_str(
+            r#"
+version = 1
+
+[identity]
+positive_ttl_ms = 60000
+negative_ttl_ms = 10000
+request_timeout_ms = 5000
+"#,
+        )
+        .expect("identity section should parse without an allowlist");
+        assert!(without
+            .identity
+            .expect("section")
+            .allowed_base_urls
+            .is_empty());
+
+        let with: Manifest = toml::from_str(
+            r#"
+version = 1
+
+[identity]
+allowed_base_urls = ["https://dev.example", "https://prod.example/"]
+positive_ttl_ms = 60000
+negative_ttl_ms = 10000
+request_timeout_ms = 5000
+"#,
+        )
+        .expect("identity section should parse with an allowlist");
+        assert_eq!(
+            with.identity.expect("section").allowed_base_urls,
+            ["https://dev.example", "https://prod.example/"]
+        );
+    }
+
     /// T02 / spec S1: the shipped `config/config.toml` must declare `[identity]`, and its
     /// values are the ones the spec pins (60s positive TTL, 10s negative TTL, 5s timeout).
     #[test]
@@ -1095,6 +1143,16 @@ request_timeout_ms = 5000
 
         // No checked-in default (finding #1): base_url comes from FALCON_API_BASE_URL at boot.
         assert_eq!(identity.base_url, None);
+        // The per-request allowlist IS checked in: it is the auditable list of Falcon
+        // environments a consumer may name in `X-Falcon-Api-Base-Url`.
+        assert_eq!(
+            identity.allowed_base_urls,
+            [
+                "https://dev.hdre-eomc.com",
+                "https://stage.hdre-eomc.com",
+                "https://hdre-eomc.com",
+            ]
+        );
         assert_eq!(identity.positive_ttl_ms.get(), 60_000);
         assert_eq!(identity.negative_ttl_ms.get(), 10_000);
         assert_eq!(identity.request_timeout_ms.get(), 5_000);

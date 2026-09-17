@@ -35,7 +35,9 @@ use super::dto::{
 };
 use super::error::AppError;
 use super::identity::IdentityContext;
-use super::identity::{parse_bearer, FALCON_AUTHORIZATION_HEADER};
+use super::identity::{
+    audit_host_selection_refused, parse_bearer, requested_falcon_host, FALCON_AUTHORIZATION_HEADER,
+};
 use super::openai;
 use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
@@ -162,7 +164,21 @@ async fn resolve_greeting_scope(
     let Some(token) = parse_bearer(header) else {
         return (GreetingScope::Neutral, Vec::new());
     };
-    let permissions = match state.permissions_provider.permissions(token).await {
+    // Same host selection as the prompt routes: the token is only ever sent to an allowlisted
+    // Falcon, and an unknown host fails closed on *content* (neutral greeting), not availability.
+    let requested_host = requested_falcon_host(headers);
+    let provider = match state.falcon_hosts.select(requested_host) {
+        Ok((_, provider)) => provider.clone(),
+        Err(err) => {
+            warn!(
+                kind = err.audit_kind(),
+                "greeting: Falcon host refused, serving neutral greeting"
+            );
+            audit_host_selection_refused(state, "/greeting".to_string(), &err).await;
+            return (GreetingScope::Neutral, Vec::new());
+        }
+    };
+    let permissions = match provider.permissions(token).await {
         Ok(permissions) => permissions,
         Err(err) => {
             warn!(error = ?err, "greeting: identity unavailable, serving neutral greeting");
@@ -1752,6 +1768,52 @@ fn stage_phase(outcome: StageOutcome) -> StagePhase {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    /// `/greeting` uses the same Falcon host table as the prompt routes: an unlisted host means
+    /// the token goes nowhere and the greeting is neutral; the listed host (any spelling) is
+    /// resolved through that host's provider.
+    #[tokio::test]
+    async fn greeting_scope_refuses_an_unlisted_falcon_host_without_calling_falcon() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            7,
+            &["hdrenewables/elecsvc/starcharger/finance"],
+        );
+        let (state, _mcp) = crate::test_support::app_state_with_provider(provider.clone()).await;
+
+        let mut unlisted = HeaderMap::new();
+        unlisted.insert(
+            FALCON_AUTHORIZATION_HEADER,
+            "Bearer user-token".parse().unwrap(),
+        );
+        unlisted.insert(
+            "x-falcon-api-base-url",
+            "https://evil.example".parse().unwrap(),
+        );
+        let (scope, capabilities) = resolve_greeting_scope(&state, &unlisted).await;
+        assert_eq!(scope, GreetingScope::Neutral);
+        assert!(capabilities.is_empty());
+        assert_eq!(
+            provider.calls(),
+            0,
+            "an unlisted host must never see the token"
+        );
+
+        let mut listed = HeaderMap::new();
+        listed.insert(
+            FALCON_AUTHORIZATION_HEADER,
+            "Bearer user-token".parse().unwrap(),
+        );
+        listed.insert(
+            "x-falcon-api-base-url",
+            "HTTPS://Falcon.test/".parse().unwrap(),
+        );
+        let _ = resolve_greeting_scope(&state, &listed).await;
+        assert_eq!(
+            provider.calls(),
+            1,
+            "the listed host resolves through its provider"
+        );
+    }
 
     #[test]
     fn insight_frames_stream_stages_tokens_and_a_clean_terminal() {

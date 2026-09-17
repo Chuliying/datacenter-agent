@@ -11,7 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -245,11 +245,22 @@ pub struct FalconPermissionsClient {
 }
 
 impl FalconPermissionsClient {
+    /// Build the client for the resolved **default** Falcon host.
     pub fn from_config(config: &crate::config::ResolvedIdentityConfig) -> Result<Self> {
+        Self::from_config_for_host(config, &config.base_url)
+    }
+
+    /// Build a client for one specific Falcon host, sharing the `[identity]` TTL / timeout
+    /// policy. One client per host keeps the bounded cache per host too: the same token string
+    /// verified against two Falcons is two different facts.
+    pub fn from_config_for_host(
+        config: &crate::config::ResolvedIdentityConfig,
+        base_url: &str,
+    ) -> Result<Self> {
         let client = build_http_client(Duration::from_millis(config.request_timeout_ms.get()))?;
         Ok(Self::new_with_client(
             client,
-            &config.base_url,
+            base_url,
             Duration::from_millis(config.positive_ttl_ms.get()),
             Duration::from_millis(config.negative_ttl_ms.get()),
             DEFAULT_CACHE_CAPACITY,
@@ -373,8 +384,249 @@ impl PermissionsProvider for FalconPermissionsClient {
     }
 }
 
+/// Canonical form of a Falcon base URL, used both for the boot-time allowlist and for the
+/// per-request `X-Falcon-Api-Base-Url` header, so a caller can never slip past the allowlist
+/// with a spelling difference (`HTTPS://Host/` vs `https://host`).
+///
+/// Rules: must parse as an absolute `http`/`https` URL with a host; no query, fragment or
+/// userinfo; the path is trimmed of trailing slashes (a base URL is a prefix the runtime appends
+/// `/api/auth/me/permissions` to). Scheme and host come back lowercased from the URL parser; the
+/// path is case-preserved, so a path-bearing base URL must be spelled with the same case on both
+/// sides. The value must be visible ASCII (an IDNA host goes in as punycode).
+pub fn normalize_base_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Falcon base URL is empty");
+    }
+    let url = reqwest::Url::parse(trimmed).context("Falcon base URL is not an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("Falcon base URL must use http or https");
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("Falcon base URL has no host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("Falcon base URL must not carry a query or fragment");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("Falcon base URL must not carry credentials");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Why a per-request Falcon host selection was refused. Both answer `401
+/// identity.falcon_host_unknown`; they are separate so the audit trail can tell a misconfigured
+/// consumer (unknown but well-formed host) from garbage in the header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostSelectionError {
+    /// The header value is not a well-formed base URL.
+    Malformed,
+    /// A well-formed base URL that is not in the boot-time allowlist.
+    Unknown(String),
+}
+
+impl HostSelectionError {
+    /// Stable audit `kind` for the refusal.
+    pub fn audit_kind(&self) -> &'static str {
+        match self {
+            HostSelectionError::Malformed => "host_malformed",
+            HostSelectionError::Unknown(_) => "host_unknown",
+        }
+    }
+}
+
+/// The set of Falcon hosts this runtime may verify end-user tokens against, each with its own
+/// permissions provider (and therefore its own cache).
+///
+/// One runtime deployment serves several Falcon environments (dev / stage / prod front-ends all
+/// call the same agent), and a token is only meaningful to the Falcon that issued it. The BFF
+/// names the issuer per request in `X-Falcon-Api-Base-Url`; this table is the **allowlist** that
+/// header is checked against, so a consumer can only ever route a token to a Falcon the operator
+/// configured — never to an arbitrary host that would say "yes" to anything. A request without
+/// the header uses the default host, which keeps a consumer that predates the header working.
+pub struct FalconHosts {
+    default_host: String,
+    providers: HashMap<String, Arc<dyn PermissionsProvider>>,
+}
+
+impl std::fmt::Debug for FalconHosts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut hosts: Vec<&str> = self.hosts().collect();
+        hosts.sort_unstable();
+        f.debug_struct("FalconHosts")
+            .field("default_host", &self.default_host)
+            .field("hosts", &hosts)
+            .finish()
+    }
+}
+
+impl FalconHosts {
+    /// A table with exactly one host, which is also the default. The test seam.
+    pub fn single(host: impl Into<String>, provider: Arc<dyn PermissionsProvider>) -> Self {
+        let host = host.into();
+        let mut providers: HashMap<String, Arc<dyn PermissionsProvider>> = HashMap::new();
+        providers.insert(host.clone(), provider);
+        Self {
+            default_host: host,
+            providers,
+        }
+    }
+
+    /// Add another allowed host with its own provider (builder form, for tests and embedders).
+    pub fn with_host(
+        mut self,
+        host: impl Into<String>,
+        provider: Arc<dyn PermissionsProvider>,
+    ) -> Self {
+        self.providers.insert(host.into(), provider);
+        self
+    }
+
+    /// Build one HTTP permissions client per allowed host from the resolved `[identity]` config.
+    /// `config.allowed_base_urls` is already normalized and contains `config.base_url`.
+    pub fn from_config(config: &crate::config::ResolvedIdentityConfig) -> Result<Self> {
+        let mut providers: HashMap<String, Arc<dyn PermissionsProvider>> = HashMap::new();
+        for host in &config.allowed_base_urls {
+            let client = FalconPermissionsClient::from_config_for_host(config, host)
+                .with_context(|| format!("build Falcon permissions provider for {host}"))?;
+            providers.insert(host.clone(), Arc::new(client));
+        }
+        if !providers.contains_key(&config.base_url) {
+            anyhow::bail!(
+                "config_error: default Falcon base URL {} is not in allowed_base_urls",
+                config.base_url
+            );
+        }
+        Ok(Self {
+            default_host: config.base_url.clone(),
+            providers,
+        })
+    }
+
+    /// The host used when a request names none.
+    pub fn default_host(&self) -> &str {
+        &self.default_host
+    }
+
+    /// Every allowed host, default included, in no particular order.
+    pub fn hosts(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
+    }
+
+    /// Pick the provider for a request. `None` (header absent) selects the default host; a
+    /// present value must normalize to an allowed host exactly.
+    pub fn select(
+        &self,
+        requested: Option<&str>,
+    ) -> std::result::Result<(&str, &Arc<dyn PermissionsProvider>), HostSelectionError> {
+        let Some(raw) = requested else {
+            return self
+                .providers
+                .get_key_value(&self.default_host)
+                .map(|(host, provider)| (host.as_str(), provider))
+                .ok_or_else(|| HostSelectionError::Unknown(self.default_host.clone()));
+        };
+        let host = normalize_base_url(raw).map_err(|_| HostSelectionError::Malformed)?;
+        match self.providers.get_key_value(&host) {
+            Some((host, provider)) => Ok((host.as_str(), provider)),
+            None => Err(HostSelectionError::Unknown(host)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn normalize_base_url_canonicalizes_case_and_trailing_slash_and_rejects_junk() {
+        assert_eq!(
+            normalize_base_url(" HTTPS://Dev.HDRE-eomc.com/ ").expect("valid"),
+            "https://dev.hdre-eomc.com"
+        );
+        assert_eq!(
+            normalize_base_url("http://127.0.0.1:8787///").expect("valid"),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            normalize_base_url("https://stage.hdre-eomc.com/falcon/").expect("valid"),
+            "https://stage.hdre-eomc.com/falcon"
+        );
+        for junk in [
+            "",
+            "   ",
+            "dev.hdre-eomc.com",
+            "ftp://dev.hdre-eomc.com",
+            "https://dev.hdre-eomc.com/?x=1",
+            "https://dev.hdre-eomc.com/#frag",
+            "https://user:pw@dev.hdre-eomc.com",
+            "not a url",
+        ] {
+            assert!(
+                normalize_base_url(junk).is_err(),
+                "{junk:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn hosts_table_selects_default_without_header_and_allowlisted_hosts_exactly() {
+        let dev = crate::test_support::ScriptedPermissionsProvider::documented(1, &[]);
+        let prod = crate::test_support::ScriptedPermissionsProvider::documented(2, &[]);
+        let hosts = FalconHosts::single("https://hdre-eomc.com", prod.clone())
+            .with_host("https://dev.hdre-eomc.com", dev.clone());
+
+        let (host, _) = hosts.select(None).expect("default host");
+        assert_eq!(host, "https://hdre-eomc.com");
+
+        let (host, _) = hosts
+            .select(Some("HTTPS://DEV.hdre-eomc.com/"))
+            .expect("allowlisted host, any spelling");
+        assert_eq!(host, "https://dev.hdre-eomc.com");
+
+        assert_eq!(
+            hosts.select(Some("https://evil.example")).map(|(h, _)| h),
+            Err(HostSelectionError::Unknown(
+                "https://evil.example".to_string()
+            ))
+        );
+        assert_eq!(
+            hosts.select(Some("not a url")).map(|(h, _)| h),
+            Err(HostSelectionError::Malformed)
+        );
+        assert_eq!(
+            hosts.select(Some("")).map(|(h, _)| h),
+            Err(HostSelectionError::Malformed)
+        );
+        let mut listed: Vec<&str> = hosts.hosts().collect();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            ["https://dev.hdre-eomc.com", "https://hdre-eomc.com"]
+        );
+    }
+
+    #[test]
+    fn hosts_table_from_config_builds_one_provider_per_allowed_host() {
+        let config = crate::config::ResolvedIdentityConfig {
+            base_url: "https://hdre-eomc.com".to_string(),
+            allowed_base_urls: vec![
+                "https://hdre-eomc.com".to_string(),
+                "https://dev.hdre-eomc.com".to_string(),
+                "https://stage.hdre-eomc.com".to_string(),
+            ],
+            positive_ttl_ms: std::num::NonZeroU64::new(60_000).unwrap(),
+            negative_ttl_ms: std::num::NonZeroU64::new(10_000).unwrap(),
+            request_timeout_ms: std::num::NonZeroU64::new(5_000).unwrap(),
+        };
+        let hosts = FalconHosts::from_config(&config).expect("table should build");
+        assert_eq!(hosts.default_host(), "https://hdre-eomc.com");
+        assert_eq!(hosts.hosts().count(), 3);
+        assert!(hosts.select(Some("https://stage.hdre-eomc.com/")).is_ok());
+
+        let mut broken = config.clone();
+        broken.allowed_base_urls = vec!["https://dev.hdre-eomc.com".to_string()];
+        let err = FalconHosts::from_config(&broken).expect_err("default must be allowlisted");
+        assert!(err.to_string().contains("allowed_base_urls"), "{err}");
+    }
 
     /// Spawns a listener that answers the first request with a same-origin redirect, then
     /// reports whether anything followed it.

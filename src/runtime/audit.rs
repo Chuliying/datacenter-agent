@@ -126,12 +126,20 @@ pub enum AuditEvent {
     IdentityRefused {
         /// Failure kind, e.g. `header_missing`, `token_refreshable`.
         kind: String,
+        /// Normalized Falcon host the request was resolved against, once known.
+        falcon_host: Option<String>,
     },
-    /// The two identity events that must page someone: `invalid_platform` (the browser-token
-    /// allowlist canary) and `upstream_conflict` (a runtime request-construction bug).
+    /// Identity events that must page someone: `invalid_platform` (the browser-token allowlist
+    /// canary), `upstream_conflict` (a runtime request-construction bug), `host_unknown` (a
+    /// consumer deployed against a Falcon this runtime is not configured for) and
+    /// `actor_key_derivation_failed` (a broken boot invariant). Malformed input is never an alarm.
     IdentityAlarm {
         /// Stable alarm kind, without credentials or request content.
         kind: String,
+        /// Normalized Falcon host the request was resolved against, once known. For
+        /// `host_unknown` this is the *requested* (rejected) host, so operators can see which
+        /// consumer is misconfigured.
+        falcon_host: Option<String>,
     },
 }
 
@@ -388,22 +396,24 @@ impl AuditSink for TracingAuditSink {
                 omitted_topics = omitted_topics.len(),
                 "audit.permission_degraded"
             ),
-            AuditEvent::IdentityRefused { kind } => info!(
+            AuditEvent::IdentityRefused { kind, falcon_host } => info!(
                 request_id,
                 route,
                 seq,
                 session_id,
                 actor_key,
                 kind = %kind,
+                falcon_host = falcon_host.as_deref().unwrap_or("-"),
                 "audit.identity_refused"
             ),
-            AuditEvent::IdentityAlarm { kind } => tracing::error!(
+            AuditEvent::IdentityAlarm { kind, falcon_host } => tracing::error!(
                 request_id,
                 route,
                 seq,
                 session_id,
                 actor_key,
                 kind = %kind,
+                falcon_host = falcon_host.as_deref().unwrap_or("-"),
                 "audit.identity_alarm"
             ),
         }

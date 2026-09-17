@@ -79,6 +79,8 @@ SS gate 判定），EV turn 不會滲入本路由，反之亦然。
 - **使用者身份 required**：`X-Falcon-Authorization: Bearer <FALCON_ACCESS_TOKEN>`。缺失回
   `401` + `identity.header_missing`；token 失效依 `error_code` 白名單回 `identity.token_refreshable`
   （可續期一次）或 `identity.token_terminal`（不得續期）——與 `/agent/stream` 完全同一個身份層。
+- **Falcon 環境選擇（選用）**：`X-Falcon-Api-Base-Url: <發 token 的 Falcon base URL>`，須在開機白名單
+  內，否則 `401 identity.falcon_host_unknown`；缺 header 走預設 host。同 `/agent/stream`。
 - **SS 權限 gate**：本路由不做 intent 判定（SS 問題在 EV intent pack 下一律 `unknown`），授權改依
   `[authz].ss_chat_permissions`——持有任一列出的 Falcon 權限碼即解鎖完整 `[ss_chat.grants]`
   fetcher 集合；一個都沒有（含只持 `startrade-power` 父層頁）則在呼叫 LLM／MCP 之前以

@@ -14,7 +14,7 @@ greeting 背景任務。是 runtime 核心與 sub-agent 層對外的唯一接觸
 
 - `dto.rs` 的 `AgentResponse` 隨非串流端點退役一併**移除**（0.4.0 breaking）。
 - <a id="auth"></a><a id="greeting"></a>greeting 由開機背景 task 跑兩階段 pipeline（fetcher → analyst）填 `AppState::greetings`。
-- <a id="identity"></a>身份與授權的四個新模組：`falcon.rs`（permissions client 與正/負向 cache）、`identity.rs`（middleware）、`actor.rs`（pepper HMAC 假名）、`authz.rs`（三方交集判定）；`codes.rs` 是三種信封共用的穩定 `code` 常數。
+- <a id="identity"></a>身份與授權的四個新模組：`falcon.rs`（permissions client 與正/負向 cache；`FalconHosts` 依 `X-Falcon-Api-Base-Url` 在多個 Falcon host 間選 client）、`identity.rs`（middleware）、`actor.rs`（pepper HMAC 假名）、`authz.rs`（三方交集判定）；`codes.rs` 是三種信封共用的穩定 `code` 常數。
 
 ## 兩條 agent 執行路徑
 
@@ -57,6 +57,18 @@ handler 層的 `validate_prompt` 與 `USER_PROMPT_LENGTH_CAP`。
 `auth.conflicting_credentials`：這是 runtime 自己的請求建構錯誤，會告警且不進負向 cache）。
 permissions endpoint 未承諾的 upstream `error_code` 只作為 runtime 內部判定輸入，不轉送給消費端；非 `POST` 直通 method
 router，以保留既有 405。
+
+**多 Falcon 環境**（`X-Falcon-Api-Base-Url`，選用）：同一個 runtime 服務 dev / stage / prod 三個
+前端，而使用者 token 只能在發它的 Falcon 驗證。BFF 因此每次轉送 token 時另帶自己的
+`API_BASE_URL`；middleware 在呼叫 Falcon **之前**把它正規化（scheme／host 小寫、去尾斜線、拒絕
+query／fragment／userinfo）並精準比對開機白名單 `[identity].allowed_base_urls`（或
+`FALCON_API_ALLOWED_BASE_URLS`），不在名單回 `401 identity.falcon_host_unknown`：合法但名單外的
+host 發 `IdentityAlarm`（`kind = host_unknown`，帶截斷至 256 字的被拒 host）；格式錯誤、非 ASCII 或
+header 重複則是一般 `IdentityRefused`（`kind = host_malformed`）。缺 header 走預設
+host（`FALCON_API_BASE_URL`／`[identity].base_url`，永遠在白名單內）。每個 host 一個
+`FalconPermissionsClient` 與獨立 cache（`FalconHosts`）；`actor_key` 亦以 host 參與 HMAC
+（`v2:` 前綴），dev 與 prod 的同一 `user_id` 不會共用 session memory 或 per-actor bucket。
+`/greeting` 用同一張表：host 不在名單時退回中性問候。
 
 對 Falcon 的外呼固定 `redirect::Policy::none()`：reqwest 預設會跟隨轉址，而同 origin 的跳轉會保留
 `Authorization`，等於把使用者 token 送到未經審查的 URL。3xx 因此歸為 `identity.upstream_unavailable`。
