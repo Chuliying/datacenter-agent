@@ -1,6 +1,6 @@
 [package]
 name = "datacenter-agent"
-version = "0.3.0"
+version = "0.6.1"
 edition = "2021"
 
 [dependencies]
@@ -16,6 +16,10 @@ serde_json = "1"
 # JSON-Schema derivation for `SchemaTool<T>` (tool contract §3): the advertised
 # tool schema and the on-receipt validation both come from one Rust type.
 schemars = "0.8"
+# Field-path-aware deserialization errors. `serde_json`'s own error says *what* was wrong but not
+# *where* in a nested payload; wrapping the deserializer gives the model a JSON path
+# (`periods[3].kwh`) it can actually act on when a tool call is Rejected (see `agent::tools`).
+serde_path_to_error = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 
 tracing = "0.1"
@@ -67,6 +71,19 @@ futures = "0.3"
 mimalloc = { version = "0.1", default-features = false }
 constant_time_eq = "0.3"
 rand = "0.8"
+tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
+governor = "0.10.4"
+
+# Test-only. Router-level tests need a real `AppState`, whose `mcp` field wraps an rmcp
+# `Peer<RoleClient>` that only a completed MCP handshake produces. `rmcp/server` (which pulls in
+# `transport-async-rw`) plus `tokio/io-util`'s `duplex` let `test_support` stand a stub MCP server
+# up in memory, so no live server is needed. Neither reaches the shipped binary: the release build
+# still depends on rmcp as an HTTP client only.
+[dev-dependencies]
+rmcp = { version = "0.17", default-features = false, features = ["server"] }
+tempfile = "3.27.0"
+tokio = { version = "1", features = ["io-util"] }
+tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 
 # [target.'cfg(target_env = "musl")'.dependencies]
 # mimalloc = { version = "0.1", default-features = false }

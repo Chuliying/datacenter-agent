@@ -18,8 +18,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Extension, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -30,10 +30,14 @@ use rand::seq::SliceRandom;
 use futures::StreamExt;
 
 use super::dto::{
-    AgentRequest, AgentResponse, GreetingResponse, IntentResolvedData, ReadyBody, ReadyChecks,
-    StageData, StagePhase, StreamFrame, ToolArgsData, ToolCallData, UsageData,
+    AgentRequest, GreetingResponse, IntentResolvedData, ReadyBody, ReadyChecks, StageData,
+    StagePhase, StreamFrame, ToolArgsData, ToolCallData, UsageData,
 };
 use super::error::AppError;
+use super::identity::IdentityContext;
+use super::identity::{
+    audit_host_selection_refused, parse_bearer, requested_falcon_host, FALCON_AUTHORIZATION_HEADER,
+};
 use super::openai;
 use super::AppState;
 use crate::agent::clock::{Clock, SystemClock};
@@ -41,17 +45,23 @@ use crate::agent::config::PipelineId;
 use crate::agent::engine::Orchestrator;
 use crate::agent::events::{AgentEvent, ChannelSink, EventSink, StageOutcome};
 use crate::agent::payload::{AgentError, AgentPayload, Exchange, InitialPrompt};
-use crate::agent::pipeline::{agent_pipeline_id, report_pipeline_id};
-use crate::agent::wiring::{build_insight_pipeline, build_report_pipeline};
+use crate::agent::pipeline::{
+    agent_pipeline_id, report_pipeline_id, ss_chat_pipeline_id, ss_report_pipeline_id,
+};
+use crate::agent::wiring::{
+    build_insight_pipeline, build_report_pipeline, build_ss_chat_pipeline, build_ss_report_pipeline,
+};
 use crate::runtime::audit::{hash_identifier, AuditCtx, AuditEvent, AuditWriter};
+use crate::runtime::guardrails::answer_policy::{AlwaysAnswerPolicy, AnswerPolicy};
 use crate::runtime::schema::{AgentTurnFrame, AgentTurnInput, NormalizedInput};
 use crate::runtime::turn::{
     append_memory_turn_if_enabled, plan_stream_turn, AgentPort, AgentTurnDeps, StreamPlan,
     TurnEvent,
 };
-
-/// Upper bound on the user prompt, in UTF-8 characters.
-pub const USER_PROMPT_LENGTH_CAP: usize = 2_000;
+use crate::server::authz::{
+    authorize_pipeline, authorize_ss_chat, greeting_capabilities, greeting_scope_allows,
+    AuthorizationDecision,
+};
 
 /// SSE keep-alive interval.
 ///
@@ -102,299 +112,131 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 
 // ──── /greeting ───
 
-#[instrument(skip(state))]
-pub async fn greeting(State(state): State<AppState>) -> Result<Json<GreetingResponse>, AppError> {
+/// The permission-safe greeting served when the caller may not see the data-aware one.
+///
+/// It must not quote any figure: the whole point is that a role without (say) revenue tools
+/// should not learn the month's revenue from the welcome line it would be refused on if it asked.
+pub const NEUTRAL_GREETING: &str = "請選擇事業單位，或直接輸入想了解的營運問題。";
+
+/// Which greeting the caller may see. Decided per request in [`greeting`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GreetingScope {
+    /// The pre-generated, data-aware greeting.
+    Full,
+    /// [`NEUTRAL_GREETING`].
+    Neutral,
+}
+
+impl GreetingScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            GreetingScope::Full => "full",
+            GreetingScope::Neutral => "neutral",
+        }
+    }
+}
+
+/// `/greeting` stays outside the identity middleware (probes and the welcome line must work
+/// before a user is resolved), but when the caller *does* send `X-Falcon-Authorization` the
+/// greeting is scoped to their permissions:
+///
+/// - no header → `Full` (legacy behaviour, unauthenticated callers keep the global greeting);
+/// - header present and the permissions unlock every greeting-fetcher tool → `Full`;
+/// - header present but malformed, unverifiable, or narrower than the greeting grant → `Neutral`
+///   (fail closed on *content*, never on availability — the response is still `200`).
+///
+/// Returns the scope plus the capability list that goes out with every greeting response.
+async fn resolve_greeting_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> (GreetingScope, Vec<String>) {
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    let Some(header) = headers.get(FALCON_AUTHORIZATION_HEADER) else {
+        return (
+            GreetingScope::Full,
+            greeting_capabilities(&state.authz, None, &advertised),
+        );
+    };
+    let Some(token) = parse_bearer(header) else {
+        return (GreetingScope::Neutral, Vec::new());
+    };
+    // Same host selection as the prompt routes: the token is only ever sent to an allowlisted
+    // Falcon, and an unknown host fails closed on *content* (neutral greeting), not availability.
+    let requested_host = requested_falcon_host(headers);
+    let provider = match state.falcon_hosts.select(requested_host) {
+        Ok((_, provider)) => provider.clone(),
+        Err(err) => {
+            warn!(
+                kind = err.audit_kind(),
+                "greeting: Falcon host refused, serving neutral greeting"
+            );
+            audit_host_selection_refused(state, "/greeting".to_string(), &err).await;
+            return (GreetingScope::Neutral, Vec::new());
+        }
+    };
+    let permissions = match provider.permissions(token).await {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            warn!(error = ?err, "greeting: identity unavailable, serving neutral greeting");
+            return (GreetingScope::Neutral, Vec::new());
+        }
+    };
+    let capabilities = greeting_capabilities(&state.authz, Some(&permissions.codes), &advertised);
+    let scope = if greeting_scope_allows(
+        &state.authz,
+        &permissions.codes,
+        &state.insight_grants.fetcher,
+        &advertised,
+    ) {
+        GreetingScope::Full
+    } else {
+        GreetingScope::Neutral
+    };
+    (scope, capabilities)
+}
+
+#[instrument(skip(state, headers))]
+pub async fn greeting(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<GreetingResponse>, AppError> {
+    let (scope, capabilities) = resolve_greeting_scope(&state, &headers).await;
+    if scope == GreetingScope::Neutral {
+        return Ok(Json(GreetingResponse {
+            greeting: NEUTRAL_GREETING.to_string(),
+            scope: scope.as_str(),
+            capabilities,
+        }));
+    }
     let picked = {
         let v = state.greetings.lock().await;
         v.choose(&mut rand::thread_rng()).cloned()
     };
     match picked {
-        Some(greeting) => Ok(Json(GreetingResponse { greeting })),
+        Some(greeting) => Ok(Json(GreetingResponse {
+            greeting,
+            scope: scope.as_str(),
+            capabilities,
+        })),
         None => Err(AppError::ServiceUnavailable(
             "greeting not ready, retry shortly".into(),
         )),
     }
 }
 
-// ──── /insight ───
-
-/// Non-streaming analytics handler: runs the four-stage `/insight` pipeline (fetcher → analyst →
-/// charter → finalizer) and returns the finalizer's complete answer — the analyst's report with
-/// any charts embedded as `falcon-chart` fenced blocks.
-///
-/// This drives the sub-agent pipeline **directly**: it does not pass through the runtime turn
-/// (guardrails / intent / memory / audit). Routing the pipeline behind the runtime `AgentPort` is
-/// the plan's §9 step, deferred until the pipeline is proven by hand.
-pub async fn insight(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AgentResponse>, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "insight",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-        session_id = req.session_id.as_deref().unwrap_or(""),
-        option_id = req.option_id.as_deref().unwrap_or(""),
-    );
-    async move {
-        validate_prompt(&req.prompt)?;
-        let user_prompt = req.prompt.clone();
-
-        // Assemble the pipeline buffered (no sink) and thread the payload through it.
-        let resolved = state.llm.resolved();
-        let orchestrator = build_insight_pipeline(
-            state.mcp.clone(),
-            &state.tools,
-            state.instructions.as_deref(),
-            &state.prompts.fetcher_system,
-            &state.prompts.analyst_system,
-            &state.prompts.charter_system,
-            &state.insight_grants.fetcher,
-            &state.insight_grants.charter,
-            &resolved,
-            None,
-        )
-        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-        let outcome = orchestrator
-            .run(&agent_pipeline_id(), insight_initial(req))
-            .await
-            .map_err(insight_error_to_app_error)?;
-
-        Ok(Json(AgentResponse {
-            user_prompt,
-            model_response: final_answer(outcome)?,
-            intent: "unknown".into(),
-        }))
-    }
-    .instrument(span)
-    .await
-}
-
-// ──── /report ───
-
-/// HTML report handler: runs the four-stage `/report` pipeline (fetcher → analyst → composer →
-/// renderer) and returns the renderer's self-contained HTML report, wrapped in a `falcon-report`
-/// fenced block.
-///
-/// The economy over the old monolith: the `composer` emits only the small structured
-/// [`ReportData`](crate::agent::report::ReportData) via its `emit_report` sink, and the pure-logic
-/// renderer injects it into the boot-loaded template — **no LLM ever writes HTML**, so the report
-/// is faster, cheaper, and design-stable per turn.
-///
-/// Drives the pipeline directly (no runtime turn), like [`insight`].
-pub async fn report(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AgentResponse>, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "report",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-    );
-    async move {
-        validate_prompt(&req.prompt)?;
-        let user_prompt = req.prompt.clone();
-
-        // Assemble the pipeline buffered (no sink) and thread the payload through it.
-        let resolved = state.llm.resolved();
-        let orchestrator = build_report_pipeline(
-            state.mcp.clone(),
-            &state.tools,
-            state.instructions.as_deref(),
-            &state.prompts.fetcher_system,
-            &state.prompts.report_analyst_system,
-            &state.prompts.report_composer_system,
-            &state.insight_grants.fetcher,
-            &resolved,
-            state.report_template.clone(),
-            None,
-        )
-        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-        let outcome = orchestrator
-            .run(&report_pipeline_id(), insight_initial(req))
-            .await
-            .map_err(insight_error_to_app_error)?;
-
-        Ok(Json(AgentResponse {
-            user_prompt,
-            model_response: final_answer(outcome)?,
-            intent: "unknown".into(),
-        }))
-    }
-    .instrument(span)
-    .await
-}
-
-// ──── /report/stream ───
-
-/// Server-Sent Events variant of [`report`].
-///
-/// Same wire contract as [`insight_stream`] — `stage` frames (progress dots) plus a terminal
-/// `clear` + full-answer `token` + `done`. The `composer` emits a tool call rather than streamable
-/// prose, so the live signal is the per-stage progress; the finished HTML arrives on the terminal
-/// frame.
-pub async fn report_stream(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "report-stream",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-    );
-    let _enter = span.enter();
-
-    validate_prompt(&req.prompt)?;
-
-    // One shared per-turn sink drives the stream (plan §8.5, mechanism A): the streaming LLM stages
-    // emit content deltas onto it, and the orchestrator emits stage transitions.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
-    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
-
-    let resolved = state.llm.resolved();
-    let orchestrator = build_report_pipeline(
-        state.mcp.clone(),
-        &state.tools,
-        state.instructions.as_deref(),
-        &state.prompts.fetcher_system,
-        &state.prompts.report_analyst_system,
-        &state.prompts.report_composer_system,
-        &state.insight_grants.fetcher,
-        &resolved,
-        state.report_template.clone(),
-        Some(sink.clone()),
-    )
-    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-    let initial = insight_initial(req);
-    // The task owns the orchestrator + sink, so when the run finishes every sink clone drops and
-    // the channel closes — the drain loop below ends naturally on close.
-    let run = tokio::spawn(async move {
-        orchestrator
-            .run_emitting(&report_pipeline_id(), initial, &*sink)
-            .await
-    });
-
-    let sse_stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            for frame in insight_frames(event) {
-                yield Ok::<_, Infallible>(sse_event(frame));
-            }
-        }
-        // Channel closed → the run finished. A stage failure already surfaced as an `error` frame
-        // during draining; only a task panic needs a fallback terminal frame here.
-        if let Err(join) = run.await {
-            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                data: format!("report task failed: {join}"),
-            }));
-        }
-    };
-
-    Ok(Sse::new(sse_stream)
-        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-        .into_response())
-}
-
-// ──── /insight/stream ───
-
-/// Server-Sent Events variant of [`insight`].
-///
-/// Runs the same four-stage pipeline, streaming its progress live onto one shared per-turn sink
-/// (plan §8.5, mechanism A). Each frame is a single SSE `data:` line carrying a JSON envelope:
-/// - `{"event":"stage","data":{"agent":"<id>","phase":"started"}}`: the sub-agent started; on
-///   completion a matching `{"phase":"success"}` / `{"phase":"failure"}` follows (a green/red dot).
-/// - `{"event":"token","data":"<text fragment>"}`: a fragment of the current stage's output.
-/// - `{"event":"clear"}` then `{"event":"token","data":"<full answer>"}`: on completion, the
-///   streamed previews are cleared and the **complete** finalizer answer (report + charts) is
-///   re-sent, so a consumer always ends with the correct full answer.
-/// - `{"event":"done"}`: finished cleanly; close the connection.
-/// - `{"event":"error","data":"<message>"}`: terminal error; close the connection.
-///
-/// Like [`insight`], this drives the pipeline directly (no runtime turn).
-pub async fn insight_stream(
-    State(state): State<AppState>,
-    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Result<Response, AppError> {
-    let Json(req) = req?;
-
-    let span = tracing::info_span!(
-        "insight-stream",
-        prompt_len = req.prompt.chars().count(),
-        history_len = req.history.len(),
-        session_id = req.session_id.as_deref().unwrap_or(""),
-        option_id = req.option_id.as_deref().unwrap_or(""),
-    );
-    let _enter = span.enter();
-
-    validate_prompt(&req.prompt)?;
-
-    // One shared per-turn sink drives the stream: the streaming analyst LLM emits content deltas
-    // onto it, and the orchestrator emits stage transitions (both from outside `SubAgent::run`).
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
-    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
-
-    let resolved = state.llm.resolved();
-    let orchestrator = build_insight_pipeline(
-        state.mcp.clone(),
-        &state.tools,
-        state.instructions.as_deref(),
-        &state.prompts.fetcher_system,
-        &state.prompts.analyst_system,
-        &state.prompts.charter_system,
-        &state.insight_grants.fetcher,
-        &state.insight_grants.charter,
-        &resolved,
-        Some(sink.clone()),
-    )
-    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-
-    let initial = insight_initial(req);
-    // The task owns the orchestrator + sink, so when the run finishes every sink clone drops and
-    // the channel closes — the drain loop below ends naturally on close.
-    let run = tokio::spawn(async move {
-        orchestrator
-            .run_emitting(&agent_pipeline_id(), initial, &*sink)
-            .await
-    });
-
-    let sse_stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            for frame in insight_frames(event) {
-                yield Ok::<_, Infallible>(sse_event(frame));
-            }
-        }
-        // Channel closed → the run finished. A stage failure already surfaced as an `error` frame
-        // during draining (the orchestrator emits it before returning `Err`); only a task panic
-        // needs a fallback terminal frame here.
-        if let Err(join) = run.await {
-            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                data: format!("insight task failed: {join}"),
-            }));
-        }
-    };
-
-    Ok(Sse::new(sse_stream)
-        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-        .into_response())
-}
-
 // ──── /agent/stream ───
 
-/// Intent id that routes a turn to the `/report` pipeline (defined in
+/// Intent id that routes a turn to the report pipeline (defined in
 /// `config/runtime/intents.toml`).
 const REPORT_INTENT: &str = "report";
 
-/// Route to the `/report` pipeline when the user asked for a report — the `report`
+/// Route to the report pipeline when the user asked for a report — the `report`
 /// intent was *mentioned* (the resolved top intent, or present among the
-/// candidates). Otherwise the `/insight` pipeline.
+/// candidates). Otherwise the insight pipeline.
 ///
 /// Keying off "mentioned" rather than strict top-1 means a topic-plus-report
 /// prompt like `營收報告` still routes to the report while its topic intent
@@ -405,6 +247,35 @@ fn wants_report_pipeline(normalized: &NormalizedInput) -> bool {
             .candidate_intents
             .iter()
             .any(|candidate| candidate == REPORT_INTENT)
+}
+
+/// Whether `route` is one of the 星星電力 front doors.
+///
+/// Memory replay is route-family-scoped (see the `ss_route` comment at its call site), and the two
+/// SS routes are one family: a turn from `/ss-chat/stream` should be visible to `/ss-report` and
+/// vice versa, because both answer over the same investor-platform data under the same permissions.
+fn is_ss_route(route: &str) -> bool {
+    matches!(route, "/ss-chat/stream" | "/ss-report")
+}
+
+fn insufficient_permission_copy(decision: &AuthorizationDecision) -> String {
+    let missing = if decision.omitted_topics.is_empty() {
+        "此主題"
+    } else {
+        &decision.omitted_topics.join("、")
+    };
+    format!("權限不足，無法提供{missing}資料。請向管理者申請相應權限。")
+}
+
+fn permission_degradation_prefix(decision: &AuthorizationDecision) -> String {
+    if decision.omitted_topics.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "本報告因權限不足，省略以下主題：{}。",
+            decision.omitted_topics.join("、")
+        )
+    }
 }
 
 /// Map the runtime's HTTP-ish status onto the host error contract for a
@@ -435,37 +306,32 @@ impl AgentPort for UnusedAgentPort {
 
 /// Server-Sent Events analytics front door that runs the **full runtime turn**
 /// (guardrails → intent → memory → audit) and then routes to the sub-agent
-/// pipeline the resolved intent selects: the `/report` pipeline when a report was
-/// asked for (see [`wants_report_pipeline`]), else `/insight`.
+/// pipeline the resolved intent selects: the report pipeline when a report was
+/// asked for (see [`wants_report_pipeline`]), else the insight pipeline.
 ///
-/// Unlike [`insight_stream`] / [`report_stream`] — which drive one fixed pipeline
-/// directly, bypassing the runtime — this is the routed production path. It reuses
-/// the runtime's [`plan_stream_turn`] prelude verbatim (no duplicated
-/// guardrail/intent logic), then streams the chosen pipeline's rich stage frames
-/// through the same [`insight_frames`] mapping — so the stage-aware SSE contract is
-/// identical — and replicates the runtime turn's two post-stream side effects
+/// This is the only native streaming front door for the EV-charging (EOMC) tools. The retired
+/// `insight_stream` / `report_stream` handlers drove one fixed pipeline directly and bypassed the
+/// runtime; this one reuses the runtime's [`plan_stream_turn`] prelude verbatim (no
+/// duplicated guardrail/intent logic), then streams the chosen pipeline's rich stage
+/// frames through the `insight_frames` mapping — and replicates the runtime turn's
+/// two post-stream side effects
 /// (`ResponseCompleted` / `ResponseFailed` audit + session-memory append).
 ///
+/// The streaming body is shared with [`ss_chat_stream`] through [`run_chat_stream`]; this handler
+/// contributes the route's own two decisions: the runtime's configured answer policy (so
+/// off-scope prompts are refused), and intent-driven pipeline selection.
+///
 /// Requires the runtime to be enabled (`RUNTIME_ENABLED`, default on); rolled back,
-/// this returns `503` and callers should use the direct `/insight/stream` or
-/// `/report/stream` pipelines.
+/// this returns `503`. There is no alternative path: the forced-pipeline endpoints that used to
+/// serve as a rollback target were retired (they were also the only prompt entry points that
+/// bypassed the prelude), so a rolled-back runtime leaves only `/health`, `/ready` and
+/// `/greeting` available.
 pub async fn agent_stream(
     State(state): State<AppState>,
+    Extension(identity): Extension<IdentityContext>,
     req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, AppError> {
     let Json(req) = req?;
-
-    let runtime = state
-        .runtime
-        .clone()
-        .filter(|rt| rt.enabled)
-        .ok_or_else(|| {
-            AppError::ServiceUnavailable(
-                "runtime disabled (RUNTIME_ENABLED=false); use /insight/stream or /report/stream"
-                    .into(),
-            )
-        })?;
-
     let span = tracing::info_span!(
         "agent-stream",
         prompt_len = req.prompt.chars().count(),
@@ -473,220 +339,613 @@ pub async fn agent_stream(
         session_id = req.session_id.as_deref().unwrap_or(""),
         option_id = req.option_id.as_deref().unwrap_or(""),
     );
-
-    async move {
-        // ── runtime prelude: audit, guardrails, intent, answer policy, memory ──
-        // Reuses the runtime turn's synchronous prelude verbatim. The dummy port +
-        // no-op emit are never exercised by `plan_stream_turn`; this handler owns
-        // the streaming itself.
-        let request_id = uuid::Uuid::new_v4();
-        let audit_ctx = AuditCtx {
-            request_id: request_id.to_string(),
-            session_id: req.session_id.clone(),
-            route: "/agent/stream".into(),
-            actor: None,
-        };
-        let input = AgentTurnInput {
-            request_id,
-            prompt: req.prompt.clone(),
-            raw_input: req.prompt.clone(),
-            history: req.history.clone(),
-            session_id: req.session_id.clone(),
-            option_id: req.option_id.clone(),
-        };
-        let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
-
-        let plan = {
-            let unused = UnusedAgentPort;
-            let emit_noop = |_event: TurnEvent| {};
-            let deps = AgentTurnDeps {
-                runtime_config: &runtime.config,
-                input_pipeline: &runtime.input_pipeline,
-                answer_policy: runtime.answer_policy.as_ref(),
-                llm_normalizer: runtime.llm_normalizer.as_deref(),
-                sessions: runtime.sessions.as_deref(),
-                agent: &unused,
-                audit: &audit,
-                emit: &emit_noop,
-            };
-            plan_stream_turn(input, &audit_ctx, deps)
-                .await
-                .map_err(|e| AppError::ServiceUnavailable(format!("runtime prelude: {e}")))?
-        };
-
-        // ── act on the plan ──
-        let (started, prefix, agent_input, normalized) = match plan {
-            StreamPlan::Error { code, status } => {
-                // Pre-stream validation error; audit already recorded it.
-                return Err(status_to_app_error(status, code));
-            }
-            StreamPlan::Refused { copy, .. } => {
-                // Guardrail refusal: audit + memory already written. Stream the
-                // refusal copy as the whole answer, then close.
-                let sse = async_stream::stream! {
-                    yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: copy }));
-                    yield Ok::<_, Infallible>(sse_event(StreamFrame::Done));
-                };
-                return Ok(Sse::new(sse)
-                    .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-                    .into_response());
-            }
-            StreamPlan::Proceed {
-                started,
-                prefix,
-                agent_input,
-                normalized,
-            } => (started, prefix, agent_input, *normalized),
-        };
-
-        // ── build the intent-selected pipeline (streaming) ──
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
-        let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
-        let resolved = state.llm.resolved();
-
-        let (orchestrator, pipeline_id) = if wants_report_pipeline(&normalized) {
-            let orch = build_report_pipeline(
-                state.mcp.clone(),
-                &state.tools,
-                state.instructions.as_deref(),
-                &state.prompts.fetcher_system,
-                &state.prompts.report_analyst_system,
-                &state.prompts.report_composer_system,
-                &state.insight_grants.fetcher,
-                &resolved,
-                state.report_template.clone(),
-                Some(sink.clone()),
-            )
-            .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-            (orch, report_pipeline_id())
-        } else {
-            let orch = build_insight_pipeline(
-                state.mcp.clone(),
-                &state.tools,
-                state.instructions.as_deref(),
-                &state.prompts.fetcher_system,
-                &state.prompts.analyst_system,
-                &state.prompts.charter_system,
-                &state.insight_grants.fetcher,
-                &state.insight_grants.charter,
-                &resolved,
-                Some(sink.clone()),
-            )
-            .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
-            (orch, agent_pipeline_id())
-        };
-
-        // The memory-augmented prompt/history drive the pipeline; the full
-        // agent_input (raw_input preserved) is kept for the post-stream memory append.
-        let memory_input = agent_input.clone();
-        let initial = AgentPayload::Initial(InitialPrompt {
-            prompt: agent_input.prompt,
-            history: agent_input
-                .history
-                .into_iter()
-                .map(|turn| Exchange {
-                    user: turn.user_prompt,
-                    assistant: turn.model_response,
-                })
-                .collect(),
-            now: SystemClock::default().now(),
-        });
-
-        let run = tokio::spawn(async move {
-            orchestrator
-                .run_emitting(&pipeline_id, initial, &*sink)
-                .await
-        });
-
-        // State moved into the stream for the intent frame + post-stream side effects.
-        let intent = normalized.intent.clone();
-        let candidate_intents = normalized.candidate_intents.clone();
-        let sessions = runtime.sessions.clone();
-
-        let sse_stream = async_stream::stream! {
-            // `intent.resolved` first, mirroring the runtime turn's ordering.
-            yield Ok::<_, Infallible>(sse_event(StreamFrame::IntentResolved {
-                data: IntentResolvedData { intent, candidate_intents },
-            }));
-            // A disclaimer prefix, if the answer policy asked for one (transient — the
-            // pipeline's terminal `clear` supersedes it, exactly as the runtime turn does).
-            if !prefix.is_empty() {
-                yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: prefix }));
-            }
-
-            let mut response = String::new();
-            let mut failure: Option<String> = None;
-            let mut completed = false;
-
-            while let Some(event) = rx.recv().await {
-                match &event {
-                    AgentEvent::ContentDelta { text } => response.push_str(text),
-                    // The finalizer/renderer answer is the complete result; the
-                    // terminal `clear` in `insight_frames` resets the client preview.
-                    AgentEvent::Finished { assistant } => {
-                        response = assistant.clone();
-                        completed = true;
-                    }
-                    AgentEvent::Error { message } => failure = Some(message.clone()),
-                    _ => {}
-                }
-                for frame in insight_frames(event) {
-                    yield Ok::<_, Infallible>(sse_event(frame));
-                }
-            }
-
-            // Channel closed → the run finished. A stage failure already surfaced as
-            // an `error` frame during draining; only a task panic needs a fallback.
-            if let Err(join) = run.await {
-                yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
-                    data: format!("agent task failed: {join}"),
-                }));
-            }
-
-            // ── post-stream side effects (parity with the runtime turn) ──
-            let duration_ms = started.elapsed().as_millis() as u64;
-            if let Some(error_code) = failure {
-                if let Err(e) = audit
-                    .write(&audit_ctx, AuditEvent::ResponseFailed { error_code, duration_ms })
-                    .await
-                {
-                    warn!(error = %e, "agent-stream: audit ResponseFailed failed");
-                }
-            } else if completed {
-                if let Err(e) = append_memory_turn_if_enabled(
-                    &memory_input,
-                    sessions.as_deref(),
-                    &normalized,
-                    &response,
-                )
-                .await
-                {
-                    warn!(error = %e, "agent-stream: memory append failed");
-                }
-                if let Err(e) = audit
-                    .write(
-                        &audit_ctx,
-                        AuditEvent::ResponseCompleted {
-                            response_hash: hash_identifier(&response),
-                            response_chars: response.chars().count(),
-                            duration_ms,
-                            status: "completed".to_string(),
-                        },
-                    )
-                    .await
-                {
-                    warn!(error = %e, "agent-stream: audit ResponseCompleted failed");
-                }
-            }
-            // else: aborted (no Finished/Error) — mirror `stream_agent_response` (no extra audit).
-        };
-
-        Ok(Sse::new(sse_stream)
-            .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
-            .into_response())
-    }
+    run_chat_stream(
+        state,
+        identity,
+        req,
+        "/agent/stream",
+        None,
+        authorize_agent_route,
+        select_agent_pipeline,
+    )
     .instrument(span)
     .await
+}
+
+/// Server-Sent Events front door for the **星星電力 (SS) investor platform**: the same four-stage
+/// chat pipeline as [`agent_stream`]'s insight path, over the six `ss_*` tools.
+///
+/// Identical in wire contract to `/agent/stream` — same [`AgentRequest`] body, same
+/// [`StreamFrame`] SSE frames, same bearer gate, same opt-in burst limiter — and it runs the same
+/// [`plan_stream_turn`] prelude, so prompt-length validation, the injection guardrail, session
+/// memory and the audit trail all apply unchanged. Two things differ:
+///
+/// - **No intent filtering.** The runtime's intent pack (`config/runtime/intents.toml`) describes
+///   the EV-charging domain, so every SS question resolves to `unknown` and the configured
+///   [`RuleAnswerPolicy`](crate::runtime::guardrails::answer_policy::RuleAnswerPolicy) would refuse
+///   it as `off_scope` before the pipeline ever ran. This route substitutes
+///   [`AlwaysAnswerPolicy`], which keeps the prompt-injection refusal but drops the scope gate.
+///   Intent still resolves and is still emitted as `intent.resolved` / audited — it just no longer
+///   decides anything here.
+/// - **No pipeline routing.** There is one SS pipeline today; a report counterpart is a later
+///   step, so [`wants_report_pipeline`] is deliberately not consulted.
+///
+/// Requires the runtime to be enabled (`RUNTIME_ENABLED`, default on); rolled back, returns `503`.
+pub async fn ss_chat_stream(
+    State(state): State<AppState>,
+    Extension(identity): Extension<IdentityContext>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, AppError> {
+    let Json(req) = req?;
+    let span = tracing::info_span!(
+        "ss-chat-stream",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
+    );
+    run_chat_stream(
+        state,
+        identity,
+        req,
+        "/ss-chat/stream",
+        // Intent filtering off: see the doc comment above.
+        Some(&AlwaysAnswerPolicy),
+        authorize_ss_chat_route,
+        select_ss_chat_pipeline,
+    )
+    .instrument(span)
+    .await
+}
+
+/// `POST /ss-report` — the 星星電力 **HTML report** front door (SSE).
+///
+/// [`ss_chat_stream`]'s report counterpart, and the SS analogue of the report branch of
+/// [`agent_stream`]. It runs the same runtime prelude and the same identity/authorization gate as
+/// `/ss-chat/stream` — it reaches the same six `ss_*` tools and the same investor-platform data, so
+/// it must be gated by the same Falcon permissions — but always drives the four-stage
+/// `fetcher → analyst → composer → renderer` report pipeline, terminating in a
+/// ```` ```falcon-report ```` HTML block instead of markdown prose.
+///
+/// Unlike `/agent/stream`, this route does **not** choose between a chat and a report pipeline: the
+/// endpoint *is* the report. What the request's wording still decides is how hard the fetcher's
+/// grant binds — see [`select_ss_report_pipeline`].
+///
+/// The answer policy is `AlwaysAnswerPolicy` for the same reason `/ss-chat/stream` uses it: the
+/// runtime's intent pack is EV-charging-specific, so every SS prompt resolves to `unknown` and the
+/// configured policy would refuse the whole route. The SS fetcher prompt carries the domain
+/// boundary instead.
+pub async fn ss_report_stream(
+    State(state): State<AppState>,
+    Extension(identity): Extension<IdentityContext>,
+    req: Result<Json<AgentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, AppError> {
+    let Json(req) = req?;
+    let span = tracing::info_span!(
+        "ss-report-stream",
+        prompt_len = req.prompt.chars().count(),
+        history_len = req.history.len(),
+        session_id = req.session_id.as_deref().unwrap_or(""),
+        option_id = req.option_id.as_deref().unwrap_or(""),
+    );
+    run_chat_stream(
+        state,
+        identity,
+        req,
+        "/ss-report",
+        // Intent filtering off: see the doc comment above.
+        Some(&AlwaysAnswerPolicy),
+        authorize_ss_report_route,
+        select_ss_report_pipeline,
+    )
+    .instrument(span)
+    .await
+}
+
+/// How a streaming front door turns a resolved turn into a runnable pipeline.
+///
+/// Taken as a plain `fn` pointer rather than a closure so each route's choice is a named,
+/// separately-testable function ([`select_agent_pipeline`] / [`select_ss_chat_pipeline`]) instead
+/// of an anonymous body buried in the handler.
+type PipelineSelector = fn(
+    &AppState,
+    &NormalizedInput,
+    &AuthorizationDecision,
+    Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError>;
+
+/// Per-route authorization gate, run after the prelude resolves the intent and before any
+/// pipeline (and therefore any LLM or MCP call) is built. Both prompt routes carry one; a route
+/// without a gate would be an end-user-unauthenticated way into the same pipelines.
+type RouteAuthz = fn(&AppState, &IdentityContext, &NormalizedInput) -> AuthorizationDecision;
+
+/// `/agent/stream`'s gate: the boot ∩ permission ∩ intent-required three-way intersection,
+/// with the report predicate keyed off [`wants_report_pipeline`] (top **or** candidate intent).
+fn authorize_agent_route(
+    state: &AppState,
+    identity: &IdentityContext,
+    normalized: &NormalizedInput,
+) -> AuthorizationDecision {
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    authorize_pipeline(
+        &state.authz,
+        if wants_report_pipeline(normalized) {
+            &state.report_grants.fetcher
+        } else {
+            &state.insight_grants.fetcher
+        },
+        &identity.permissions.codes,
+        &normalized.intent,
+        wants_report_pipeline(normalized),
+        &advertised,
+        &state.insight_grants.charter,
+        &["emit_report".to_string()],
+    )
+}
+
+/// `/ss-chat/stream`'s gate. Intent-based gating cannot apply here — the route deliberately
+/// disables intent filtering because every SS question resolves to `unknown` under the
+/// EV-charging intent pack, and `unknown` maps to no required tools. Authorization instead keys
+/// off `[authz].ss_chat_permissions`: holding **any** of those Falcon codes unlocks the full
+/// `[ss_chat.grants]` fetcher set; holding none refuses before any LLM or MCP call, exactly like
+/// the agent route's empty-intersection refusal.
+fn authorize_ss_chat_route(
+    state: &AppState,
+    identity: &IdentityContext,
+    _normalized: &NormalizedInput,
+) -> AuthorizationDecision {
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    authorize_ss_chat(
+        &state.authz,
+        &state.ss_chat_grants.fetcher,
+        &identity.permissions.codes,
+        &advertised,
+        &state.ss_chat_grants.charter,
+    )
+}
+
+/// `/agent/stream`'s selector: the report pipeline when a report was asked for (see
+/// [`wants_report_pipeline`]), else the insight pipeline.
+fn select_agent_pipeline(
+    state: &AppState,
+    normalized: &NormalizedInput,
+    decision: &AuthorizationDecision,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError> {
+    let resolved = state.llm.resolved();
+    if wants_report_pipeline(normalized) {
+        let orch = build_report_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.report_analyst_system,
+            &state.prompts.report_composer_system,
+            &decision.effective_data_grant,
+            &resolved,
+            state.report_template.clone(),
+            Some(sink),
+        )
+        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+        Ok((orch, report_pipeline_id()))
+    } else {
+        let orch = build_insight_pipeline(
+            state.mcp.clone(),
+            &state.tools,
+            state.instructions.as_deref(),
+            &state.prompts.fetcher_system,
+            &state.prompts.analyst_system,
+            &state.prompts.charter_system,
+            &decision.effective_data_grant,
+            &state.insight_grants.charter,
+            &resolved,
+            Some(sink),
+        )
+        .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+        Ok((orch, agent_pipeline_id()))
+    }
+}
+
+/// `/ss-chat/stream`'s selector: always the SS chat pipeline.
+///
+/// `normalized` is unused on purpose — this route does no intent routing (the SS report pipeline
+/// is a later step). Keeping the shared [`PipelineSelector`] shape means adding one later is a
+/// change here, not in the streaming body.
+fn select_ss_chat_pipeline(
+    state: &AppState,
+    _normalized: &NormalizedInput,
+    decision: &AuthorizationDecision,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError> {
+    let orch = build_ss_chat_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.prompts.ss_fetcher_system,
+        &state.prompts.ss_analyst_system,
+        &state.prompts.ss_charter_system,
+        &decision.effective_data_grant,
+        &state.ss_chat_grants.charter,
+        &state.llm.resolved(),
+        Some(sink),
+    )
+    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+    Ok((orch, ss_chat_pipeline_id()))
+}
+
+/// `/ss-report`'s gate: the same SS permission check as `/ss-chat/stream`, over the SS **report**
+/// ceiling.
+///
+/// The permission codes are identical on purpose — both routes reach the same investor-platform
+/// data, so a caller who may chat about it may report on it and vice versa. Only the ceiling
+/// differs (`[ss_report.grants]` rather than `[ss_chat.grants]`), which is what lets a report draw
+/// on the whole tool set without widening what a chat turn reaches.
+fn authorize_ss_report_route(
+    state: &AppState,
+    identity: &IdentityContext,
+    _normalized: &NormalizedInput,
+) -> AuthorizationDecision {
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    authorize_ss_chat(
+        &state.authz,
+        &state.ss_report_grants.fetcher,
+        &identity.permissions.codes,
+        &advertised,
+        // No charter stage on this pipeline — the report renders charts from the emitted data, so
+        // there is no `emit_chart` grant to authorize.
+        &[],
+    )
+}
+
+/// The report keywords that make the SS fetcher sweep **every** granted tool.
+///
+/// `/ss-report` is reached for narrow asks too ("只要日照資料"), and forcing all six tools on those
+/// would waste six upstream calls and bury the answer. So the request's own wording decides, the
+/// same way `wants_report_pipeline` decides which pipeline `/agent/stream` runs: an explicit ask
+/// for a *report* gets the full sweep, anything narrower fetches what it needs.
+///
+/// Matched case-insensitively against the normalized prompt.
+const SS_REPORT_SWEEP_KEYWORDS: &[&str] = &["report", "報告", "報表", "完整", "整體", "各條業務線"];
+
+/// Whether this turn should sweep every granted `ss_*` tool.
+///
+/// See [`SS_REPORT_SWEEP_KEYWORDS`]. An empty prompt sweeps nothing.
+fn wants_full_ss_sweep(normalized: &NormalizedInput) -> bool {
+    let prompt = normalized.prompt.to_lowercase();
+    SS_REPORT_SWEEP_KEYWORDS
+        .iter()
+        .any(|keyword| prompt.contains(keyword))
+}
+
+/// `/ss-report`'s selector: always the SS report pipeline, with the fetcher's sweep decided by
+/// [`wants_full_ss_sweep`].
+fn select_ss_report_pipeline(
+    state: &AppState,
+    normalized: &NormalizedInput,
+    decision: &AuthorizationDecision,
+    sink: Arc<dyn EventSink>,
+) -> Result<(Orchestrator, PipelineId), AppError> {
+    let orch = build_ss_report_pipeline(
+        state.mcp.clone(),
+        &state.tools,
+        state.instructions.as_deref(),
+        &state.prompts.ss_fetcher_system,
+        &state.prompts.ss_report_analyst_system,
+        &state.prompts.ss_report_composer_system,
+        &decision.effective_data_grant,
+        wants_full_ss_sweep(normalized),
+        &state.llm.resolved(),
+        state.ss_report_template.clone(),
+        Some(sink),
+    )
+    .map_err(|e| AppError::BadGateway(format!("{e:#}")))?;
+    Ok((orch, ss_report_pipeline_id()))
+}
+
+/// The streaming body shared by every SSE chat front door ([`agent_stream`], [`ss_chat_stream`]).
+///
+/// Runs the runtime prelude, acts on the resulting [`StreamPlan`], drives `select_pipeline`'s
+/// orchestrator on a [`ChannelSink`], maps its events into [`StreamFrame`]s, and replicates the
+/// runtime turn's two post-stream side effects (audit + session-memory append). A route
+/// contributes exactly three things:
+///
+/// - `route` — the audit `route` label, and the prefix on this handler's own warnings;
+/// - `answer_policy` — `None` uses the runtime's configured policy; `Some` overrides it (that is
+///   how `/ss-chat/stream` turns intent filtering off without touching the shared prelude);
+/// - `select_pipeline` — which pipeline the resolved turn runs.
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_stream(
+    state: AppState,
+    identity: IdentityContext,
+    req: AgentRequest,
+    route: &'static str,
+    answer_policy: Option<&(dyn AnswerPolicy + 'static)>,
+    route_authz: RouteAuthz,
+    select_pipeline: PipelineSelector,
+) -> Result<Response, AppError> {
+    let runtime = state
+        .runtime
+        .clone()
+        .filter(|rt| rt.enabled)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable(format!(
+                "runtime disabled (RUNTIME_ENABLED=false); {route} requires the runtime"
+            ))
+        })?;
+
+    // ── runtime prelude: audit, guardrails, intent, answer policy, memory ──
+    // Reuses the runtime turn's synchronous prelude verbatim. The dummy port +
+    // no-op emit are never exercised by `plan_stream_turn`; this handler owns
+    // the streaming itself.
+    let request_id = uuid::Uuid::new_v4();
+    let audit_ctx = AuditCtx {
+        request_id: request_id.to_string(),
+        session_id: req.session_id.clone(),
+        route: route.into(),
+        actor_key: Some(identity.actor_key.as_str().to_string()),
+        actor: None,
+    };
+    let input = AgentTurnInput {
+        request_id,
+        prompt: req.prompt.clone(),
+        raw_input: req.prompt.clone(),
+        // Identity-protected requests never trust client-supplied conversation history:
+        // server-side session memory is the only context source (FR-009).
+        history: Vec::new(),
+        session_id: req.session_id.clone(),
+        option_id: req.option_id.clone(),
+        identity: Some(identity.clone()),
+    };
+    let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
+
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    let plan = {
+        let unused = UnusedAgentPort;
+        let emit_noop = |_event: TurnEvent| {};
+        let deps = AgentTurnDeps {
+            runtime_config: &runtime.config,
+            input_pipeline: &runtime.input_pipeline,
+            // The route's override, else the runtime's configured policy.
+            answer_policy: answer_policy.unwrap_or(runtime.answer_policy.as_ref()),
+            llm_normalizer: runtime.llm_normalizer.as_deref(),
+            sessions: runtime.sessions.as_deref(),
+            agent: &unused,
+            audit: &audit,
+            emit: &emit_noop,
+            authz: Some(&state.authz),
+            advertised_tools: &advertised,
+            insight_grant: &state.insight_grants.fetcher,
+            ss_grant: &state.ss_chat_grants.fetcher,
+            // Both SS front doors are one memory family. `/ss-report` must be in here: the replay
+            // filter drops any turn whose `ss_pipeline` tag disagrees with this flag, so leaving it
+            // out would make the SS report route silently single-turn while its fetcher prompt
+            // instructs the model to reuse earlier turns.
+            ss_route: is_ss_route(route),
+            report_grant: &state.report_grants.fetcher,
+        };
+        plan_stream_turn(input, &audit_ctx, deps)
+            .await
+            .map_err(|e| AppError::ServiceUnavailable(format!("runtime prelude: {e}")))?
+    };
+
+    // ── act on the plan ──
+    let (started, prefix, agent_input, normalized) = match plan {
+        StreamPlan::Error { code, status } => {
+            // Pre-stream validation error; audit already recorded it.
+            return Err(status_to_app_error(status, code));
+        }
+        StreamPlan::Refused { copy, .. } => {
+            // Guardrail refusal: audit + memory already written. Stream the
+            // refusal copy as the whole answer, then close.
+            let sse = async_stream::stream! {
+                yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: copy }));
+                yield Ok::<_, Infallible>(sse_event(StreamFrame::Done));
+            };
+            return Ok(Sse::new(sse)
+                .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+                .into_response());
+        }
+        StreamPlan::Proceed {
+            started,
+            prefix,
+            agent_input,
+            normalized,
+        } => (started, prefix, *agent_input, *normalized),
+    };
+
+    // ── authorization gate: after intent resolution, before any pipeline/LLM/MCP work ──
+    let decision = route_authz(&state, &identity, &normalized);
+    if !decision.allowed {
+        let copy = insufficient_permission_copy(&decision);
+        if let Err(err) = audit
+            .write(
+                &audit_ctx,
+                AuditEvent::ResponseFailed {
+                    error_code: crate::server::codes::AUTHZ_INSUFFICIENT.to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            )
+            .await
+        {
+            warn!(error = %err, %route, "chat stream: audit authorization refusal failed");
+        }
+        let sse = async_stream::stream! {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: copy }));
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Refusal {
+                code: crate::server::codes::AUTHZ_INSUFFICIENT.to_string(),
+            }));
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Done));
+        };
+        return Ok(Sse::new(sse)
+            .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+            .into_response());
+    }
+    let degradation_prefix = permission_degradation_prefix(&decision);
+    if !degradation_prefix.is_empty() {
+        audit
+            .write(
+                &audit_ctx,
+                AuditEvent::PermissionDegraded {
+                    omitted_topics: decision.omitted_topics.clone(),
+                },
+            )
+            .await
+            .map_err(|err| AppError::ServiceUnavailable(format!("audit authorization: {err}")))?;
+    }
+
+    // ── build the route's pipeline (streaming) ──
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
+    let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
+    let (orchestrator, pipeline_id) =
+        select_pipeline(&state, &normalized, &decision, sink.clone())?;
+    // The pipeline that actually ran, not the top intent: the memory replay filter keys its
+    // stricter report rule off this (a mixed-topic report can be stored under a topic intent).
+    let ran_report_pipeline =
+        pipeline_id == report_pipeline_id() || pipeline_id == ss_report_pipeline_id();
+    let ran_ss_pipeline =
+        pipeline_id == ss_chat_pipeline_id() || pipeline_id == ss_report_pipeline_id();
+
+    // The memory-augmented prompt/history drive the pipeline; the full
+    // agent_input (raw_input preserved) is kept for the post-stream memory append.
+    let memory_input = agent_input.clone();
+    let initial = AgentPayload::Initial(InitialPrompt {
+        prompt: agent_input.prompt,
+        history: agent_input
+            .history
+            .into_iter()
+            .map(|turn| Exchange {
+                user: turn.user_prompt,
+                assistant: turn.model_response,
+            })
+            .collect(),
+        now: SystemClock::default().now(),
+    });
+
+    let run = tokio::spawn(async move {
+        orchestrator
+            .run_emitting(&pipeline_id, initial, &*sink)
+            .await
+    });
+
+    // State moved into the stream for the intent frame + post-stream side effects.
+    let intent = normalized.intent.clone();
+    let candidate_intents = normalized.candidate_intents.clone();
+    let sessions = runtime.sessions.clone();
+
+    let sse_stream = async_stream::stream! {
+        // `intent.resolved` first, mirroring the runtime turn's ordering.
+        yield Ok::<_, Infallible>(sse_event(StreamFrame::IntentResolved {
+            data: IntentResolvedData { intent, candidate_intents },
+        }));
+        // A disclaimer prefix, if the answer policy asked for one (transient — the
+        // pipeline's terminal `clear` supersedes it, exactly as the runtime turn does).
+        if !prefix.is_empty() {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Token { data: prefix }));
+        }
+
+        let mut response = String::new();
+        let mut failure: Option<String> = None;
+        let mut completed = false;
+
+        while let Some(event) = rx.recv().await {
+            match &event {
+                AgentEvent::ContentDelta { text } => response.push_str(text),
+                // The finalizer/renderer answer is the complete result; the
+                // terminal `clear` in `insight_frames` resets the client preview.
+                AgentEvent::Finished { assistant } => {
+                    response = if degradation_prefix.is_empty() {
+                        assistant.clone()
+                    } else {
+                        with_prefix(&degradation_prefix, assistant.clone())
+                    };
+                    completed = true;
+                }
+                AgentEvent::Error { message } => failure = Some(message.clone()),
+                _ => {}
+            }
+            // The degradation notice must survive the terminal `clear`, so it rides on the
+            // final answer itself rather than on a transient token (AC-009).
+            let event = match event {
+                AgentEvent::Finished { assistant } if !degradation_prefix.is_empty() => {
+                    AgentEvent::Finished {
+                        assistant: with_prefix(&degradation_prefix, assistant),
+                    }
+                }
+                other => other,
+            };
+            for frame in insight_frames(event) {
+                yield Ok::<_, Infallible>(sse_event(frame));
+            }
+        }
+
+        // Channel closed → the run finished. A stage failure already surfaced as
+        // an `error` frame during draining; only a task panic needs a fallback.
+        if let Err(join) = run.await {
+            yield Ok::<_, Infallible>(sse_event(StreamFrame::Error {
+                data: format!("agent task failed: {join}"),
+                code: crate::server::codes::SERVER_INTERNAL.to_string(),
+            }));
+        }
+
+        // ── post-stream side effects (parity with the runtime turn) ──
+        let duration_ms = started.elapsed().as_millis() as u64;
+        if let Some(error_code) = failure {
+            if let Err(e) = audit
+                .write(&audit_ctx, AuditEvent::ResponseFailed { error_code, duration_ms })
+                .await
+            {
+                warn!(error = %e, %route, "chat stream: audit ResponseFailed failed");
+            }
+        } else if completed {
+            if let Err(e) = append_memory_turn_if_enabled(
+                &memory_input,
+                sessions.as_deref(),
+                &normalized,
+                &response,
+                ran_report_pipeline,
+                ran_ss_pipeline,
+            )
+            .await
+            {
+                warn!(error = %e, %route, "chat stream: memory append failed");
+            }
+            if let Err(e) = audit
+                .write(
+                    &audit_ctx,
+                    AuditEvent::ResponseCompleted {
+                        response_hash: hash_identifier(&response),
+                        response_chars: response.chars().count(),
+                        duration_ms,
+                        status: "completed".to_string(),
+                    },
+                )
+                .await
+            {
+                warn!(error = %e, %route, "chat stream: audit ResponseCompleted failed");
+            }
+        }
+        // else: aborted (no Finished/Error) — mirror `stream_agent_response` (no extra audit).
+    };
+
+    Ok(Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response())
 }
 
 /// Serialize a stream frame into an SSE event.
@@ -746,32 +1005,6 @@ fn with_prefix(prefix: &str, answer: String) -> String {
     }
 }
 
-/// Fold prior conversation turns into the prompt text so **both** the runtime prelude's intent
-/// classifier and the first pipeline stage's LLM see the whole conversation.
-///
-/// Two layers would otherwise drop history: the sub-agent engine (`ConfiguredAgent::run`) threads
-/// only `InitialPrompt.prompt` and ignores `InitialPrompt.history`; and the prelude's intent
-/// classifier / answer-policy look only at `AgentTurnInput.prompt`. So on `/v1/chat/completions` a
-/// multi-turn request would collapse to its final user message — and an off-scope-looking follow-up
-/// would even be refused. `chat_completions` therefore renders the earlier turns into a labeled
-/// transcript and prepends it to the current question **before** calling the prelude. An empty
-/// history returns the prompt unchanged, so a single-turn request is byte-for-byte what it was.
-///
-/// This lives at the handler layer on purpose: the engine, the shared `plan_stream_turn` prelude,
-/// `/agent/stream`, and falcon behaviour are all left untouched — only this endpoint's prompt is
-/// rewritten.
-fn fold_history_into_prompt(history: &[Exchange], prompt: &str) -> String {
-    if history.is_empty() {
-        return prompt.to_string();
-    }
-    let transcript = history
-        .iter()
-        .map(|turn| format!("User: {}\nAssistant: {}", turn.user, turn.assistant))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("以下是先前的對話紀錄:\n{transcript}\n\n目前的問題:\n{prompt}")
-}
-
 /// Resolve the pipeline task's own return value into the authoritative answer / failure.
 ///
 /// The answer and any failure come from the awaited `run_emitting` **result**, never from draining
@@ -794,11 +1027,13 @@ fn resolve_outcome(outcome: Result<AgentPayload, AgentError>) -> Result<String, 
 }
 
 /// Build the intent-selected sub-agent pipeline for the OpenAI endpoint (spec Data Flow): the
-/// `/report` pipeline when a report was asked for (see [`wants_report_pipeline`]), else `/insight`.
+/// report pipeline when a report was asked for (see [`wants_report_pipeline`]), else the insight
+/// pipeline.
 /// `sink = Some(_)` selects the streaming shape; `None` is buffered (spec D1/D2).
 fn build_openai_pipeline(
     state: &AppState,
     report: bool,
+    effective_data_grant: &[String],
     sink: Option<Arc<dyn EventSink>>,
 ) -> anyhow::Result<(Orchestrator, PipelineId)> {
     let resolved = state.llm.resolved();
@@ -810,7 +1045,7 @@ fn build_openai_pipeline(
             &state.prompts.fetcher_system,
             &state.prompts.report_analyst_system,
             &state.prompts.report_composer_system,
-            &state.insight_grants.fetcher,
+            effective_data_grant,
             &resolved,
             state.report_template.clone(),
             sink,
@@ -824,7 +1059,7 @@ fn build_openai_pipeline(
             &state.prompts.fetcher_system,
             &state.prompts.analyst_system,
             &state.prompts.charter_system,
-            &state.insight_grants.fetcher,
+            effective_data_grant,
             &state.insight_grants.charter,
             &resolved,
             sink,
@@ -854,6 +1089,7 @@ fn build_openai_pipeline(
 #[instrument(skip_all, fields(route = "/v1/chat/completions"))]
 pub async fn chat_completions(
     State(state): State<AppState>,
+    Extension(identity): Extension<IdentityContext>,
     req: Result<Json<openai::ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     // ── parse body (ERR2: malformed JSON / missing fields) ──
@@ -917,37 +1153,30 @@ pub async fn chat_completions(
         request_id: request_id.to_string(),
         session_id: agent_req.session_id.clone(),
         route: "/v1/chat/completions".into(),
+        actor_key: Some(identity.actor_key.as_str().to_string()),
         actor: None,
     };
-    // Fold prior turns into the prompt **before** the prelude so the intent classifier /
-    // answer-policy — which only see `input.prompt`, never `history` — are given the conversation
-    // context. Without this a follow-up like「那 AC 佔比呢?」is classified in isolation and refused
-    // as off_scope; folded, it is judged against the prior turns. Handler-only: `plan_stream_turn`
-    // and `/agent/stream` are untouched, and the folded prompt is also what the pipeline stage sees.
-    let folded_history: Vec<Exchange> = agent_req
-        .history
-        .iter()
-        .map(|turn| Exchange {
-            user: turn.user_prompt.clone(),
-            assistant: turn.model_response.clone(),
-        })
-        .collect();
-    let folded_prompt = fold_history_into_prompt(&folded_history, &agent_req.prompt);
     let input = AgentTurnInput {
         request_id,
-        prompt: folded_prompt.clone(),
-        raw_input: folded_prompt,
-        // History is folded into `prompt` above; the field stays empty (prelude memory is inert
-        // here anyway — `session_id` is always `None` on this endpoint).
+        // Authorization mode is single-turn: `map_request` already discarded every message
+        // except the last user message, and no client history is accepted here.
+        prompt: agent_req.prompt.clone(),
+        raw_input: agent_req.prompt.clone(),
         history: Vec::new(),
         session_id: agent_req.session_id.clone(),
         option_id: agent_req.option_id.clone(),
+        identity: Some(identity.clone()),
     };
     let audit = AuditWriter::new(runtime.audit_sink.clone(), runtime.audit_failure_policy);
 
     let plan = {
         let unused = UnusedAgentPort;
         let emit_noop = |_event: TurnEvent| {};
+        let advertised = state
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect::<Vec<_>>();
         let deps = AgentTurnDeps {
             runtime_config: &runtime.config,
             input_pipeline: &runtime.input_pipeline,
@@ -957,6 +1186,12 @@ pub async fn chat_completions(
             agent: &unused,
             audit: &audit,
             emit: &emit_noop,
+            authz: Some(&state.authz),
+            advertised_tools: &advertised,
+            insight_grant: &state.insight_grants.fetcher,
+            ss_grant: &state.ss_chat_grants.fetcher,
+            ss_route: false,
+            report_grant: &state.report_grants.fetcher,
         };
         match plan_stream_turn(input, &audit_ctx, deps).await {
             Ok(plan) => plan,
@@ -983,7 +1218,7 @@ pub async fn chat_completions(
         // Guardrail refusal (AC-5 / TC-I04): return the refusal copy as the assistant answer at
         // `200` — governance parity with /agent/stream (which streams the copy then closes).
         StreamPlan::Refused { copy, .. } => {
-            return openai_refusal(stream, copy, include_usage, &id, &model, created);
+            return openai_refusal(stream, copy, include_usage, &id, &model, created, None);
         }
         // The answer-policy disclaimer `prefix` (finding #7) is prepended to the delivered answer
         // below — OpenAI's `delta`/`message` have no retract semantics, so unlike /agent/stream
@@ -995,13 +1230,72 @@ pub async fn chat_completions(
             prefix,
             agent_input,
             normalized,
-        } => (started, prefix, agent_input, *normalized),
+        } => (started, prefix, *agent_input, *normalized),
     };
 
+    let advertised = state
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    let decision = authorize_pipeline(
+        &state.authz,
+        if wants_report_pipeline(&normalized) {
+            &state.report_grants.fetcher
+        } else {
+            &state.insight_grants.fetcher
+        },
+        &identity.permissions.codes,
+        &normalized.intent,
+        wants_report_pipeline(&normalized),
+        &advertised,
+        &state.insight_grants.charter,
+        &["emit_report".to_string()],
+    );
+    if !decision.allowed {
+        let copy = insufficient_permission_copy(&decision);
+        if let Err(err) = audit
+            .write(
+                &audit_ctx,
+                crate::runtime::audit::AuditEvent::ResponseFailed {
+                    error_code: crate::server::codes::AUTHZ_INSUFFICIENT.to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            )
+            .await
+        {
+            warn!(error = %err, "chat_completions: audit authorization refusal failed");
+        }
+        return openai_refusal(
+            stream,
+            copy,
+            include_usage,
+            &id,
+            &model,
+            created,
+            Some(crate::server::codes::AUTHZ_INSUFFICIENT),
+        );
+    }
+    let degradation_prefix = permission_degradation_prefix(&decision);
+    if !degradation_prefix.is_empty() {
+        if let Err(err) = audit
+            .write(
+                &audit_ctx,
+                crate::runtime::audit::AuditEvent::PermissionDegraded {
+                    omitted_topics: decision.omitted_topics.clone(),
+                },
+            )
+            .await
+        {
+            return openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                openai::ERR_SERVER,
+                format!("audit authorization: {err}"),
+            );
+        }
+    }
+
     // ── build + run the intent-selected pipeline ──
-    // History was already folded into the prompt before the prelude (see above), so both the intent
-    // classifier and the first pipeline stage see the full exchange. `agent_input.prompt` carries
-    // it; `InitialPrompt.history` stays empty (the engine ignores it anyway).
     let initial = AgentPayload::Initial(InitialPrompt {
         prompt: agent_input.prompt,
         history: Vec::new(),
@@ -1015,6 +1309,8 @@ pub async fn chat_completions(
             report,
             initial,
             prefix,
+            degradation_prefix,
+            &decision.effective_data_grant,
             id,
             model,
             created,
@@ -1026,7 +1322,18 @@ pub async fn chat_completions(
         .await
     } else {
         openai_buffered_response(
-            &state, report, initial, &prefix, &id, &model, created, audit, audit_ctx, started,
+            &state,
+            report,
+            initial,
+            &prefix,
+            &degradation_prefix,
+            &decision.effective_data_grant,
+            &id,
+            &model,
+            created,
+            audit,
+            audit_ctx,
+            started,
         )
         .await
     }
@@ -1045,6 +1352,7 @@ fn openai_refusal(
     id: &str,
     model: &str,
     created: i64,
+    refusal_code: Option<&str>,
 ) -> Response {
     if stream {
         let chunks = openai::build_chunks(&copy, id, model, created, include_usage);
@@ -1065,14 +1373,10 @@ fn openai_refusal(
             .into_response()
     } else {
         // A refusal costs no LLM tokens → usage is zero.
-        Json(openai::build_response(
-            &copy,
-            id,
-            model,
-            created,
-            openai::Usage::default(),
-        ))
-        .into_response()
+        let mut response =
+            openai::build_response(&copy, id, model, created, openai::Usage::default());
+        response.x_refusal_code = refusal_code.map(str::to_string);
+        Json(response).into_response()
     }
 }
 
@@ -1093,6 +1397,8 @@ async fn openai_buffered_response(
     report: bool,
     initial: AgentPayload,
     prefix: &str,
+    degradation_prefix: &str,
+    effective_data_grant: &[String],
     id: &str,
     model: &str,
     created: i64,
@@ -1103,8 +1409,12 @@ async fn openai_buffered_response(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
     let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
 
-    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
-    {
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(
+        state,
+        report,
+        effective_data_grant,
+        Some(sink.clone()),
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             // Finding #6: a pipeline-construction failure is a ResponseFailed too — audit it before
@@ -1167,7 +1477,7 @@ async fn openai_buffered_response(
     match result {
         Ok(answer) => {
             // Prepend the answer-policy disclaimer, if any (finding #7).
-            let answer = with_prefix(prefix, answer);
+            let answer = with_prefix(degradation_prefix, with_prefix(prefix, answer));
             let usage = openai::accumulate_usage(&usages);
             if let Err(e) = audit
                 .write(
@@ -1220,6 +1530,8 @@ async fn openai_stream_response(
     report: bool,
     initial: AgentPayload,
     prefix: String,
+    degradation_prefix: String,
+    effective_data_grant: &[String],
     id: String,
     model: String,
     created: i64,
@@ -1231,8 +1543,12 @@ async fn openai_stream_response(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(INSIGHT_STREAM_BUFFER);
     let sink: Arc<dyn EventSink> = Arc::new(ChannelSink(tx));
 
-    let (orchestrator, pipeline_id) = match build_openai_pipeline(state, report, Some(sink.clone()))
-    {
+    let (orchestrator, pipeline_id) = match build_openai_pipeline(
+        state,
+        report,
+        effective_data_grant,
+        Some(sink.clone()),
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             // Finding #6: audit the pipeline-construction failure before the 502, matching the
@@ -1295,7 +1611,10 @@ async fn openai_stream_response(
         match result {
             Ok(answer) => {
                 // Prepend the answer-policy disclaimer, if any (finding #7).
-                let answer = with_prefix(&prefix, answer);
+                let answer = with_prefix(
+                    &degradation_prefix,
+                    with_prefix(&prefix, answer),
+                );
                 let usage = openai::accumulate_usage(&usages);
                 tracing::info!(
                     prompt_tokens = usage.prompt_tokens,
@@ -1361,78 +1680,14 @@ async fn openai_stream_response(
         .into_response()
 }
 
-// ──── shared prelude ───
+// ──── sub-agent pipeline shared helpers ───
 
-/// Validate the current prompt contract.
-fn validate_prompt(prompt: &str) -> Result<(), AppError> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        return Err(AppError::BadRequest("prompt must not be empty".into()));
-    }
-    let char_count = prompt.chars().count();
-    if char_count > USER_PROMPT_LENGTH_CAP {
-        return Err(AppError::BadRequest(format!(
-            "prompt exceeds {USER_PROMPT_LENGTH_CAP} chars (got {char_count})"
-        )));
-    }
-
-    Ok(())
-}
-
-// ──── /insight shared helpers ───
-
-/// Bounded buffer for the `/insight/stream` event channel.
+/// Bounded buffer for the sub-agent pipeline event channel.
 ///
 /// Large enough that a normal turn's events (stage transitions plus the analyst's streamed
 /// report) are never dropped by [`ChannelSink`]'s `try_send`; a lossless channel is a later
 /// refinement (plan §8.2).
 const INSIGHT_STREAM_BUFFER: usize = 8192;
-
-/// Build the pipeline's `Initial` payload, stamping the turn's `now` once at this boundary
-/// (plan §12.1) and carrying prior turns forward as [`Exchange`]es.
-///
-/// (The pipeline does not yet thread `history` into each stage's prompt — a known limitation of
-/// this first cut; the payload carries it for when it does.)
-fn insight_initial(req: AgentRequest) -> AgentPayload {
-    let history = req
-        .history
-        .into_iter()
-        .map(|turn| Exchange {
-            user: turn.user_prompt,
-            assistant: turn.model_response,
-        })
-        .collect();
-    AgentPayload::Initial(InitialPrompt {
-        prompt: req.prompt,
-        history,
-        now: SystemClock::default().now(),
-    })
-}
-
-/// Extract the user-facing answer from the pipeline's terminal payload.
-///
-/// The `/insight` pipeline always ends in a `Final` (the finalizer); anything else is an internal
-/// wiring fault surfaced as a host error rather than a panic.
-fn final_answer(outcome: AgentPayload) -> Result<String, AppError> {
-    match outcome {
-        AgentPayload::Final(result) => Ok(result.assistant),
-        other => Err(AppError::ServiceUnavailable(format!(
-            "insight pipeline did not produce a final result (got {:?})",
-            other.kind()
-        ))),
-    }
-}
-
-/// Map a pipeline [`AgentError`] onto the external HTTP error contract.
-///
-/// A capability failure (LLM transport, MCP tool) is an upstream `502`; an internal mismatch /
-/// missing-artifact / unknown-tool is a wiring fault surfaced as `503`.
-fn insight_error_to_app_error(err: AgentError) -> AppError {
-    match err {
-        AgentError::Capability(msg) => AppError::BadGateway(msg),
-        other => AppError::ServiceUnavailable(other.to_string()),
-    }
-}
 
 /// Map one sub-agent [`AgentEvent`] onto the external SSE frames it surfaces (0 or more).
 ///
@@ -1491,7 +1746,10 @@ fn insight_frames(event: AgentEvent) -> Vec<StreamFrame> {
             StreamFrame::Token { data: assistant },
             StreamFrame::Done,
         ],
-        AgentEvent::Error { message } => vec![StreamFrame::Error { data: message }],
+        AgentEvent::Error { message } => vec![StreamFrame::Error {
+            data: message,
+            code: crate::server::codes::UPSTREAM_ERROR.to_string(),
+        }],
         // Internal framing (stage produced, tool execution, reasoning deltas) is not surfaced to
         // the browser yet.
         _ => vec![],
@@ -1509,30 +1767,52 @@ fn stage_phase(outcome: StageOutcome) -> StagePhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
-    #[test]
-    fn prompt_validation_rejects_empty_prompt() {
-        let err = validate_prompt(" \n\t").expect_err("empty prompt should be rejected");
-        match err {
-            AppError::BadRequest(msg) => assert_eq!(msg, "prompt must not be empty"),
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
+    /// `/greeting` uses the same Falcon host table as the prompt routes: an unlisted host means
+    /// the token goes nowhere and the greeting is neutral; the listed host (any spelling) is
+    /// resolved through that host's provider.
+    #[tokio::test]
+    async fn greeting_scope_refuses_an_unlisted_falcon_host_without_calling_falcon() {
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            7,
+            &["hdrenewables/elecsvc/starcharger/finance"],
+        );
+        let (state, _mcp) = crate::test_support::app_state_with_provider(provider.clone()).await;
 
-    #[test]
-    fn prompt_validation_preserves_existing_2000_char_cap() {
-        let at_cap = "x".repeat(USER_PROMPT_LENGTH_CAP);
-        assert!(validate_prompt(&at_cap).is_ok());
+        let mut unlisted = HeaderMap::new();
+        unlisted.insert(
+            FALCON_AUTHORIZATION_HEADER,
+            "Bearer user-token".parse().unwrap(),
+        );
+        unlisted.insert(
+            "x-falcon-api-base-url",
+            "https://evil.example".parse().unwrap(),
+        );
+        let (scope, capabilities) = resolve_greeting_scope(&state, &unlisted).await;
+        assert_eq!(scope, GreetingScope::Neutral);
+        assert!(capabilities.is_empty());
+        assert_eq!(
+            provider.calls(),
+            0,
+            "an unlisted host must never see the token"
+        );
 
-        let over_cap = "x".repeat(USER_PROMPT_LENGTH_CAP + 1);
-        let err = validate_prompt(&over_cap).expect_err("prompt over cap should be rejected");
-        match err {
-            AppError::BadRequest(msg) => {
-                assert!(msg.contains("prompt exceeds 2000 chars"));
-                assert!(msg.contains("got 2001"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let mut listed = HeaderMap::new();
+        listed.insert(
+            FALCON_AUTHORIZATION_HEADER,
+            "Bearer user-token".parse().unwrap(),
+        );
+        listed.insert(
+            "x-falcon-api-base-url",
+            "HTTPS://Falcon.test/".parse().unwrap(),
+        );
+        let _ = resolve_greeting_scope(&state, &listed).await;
+        assert_eq!(
+            provider.calls(),
+            1,
+            "the listed host resolves through its provider"
+        );
     }
 
     #[test]
@@ -1645,7 +1925,8 @@ mod tests {
                 message: "boom".into()
             }),
             vec![StreamFrame::Error {
-                data: "boom".into()
+                data: "boom".into(),
+                code: crate::server::codes::UPSTREAM_ERROR.into(),
             }]
         );
         // Internal framing (stage produced) surfaces nothing on the wire for now.
@@ -1732,6 +2013,164 @@ mod tests {
         assert!(wants_report_pipeline(&classify("我想要營收報告")));
         // A plain analytics ask (no report vocabulary) → insight pipeline.
         assert!(!wants_report_pipeline(&classify("分析最近三個月的營收")));
+    }
+
+    #[tokio::test]
+    /// S-RUNTIME-SEC-02 AC-009
+    async fn authorized_report_crosses_runtime_pipeline_with_terminal_degradation_notice() {
+        // T11/T17: exercise the real handler → runtime → grant-aware report pipeline → MCP
+        // boundary with only local scripted transports. Finance can read two report tools, so the
+        // report is allowed but must declare the omitted charging/member topics in its final answer.
+        let llm = crate::test_support::ScriptedChatCompletions::start();
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            123,
+            &["hdrenewables:elecsvc:starcharger:finance"],
+        );
+        let (state, mcp) = crate::test_support::runtime_app_state_with_fixtures(
+            provider,
+            llm.base_url.clone(),
+            &[
+                "bill_revenue",
+                "bill_charge",
+                "member_analysis",
+                "business_metrics",
+                "station_revenue_ranking",
+                "bill_member_analysis",
+            ],
+        )
+        .await;
+        let app = crate::server::route::build_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                    )
+                    .header("x-falcon-authorization", "Bearer delegated-local-token")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "test/model",
+                            "messages": [{"role": "user", "content": "給我一份完整的報告"}],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await)
+            .expect("OpenAI response should be JSON");
+        let answer = body["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("response should contain an assistant answer");
+        assert!(answer.contains("本報告因權限不足，省略以下主題"));
+        assert!(answer.contains("falcon-report"));
+        assert_eq!(
+            mcp.tool_calls(),
+            1,
+            "only the granted data tool may be called"
+        );
+        assert!(
+            llm.requests() >= 5,
+            "fetcher/analyst/composer calls should be scripted"
+        );
+    }
+
+    /// The SS route through the real router with its real grant: an `unknown`-intent prompt is
+    /// **answered**, only `ss_*` tools are exposed, and — the regression this test exists for —
+    /// the second turn of a session actually sees the first turn's memory.
+    ///
+    /// Every SS prompt resolves to intent `unknown` (the intent pack is EV-charging), so before
+    /// per-pipeline turn tagging the replay filter dropped every stored SS turn: the endpoint
+    /// answered, wrote memory, and then never read it back — silently single-turn, with the drop
+    /// mislabelled as a permission event. Asserting on the *LLM request body* of turn two is the
+    /// only observation point that proves the context genuinely reached the model.
+    #[tokio::test]
+    async fn ss_chat_two_turn_memory_survives_the_replay_filter() {
+        let llm = crate::test_support::ScriptedChatCompletions::start();
+        let provider = crate::test_support::ScriptedPermissionsProvider::documented(
+            9,
+            &["hdrenewables:elecsvc:startrade-power:finance"],
+        );
+        let (state, mcp) = crate::test_support::runtime_app_state_with_fixtures(
+            provider,
+            llm.base_url.clone(),
+            &[
+                "ss_sunshine_hours",
+                "ss_energy_storage",
+                "ss_power_wheeling",
+                "ss_power_pipeline",
+                "ss_btm_projects",
+                "ss_ftm_projects",
+            ],
+        )
+        .await;
+        let app = crate::server::route::build_router(state);
+
+        let request = |prompt: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/ss-chat/stream")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", crate::test_support::TEST_TOKEN),
+                )
+                .header("x-falcon-authorization", "Bearer delegated-local-token")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"prompt": prompt, "session_id": "ss-session-1"}).to_string(),
+                ))
+                .unwrap()
+        };
+
+        // Turn one: an SS question. Intent resolves to `unknown`, and the substituted
+        // AlwaysAnswerPolicy must answer it rather than refuse it as off_scope.
+        const FIRST_PROMPT: &str = "太陽光電案場的日照時數狀況";
+        let first = app.clone().oneshot(request(FIRST_PROMPT)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = body_string(first).await;
+        assert!(
+            !first_body.contains(crate::server::codes::AUTHZ_INSUFFICIENT),
+            "a startrade-power user must pass the SS gate: {first_body}"
+        );
+        assert!(
+            first_body.contains("\"event\":\"done\""),
+            "turn one should stream to completion: {first_body}"
+        );
+        let turn_one_requests = llm.requests();
+        assert!(
+            turn_one_requests > 0,
+            "the pipeline must actually run — a refusal never reaches the LLM"
+        );
+        assert!(
+            mcp.tool_calls() >= 1,
+            "the fetcher should call an ss_* tool through the stub MCP"
+        );
+
+        // Turn two, same session: the memory context injected into the fetcher's LLM request
+        // must carry turn one's summary. This is exactly what the `unknown`-intent drop broke.
+        let second = app.oneshot(request("那儲能的部分呢")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = body_string(second).await;
+        assert!(!second_body.contains(crate::server::codes::AUTHZ_INSUFFICIENT));
+
+        let bodies = llm.request_bodies();
+        let turn_two_bodies = &bodies[turn_one_requests..];
+        assert!(
+            turn_two_bodies
+                .iter()
+                .any(|body| body.contains(FIRST_PROMPT)),
+            "turn two's LLM requests must carry turn one's memory context; \
+             got {} turn-two requests without it",
+            turn_two_bodies.len()
+        );
     }
 
     // ── /v1/chat/completions helpers (findings #3/#4/#6/#7) ──
@@ -1834,70 +2273,6 @@ mod tests {
         );
     }
 
-    // ── finding #1: fold prior turns into the prompt (the engine drops InitialPrompt.history) ──
-
-    #[test]
-    fn fold_history_into_prompt_returns_prompt_unchanged_when_history_empty() {
-        // A single-turn request has no prior turns → the prompt is byte-for-byte unchanged.
-        assert_eq!(fold_history_into_prompt(&[], "目前的問題"), "目前的問題");
-    }
-
-    #[test]
-    fn fold_history_into_prompt_includes_a_single_prior_turn_before_the_question() {
-        let history = vec![Exchange {
-            user: "上個月營收多少?".into(),
-            assistant: "上個月營收是 100 萬。".into(),
-        }];
-        let folded = fold_history_into_prompt(&history, "那這個月呢?");
-        // The prior turn (both roles) must reach the prompt — the whole point of the fix.
-        assert!(
-            folded.contains("上個月營收多少?"),
-            "prior user turn missing: {folded}"
-        );
-        assert!(
-            folded.contains("上個月營收是 100 萬。"),
-            "prior assistant turn missing: {folded}"
-        );
-        assert!(
-            folded.contains("那這個月呢?"),
-            "current question missing: {folded}"
-        );
-        // The current question comes AFTER the folded history.
-        let history_pos = folded.find("上個月營收是 100 萬。").unwrap();
-        let question_pos = folded.find("那這個月呢?").unwrap();
-        assert!(
-            history_pos < question_pos,
-            "history must precede the current question: {folded}"
-        );
-    }
-
-    #[test]
-    fn fold_history_into_prompt_preserves_multi_turn_chronological_order() {
-        let history = vec![
-            Exchange {
-                user: "Q1".into(),
-                assistant: "A1".into(),
-            },
-            Exchange {
-                user: "Q2".into(),
-                assistant: "A2".into(),
-            },
-        ];
-        let folded = fold_history_into_prompt(&history, "Q3");
-        let (p1, p2, p3) = (
-            folded.find("Q1").expect("Q1 present"),
-            folded.find("Q2").expect("Q2 present"),
-            folded.find("Q3").expect("Q3 present"),
-        );
-        assert!(
-            p1 < p2 && p2 < p3,
-            "turns must appear oldest-first with the current question last: {folded}"
-        );
-        // Each prior turn is labeled by role so the model can read the transcript.
-        assert!(folded.contains("User: Q1"));
-        assert!(folded.contains("Assistant: A1"));
-    }
-
     #[test]
     fn resolve_outcome_reads_answer_and_failures_from_the_run_result() {
         use crate::agent::payload::FinalResult;
@@ -1950,7 +2325,7 @@ mod tests {
     async fn refusal_stream_appends_a_zero_usage_chunk_when_include_usage() {
         // AC-5 / finding #4: a streamed refusal honours `stream_options.include_usage` by emitting a
         // terminal usage-only chunk (zero cost — a refusal spends no LLM tokens) before `[DONE]`.
-        let resp = openai_refusal(true, "refused copy".into(), true, "id", "m", 0);
+        let resp = openai_refusal(true, "refused copy".into(), true, "id", "m", 0, None);
         let lines = sse_data_lines(&body_string(resp).await);
 
         assert_eq!(
@@ -1981,7 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn refusal_stream_omits_usage_chunk_without_include_usage() {
         // Wire unchanged when the client did not opt in: no chunk carries a `usage` field.
-        let resp = openai_refusal(true, "refused".into(), false, "id", "m", 0);
+        let resp = openai_refusal(true, "refused".into(), false, "id", "m", 0, None);
         let lines = sse_data_lines(&body_string(resp).await);
 
         assert_eq!(lines.last().unwrap(), "[DONE]");
@@ -2000,7 +2375,7 @@ mod tests {
     #[tokio::test]
     async fn refusal_non_stream_returns_a_chat_completion_with_the_copy() {
         // Non-streaming refusal: a 200 `chat.completion` whose single choice content is the copy.
-        let resp = openai_refusal(false, "refused copy".into(), false, "id", "m", 0);
+        let resp = openai_refusal(false, "refused copy".into(), false, "id", "m", 0, None);
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value =
             serde_json::from_str(&body_string(resp).await).expect("json body");
@@ -2008,5 +2383,81 @@ mod tests {
         assert_eq!(v["choices"][0]["message"]["content"], "refused copy");
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
         assert_eq!(v["usage"]["total_tokens"], 0);
+    }
+
+    #[tokio::test]
+    /// S-RUNTIME-SEC-02 AC-006
+    async fn authorization_refusal_exposes_its_machine_code_on_openai_completion() {
+        let response = openai_refusal(
+            false,
+            "權限不足".into(),
+            false,
+            "id",
+            "m",
+            0,
+            Some(crate::server::codes::AUTHZ_INSUFFICIENT),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&body_string(response).await).expect("response is JSON");
+        assert_eq!(
+            body["x_refusal_code"],
+            crate::server::codes::AUTHZ_INSUFFICIENT
+        );
+        assert_eq!(body["choices"][0]["message"]["content"], "權限不足");
+    }
+
+    /// The `/ss-report` sweep predicate. A narrow ask on the report endpoint must NOT burn six
+    /// upstream calls, and an explicit report ask must never be left to the model's discretion —
+    /// that discretion is exactly what left the starcharger report with empty sections (0.5.2).
+    #[test]
+    fn ss_report_sweep_fires_on_report_wording_and_not_on_a_narrow_ask() {
+        // The predicate reads only the normalized prompt, so the intent fields are irrelevant here
+        // — which is the point: the sweep decision must not depend on the EV intent pack, under
+        // which every SS prompt resolves to `unknown`.
+        let normalized = |prompt: &str| NormalizedInput {
+            prompt: prompt.to_string(),
+            ..normalized_with("unknown", &[])
+        };
+
+        // The wordings the user asked us to treat as "fetch everything".
+        for prompt in [
+            "請產生完整的報告",
+            "報告",
+            "give me the full report",
+            "REPORT",
+            "本季營運報表",
+            "整體營運概況",
+            "各條業務線的狀況",
+            "完整資料",
+        ] {
+            assert!(
+                wants_full_ss_sweep(&normalized(prompt)),
+                "`{prompt}` should sweep every granted tool"
+            );
+        }
+
+        // …and the narrow asks that must stay narrow.
+        for prompt in [
+            "只要日照資料",
+            "儲能投標得標率是多少",
+            "哪些案子卡在談判中",
+            "",
+        ] {
+            assert!(
+                !wants_full_ss_sweep(&normalized(prompt)),
+                "`{prompt}` should fetch only what it needs"
+            );
+        }
+    }
+
+    /// Memory replay is route-family-scoped, and both SS front doors are one family. If
+    /// `/ss-report` fell outside it, the replay filter would drop every SS turn on that route and
+    /// silently make it single-turn — while its fetcher prompt tells the model to reuse history.
+    #[test]
+    fn both_ss_front_doors_are_one_memory_family() {
+        assert!(is_ss_route("/ss-chat/stream"));
+        assert!(is_ss_route("/ss-report"));
+        assert!(!is_ss_route("/agent/stream"));
+        assert!(!is_ss_route("/v1/chat/completions"));
     }
 }

@@ -18,7 +18,9 @@
 //! (fetcher → analyst) and appends the resulting short C-suite welcome paragraph to
 //! [`AppState::greetings`].
 //!
-//! `GET /greeting` then serves a random pick.
+//! `GET /greeting` then serves a random pick — unless the caller sends `X-Falcon-Authorization`
+//! and their permissions do not unlock every tool in the greeting fetcher grant, in which case
+//! the handler substitutes the neutral, figure-free greeting (see `handler::greeting`).
 
 use anyhow::{bail, Context, Result};
 use tracing::{error, info, warn};
@@ -30,8 +32,8 @@ use crate::agent::wiring::{build_greeting_pipeline, greeting_pipeline_id};
 
 /// Build one greeting by running the two-stage greeting pipeline (fetcher → analyst).
 ///
-/// The fetcher pulls a broad datacenter snapshot with its granted tools (the `/insight` fetcher's
-/// grant); the **terminal** analyst turns that material into one short executive greeting — its
+/// The fetcher pulls a broad datacenter snapshot with its granted tools (the insight pipeline
+/// fetcher's grant, `[insight.grants].fetcher`); the **terminal** analyst turns that material into one short executive greeting — its
 /// model message is the `Final` answer. Buffered: greetings are collected at boot, not streamed.
 pub async fn build_one_greeting(state: &AppState) -> Result<String> {
     let orchestrator = build_greeting_pipeline(

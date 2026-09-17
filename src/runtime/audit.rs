@@ -59,6 +59,8 @@ pub enum AuditEvent {
     MemoryContext {
         /// Used memory turn count.
         used_turn_count: usize,
+        /// Number of stored turns omitted before context assembly.
+        dropped_turn_count: usize,
         /// Optional dropped reason.
         dropped_reason: Option<String>,
     },
@@ -98,6 +100,47 @@ pub enum AuditEvent {
         /// Duration in milliseconds.
         duration_ms: u64,
     },
+    /// A request was rejected by the global burst limiter (S-RUNTIME-SEC-01
+    /// FR-005). Field set is pinned by spec D-007: `request_id` and `route`
+    /// ride on the [`AuditCtx`]; no IP, session, actor, token, prompt, or
+    /// response data is ever attached.
+    RateLimitRejected {
+        /// Which limiter rejected the request (`global` or `actor`).
+        layer: String,
+        /// Decision label (always `rejected` for this event).
+        decision: String,
+        /// Advised retry delay in whole seconds.
+        retry_after_secs: u64,
+        /// Active limiter policy, e.g. `burst=5;refill_ms=1000`.
+        policy_version: String,
+    },
+    /// A report was produced with one or more topic grants omitted.
+    PermissionDegraded {
+        /// Topic/tool labels omitted from the response.
+        omitted_topics: Vec<String>,
+    },
+    /// An identity failure that requires operational attention.
+    /// A routine identity failure (missing header, expired token, terminal token,
+    /// unavailable upstream). Ordinary evidence, not an alarm: paging on every 401 would
+    /// bury the two events that genuinely need eyes.
+    IdentityRefused {
+        /// Failure kind, e.g. `header_missing`, `token_refreshable`.
+        kind: String,
+        /// Normalized Falcon host the request was resolved against, once known.
+        falcon_host: Option<String>,
+    },
+    /// Identity events that must page someone: `invalid_platform` (the browser-token allowlist
+    /// canary), `upstream_conflict` (a runtime request-construction bug), `host_unknown` (a
+    /// consumer deployed against a Falcon this runtime is not configured for) and
+    /// `actor_key_derivation_failed` (a broken boot invariant). Malformed input is never an alarm.
+    IdentityAlarm {
+        /// Stable alarm kind, without credentials or request content.
+        kind: String,
+        /// Normalized Falcon host the request was resolved against, once known. For
+        /// `host_unknown` this is the *requested* (rejected) host, so operators can see which
+        /// consumer is misconfigured.
+        falcon_host: Option<String>,
+    },
 }
 
 /// Actor metadata attached to audit records.
@@ -118,6 +161,8 @@ pub struct AuditCtx {
     pub session_id: Option<String>,
     /// Route name/path.
     pub route: String,
+    /// Opaque actor key, independent from network metadata in [`AuditActor`].
+    pub actor_key: Option<String>,
     /// Actor metadata.
     pub actor: Option<AuditActor>,
 }
@@ -133,6 +178,8 @@ pub struct AuditRecord {
     pub route: String,
     /// Per-request monotonic sequence number.
     pub seq: u64,
+    /// Opaque actor key copied without hashing or joining network metadata.
+    pub actor_key: Option<String>,
     /// Hashed actor IP.
     pub actor_ip: Option<String>,
     /// Hashed actor user agent.
@@ -149,6 +196,7 @@ impl AuditRecord {
             session_id: ctx.session_id.clone(),
             route: ctx.route.clone(),
             seq,
+            actor_key: ctx.actor_key.clone(),
             actor_ip: ctx
                 .actor
                 .as_ref()
@@ -197,6 +245,7 @@ impl AuditSink for TracingAuditSink {
         let request_id = ctx.request_id.as_str();
         let route = ctx.route.as_str();
         let session_id = ctx.session_id.as_deref().unwrap_or("-");
+        let actor_key = ctx.actor_key.as_deref().unwrap_or("-");
         match event {
             AuditEvent::RequestReceived {
                 input_hash,
@@ -207,6 +256,7 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 input_hash = %input_hash,
                 input_chars,
                 option_id = option_id.as_deref().unwrap_or("-"),
@@ -222,6 +272,7 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 intent = %intent,
                 confidence = confidence as f64,
                 intent_source = intent_source.as_deref().unwrap_or("-"),
@@ -233,6 +284,7 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 code = %code,
                 reason = %reason,
                 "audit.input_rejected"
@@ -242,18 +294,22 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 reason = %reason,
                 "audit.refused"
             ),
             AuditEvent::MemoryContext {
                 used_turn_count,
+                dropped_turn_count,
                 dropped_reason,
             } => info!(
                 request_id,
                 route,
                 seq,
                 session_id,
+                actor_key,
                 used_turn_count,
+                dropped_turn_count,
                 dropped_reason = dropped_reason.as_deref().unwrap_or("-"),
                 "audit.memory_context"
             ),
@@ -262,6 +318,7 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 tool = %tool,
                 args_hash = %args_hash,
                 "audit.tool_called"
@@ -271,13 +328,17 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 tool = %tool,
                 bytes,
                 ok,
                 "audit.tool_result"
             ),
             AuditEvent::AnswerCleared => {
-                info!(request_id, route, seq, session_id, "audit.answer_cleared")
+                info!(
+                    request_id,
+                    route, seq, session_id, actor_key, "audit.answer_cleared"
+                )
             }
             AuditEvent::ResponseCompleted {
                 response_hash,
@@ -289,6 +350,7 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 response_hash = %response_hash,
                 response_chars,
                 duration_ms,
@@ -303,9 +365,56 @@ impl AuditSink for TracingAuditSink {
                 route,
                 seq,
                 session_id,
+                actor_key,
                 error_code = %error_code,
                 duration_ms,
                 "audit.response_failed"
+            ),
+            AuditEvent::RateLimitRejected {
+                layer,
+                decision,
+                retry_after_secs,
+                policy_version,
+            } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                actor_key,
+                layer = %layer,
+                decision = %decision,
+                retry_after_secs,
+                policy_version = %policy_version,
+                "audit.rate_limit_rejected"
+            ),
+            AuditEvent::PermissionDegraded { omitted_topics } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                actor_key,
+                omitted_topics = omitted_topics.len(),
+                "audit.permission_degraded"
+            ),
+            AuditEvent::IdentityRefused { kind, falcon_host } => info!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                actor_key,
+                kind = %kind,
+                falcon_host = falcon_host.as_deref().unwrap_or("-"),
+                "audit.identity_refused"
+            ),
+            AuditEvent::IdentityAlarm { kind, falcon_host } => tracing::error!(
+                request_id,
+                route,
+                seq,
+                session_id,
+                actor_key,
+                kind = %kind,
+                falcon_host = falcon_host.as_deref().unwrap_or("-"),
+                "audit.identity_alarm"
             ),
         }
         Ok(())
@@ -403,11 +512,29 @@ mod tests {
             request_id: "req-1".into(),
             session_id: Some("session-1".into()),
             route: "/agent".into(),
+            actor_key: Some("v1:opaque-actor".into()),
             actor: Some(AuditActor {
                 ip: Some("203.0.113.9".into()),
                 user_agent: Some("Bearer secret-user-agent".into()),
             }),
         }
+    }
+
+    #[test]
+    fn audit_record_carries_actor_key_as_an_independent_opaque_field() {
+        let record = AuditRecord::from_event(
+            &ctx(),
+            1,
+            AuditEvent::PermissionDegraded {
+                omitted_topics: vec!["member".into()],
+            },
+        );
+
+        assert_eq!(record.actor_key.as_deref(), Some("v1:opaque-actor"));
+        let serialized = serde_json::to_string(&record).expect("audit record should serialize");
+        assert!(serialized.contains("v1:opaque-actor"));
+        assert!(!serialized.contains("203.0.113.9"));
+        assert!(!serialized.contains("Bearer secret-user-agent"));
     }
 
     #[tokio::test]

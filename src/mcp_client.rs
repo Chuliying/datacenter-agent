@@ -43,6 +43,19 @@ pub struct McpHandle {
     peer: Peer<RoleClient>,
 }
 
+#[cfg(test)]
+impl McpHandle {
+    /// Wrap a peer that a test obtained from an in-memory transport.
+    ///
+    /// `peer` is private, and the only production path to one is
+    /// [`McpClient::connect_http`], which needs a live MCP server. Router-level tests need an
+    /// [`AppState`](crate::appstate::AppState) — that is the sole reason this exists. It is
+    /// `#[cfg(test)]`, so it adds nothing to the crate's public surface.
+    pub(crate) fn from_peer_for_tests(peer: Peer<RoleClient>) -> Self {
+        Self { peer }
+    }
+}
+
 impl McpClient {
     /// Connect to a MCP server over HTTP.
     ///

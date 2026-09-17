@@ -1,8 +1,20 @@
 # datacenter-agent 現況參考（Documentation Source of Truth）
 
 > **文件類型**：documentation source of truth。PRD 定義完成後的 target state 並逐項標建置狀態；Spec、QA、endpoint 與 module 頁描述目前 worktree。  
-> **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
-> **對應版本**：PRD v1.3.0 · Spec v1.3.0 · QA v1.3.0（2026-06-30）
+> **Source**：[`README.md`](../../README.md)、[`Cargo.toml`](../../Cargo.toml)、[`src/main.rs`](../../src/main.rs)、[`src/appstate.rs`](../../src/appstate.rs)、[`src/server/`](../../src/server/mod.rs)、[`src/agent/`](../../src/agent/mod.rs)、[`src/runtime/`](../../src/runtime/mod.rs)  
+> **對應版本**：PRD v1.4.0 · Spec v1.4.0 · QA v1.5.0（2026-09-09 快照，對應 crate 0.5.0；PRD / Spec 仍為 0.4.0 基準）
+>
+> **同步狀態（逐檔）**：
+>
+> | 檔案 | 同步基準 | 已知落差 |
+> |---|---|---|
+> | `prd.md` | crate 0.4.0（2026-08-20） | 無已知落差 |
+> | `spec/spec.md` | crate 0.4.0（2026-08-20） | 無已知落差 |
+> | `tests/qa-plan.md` | crate 0.5.0（2026-09-09 fresh run，含 live test） | §3–§9 inventory 仍為 0.4.0 基準；docker build 證據停在 0.3.x image |
+> | `endpoints/**` | 2026-08-17 兩次校正（sub-agent 層＋`/v1/chat/completions`；退役端點移除） | 無已知落差 |
+> | `modules/**` | 2026-08-17 校正；2026-08-20 依 §1 規則 4 縮減 | 無已知落差 |
+>
+> 下次落後時把該檔移回本表的落差欄，不整段警告。
 
 ## 1. 文件權威與邊界
 
@@ -11,8 +23,9 @@
 1. [`prd.md`](./prd.md) 是**目標產品樣貌**；每條需求必須標 `已完成 / 部分完成 / 待建置 / 待決策`，不可把 status 省略。
 2. Spec、QA、endpoint 與 module 頁只記錄**目前已實作行為與證據**，不把 PRD target 寫成現況。
 3. 可執行程式碼、設定與測試是現況行為證據；若與 current-state reference 衝突，先校正文件。
-4. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
-5. `docs/agent-runtime-rust-port/**` 與 `docs/archives/**` 是歷史移植需求、設計與計畫資料，不是目前 target/current contract。
+4. module 頁只寫**落差、決策、陷阱**與跨模組 wiring 現實；「模組／檔案是什麼」的結構描述唯一擁有者是 `src/**` 的 `//!` doc comment（與程式同 diff，漂移即刻可見），module 頁不複述。endpoint 頁不適用本條——wire contract 沒有其他家，完整保留。
+5. PRD 的 部分完成／待建置／待決策 差距必須由獨立的 [程式修改計劃](../../.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md) 派生，計劃狀態不反向冒充完成狀態。
+6. 移植期的歷史 PRD／Spec／TC 已自 worktree 移除，由 git 保存（取回方式見 [`docs/index.md`](../index.md#歷史git-保存不在-worktree)）。PRD／Spec／TC 三類文件的完整歸屬見 [`docs/index.md`](../index.md#prd--spec--tc-的歸屬)。
 
 ## 2. 一句話定位
 
@@ -20,11 +33,13 @@
 
 | 項目 | 現況 |
 |---|---|
-| crate / 版本 | `datacenter-agent` `0.1.1` |
-| HTTP / async | axum 0.8.9 · tokio 1.52.3 |
-| MCP / LLM | rmcp 0.17.0 client · async-openai 0.40.3 · OpenRouter |
-| 預設請求路徑 | runtime `run_agent_turn`；只有明確 `RUNTIME_ENABLED=false/0` 才 rollback 到 legacy |
-| runtime 現況 | partial；orchestrator、memory、audit、injection、answer policy 已接線，stage dispatch 與 evaluator semantics 等仍不完整 |
+| crate / 版本 | `datacenter-agent` `0.4.0` |
+| HTTP / async | axum 0.8 · tokio 1 |
+| MCP / LLM | rmcp 0.17 client · async-openai 0.40 · OpenRouter |
+| 對外端點 | 5 條（4 條 standard + OpenAI 相容 `/v1/chat/completions`） |
+| 主要編排 | [sub-agent pipeline](./modules/agent.md)（fetcher → analyst → charter/composer → finalizer/renderer） |
+| prompt 入口 | `/agent/stream`、`/v1/chat/completions`，**兩者都經過 prelude**——不存在無 guardrail 入口 |
+| runtime 現況 | partial；prelude（guardrails、intent、answer policy、memory、audit）已接線並覆蓋全部 prompt 入口。完整的 `run_agent_turn` 連同 `AgentPort` 仍 dormant，production 只走同步前段 `plan_stream_turn` |
 
 ## 3. 導覽
 
@@ -43,8 +58,10 @@
 ## 4. 啟動與組裝（top-level 接線）
 
 - [`src/main.rs`](../../src/main.rs)：讀 CLI/env/config、連 MCP、建立 AppState/Router、啟動 server。
-- [`src/appstate.rs`](../../src/appstate.rs)：持有 MCP handle、tools、LLM defaults、prompts、auth token、greetings 與 optional `AppRuntime`。
-- [`src/config.rs`](../../src/config.rs)：解析 top-level config 與相對檔案路徑。
+- [`src/appstate.rs`](../../src/appstate.rs)：持有 MCP handle、tools、LLM defaults、`PromptBank`、
+  auth token、greetings、`InsightGrants`、boot 載入的 `report_template`，與 optional `AppRuntime`。
+- [`src/config.rs`](../../src/config.rs)：解析 top-level config 與相對檔案路徑；含
+  `[insight.grants]` → `InsightGrants`（改 tool grant 不需重新編譯）。
 - `AppState::new` 先解析 `RUNTIME_ENABLED`；明確 `false/0` 時跳過 runtime config/build，其他值（含未設）必須有 `[runtime]` 並組裝 `AppRuntime`，缺失則 fail-fast。
 
 ## 5. 維護規則

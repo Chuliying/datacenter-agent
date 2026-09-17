@@ -7,12 +7,17 @@
 
 - `SessionMemoryStore` trait 與 in-memory implementation。
 - memory enabled 且 request 有 `session_id` 時，讀取 recent turns、組成 untrusted context、寫入 prompt，並清空 upstream client history。
-- request 無 `session_id` 時不使用 server memory，保留 client history。
+- request 無 `session_id` 時不使用 server memory；未受身份層保護的 legacy runtime caller 可保留 client history。
 - store retention 受 `max_turns` 限制。
 
 ## 實際 scope / isolation
 
-`SessionMemoryScope` 支援 `actor_id`，但 production load/append 都傳 None。key 實際是 anonymous + client-provided session id；目前不能宣稱 multi-user/tenant isolation。
+受身份層保護的 prompt request 以 `actor_key` 與 `session_id` 共同形成 scope；同一個 session id
+在不同 actor 間不共享記憶。未帶 verified identity 的 legacy runtime caller 才會落在 anonymous scope。
+
+每次讀取再依當次 permission grant 過濾已存 turn；`unknown`／缺少 intent 的 turn 不進入 prompt，
+report turn 必須仍完整涵蓋六個 required tools 才能保留。被略過的筆數只進 bounded audit metadata，
+被略過的內容不進 LLM prompt。
 
 ## Context semantics
 

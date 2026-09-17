@@ -1,0 +1,60 @@
+schema_version: work-item/v3
+slug: runtime-falcon-identity-rbac
+title: Falcon 使用者身份與 RBAC 接進 runtime 請求路徑
+created_at: 2026-08-26T00:00:00+08:00
+updated_at: 2026-09-02T16:40:00+08:00
+execution_mode: team-feature
+work_status: active
+delivery_status: not_requested
+documentation_impact: doc:docs/reference/endpoints/agent-stream.md
+stages:
+  prd: { skill: prd-interview, file: prd.md, status: approved }
+  spec: { skill: spec, file: spec.md, status: approved }
+  qa-plan: { skill: qa, file: qa-plan.md, status: ready }
+  plan: { skill: plan-sync, file: plan/plan.md, status: ready }
+  implement: { skill: implement, file: implement-report.md, status: done }
+  qa-report: { skill: qa, file: qa-report.md, status: validated }
+inputs:
+  - docs/work/runtime-falcon-identity-rbac/brainstorm.md
+  - user:falcon-external-login-guide-and-two-decision-rounds-2026-08-26
+  - user:token-passthrough-runtime-self-verify-2026-08-26
+  - user:permission-narrows-grants-before-llm-2026-08-26
+  - user:full-fail-closed-no-exception-2026-08-26
+  - user:mapping-table-confirm-at-pr-review-2026-08-26
+  - user:report-degrades-and-states-gaps-2026-08-26
+  - user:parent-permission-does-not-imply-children-2026-08-26
+  - user:runtime-ignores-download-permission-2026-08-26
+  - docs/work/runtime-user-session-rate-limit/prd.md
+  - src/server/auth.rs
+  - src/server/rate_limit.rs
+  - src/runtime/turn.rs
+  - src/runtime/store/sqlite.rs
+  - src/runtime/memory/store.rs
+  - src/agent/tools.rs
+  - config/runtime/intents.toml
+  - config/mcp-config.toml
+  - config/prompt_guide/fetcher_system.md
+  - external:falcon-client/src/lib/chief-of-staff/agent-client.ts
+  - external:falcon-client/src/lib/chief-of-staff/agent-runtime/identity.ts
+  - external:falcon-client/src/utils/menuPermissions.ts
+  - external:falcon-client/src/lib/server/getMenuPermissions.ts
+  - external:falcon-client/src/lib/chief-of-staff/stream-route.ts
+  - external:falcon-client/src/middleware.ts
+  - external:falcon-client/src/app/silent-refresh/page.tsx
+  - external:falcon-client/src/components/chief-of-staff/useChiefOfStaffStream.ts
+  - external:https://github.com/HDRenewables/falcon-backend/blob/c5d0408b5e1847bf165e8c5f5859ef61da93e02d/docs/External_Delegated_API_Integration.md
+  - local:fable-gate1-adversarial-review-rounds-1-to-3-2026-08-26
+  - local:fable-gate1-independent-review-round-4-2026-08-26
+  - user:authorization-and-contract-review-round-5-2026-08-26
+  - user:route-level-and-handoff-review-round-6-2026-08-26
+  - user:falcon-ops-confirmed-bearer-and-seven-auth-error-codes-2026-08-27
+  - user:adopt-specified-falcon-guide-as-ssot-2026-08-28
+  - user:prd-v1.7.0-approved-go-spec-2026-08-27
+  - src/server/openai.rs
+  - docs/reference/endpoints/chat-completions.md
+  - src/agent/wiring.rs
+  - src/server/error.rs
+  - src/server/dto.rs
+  - src/runtime/registry.rs
+  - src/runtime/store/sanitize.rs
+  - local:fable-post-delivery-review-four-reviewers-2026-09-02

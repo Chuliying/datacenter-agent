@@ -132,6 +132,17 @@ impl ArtifactKey {
         Self::new("report", "data")
     }
 
+    /// The 星星電力 composer's schema-validated report payload (`ss_report.data`), a serialized
+    /// [`SsReportData`](crate::agent::ss_report::SsReportData) from the `emit_ss_report` sink — the
+    /// single artifact the `/ss-report` renderer injects into its HTML template.
+    ///
+    /// A distinct key from [`report_data`](Self::report_data) on purpose: the two payloads have
+    /// different schemas, so a mis-wired pipeline fails as a missing artifact rather than handing
+    /// the SS template a starcharger payload it cannot read.
+    pub fn ss_report_data() -> Self {
+        Self::new("ss_report", "data")
+    }
+
     /// The producer namespace (the `agent` half).
     pub fn agent(&self) -> &str {
         &self.agent
@@ -435,13 +446,22 @@ pub trait Tool: Send + Sync {
 /// Returns `Ok((text, produced))` — the model's final message and the artifacts each tool
 /// produced, keyed by `target`.
 ///
+/// # Step cap
+///
+/// Hitting `MAX_STEPS` is not automatically a failure. What matters is whether the stage got what
+/// it was asked for: a `required` output that is present (or a stage with no requirement that
+/// nonetheless produced artifacts) returns `Ok` with an empty message and everything gathered so
+/// far, because failing there would discard real fetched data and take the whole pipeline down
+/// with it. Only a cap hit that produced *nothing* — or that left a `required` artifact unfilled —
+/// is an error. Every cap hit is logged at `warn` either way.
+///
 /// # Errors
 ///
 /// - [`AgentError::UnknownTool`] — the model called a tool outside this agent's set.
 /// - [`AgentError::MissingArtifact`] — a `required` output was never produced, even after the
 ///   retry nudges (or after the step cap).
 /// - [`AgentError::Capability`] — the LLM transport failed, a tool failed fatally, or the loop
-///   exceeded its step cap (`MAX_STEPS`) with no required output declared.
+///   exceeded its step cap (`MAX_STEPS`) having produced no artifact at all.
 ///
 /// # References
 ///
@@ -460,10 +480,20 @@ pub async fn run_llm_loop<L: LlmCapability>(
     ];
     let mut produced: HashMap<ArtifactKey, ArtifactValue> = HashMap::new();
 
-    const MAX_STEPS: usize = 8; // guard against a non-terminating tool loop
-                                // How many times to nudge a model that ends without its `required` output before giving up.
+    // Guard against a non-terminating tool loop. The bound must clear the *sequential* worst case
+    // of the widest stage: the report fetcher holds six data tools, and a model that calls them one
+    // per step needs six steps plus a closing message — before any rejection is retried. The old
+    // cap of 8 left no headroom at all, so one rejected call cost the report a whole topic (and its
+    // chart). 16 leaves room for a full sequential sweep plus retries.
+    const MAX_STEPS: usize = 16;
+    // How many times to nudge a model that ends without its `required` output before giving up.
     const MAX_OUTPUT_RETRIES: usize = 3;
     let mut output_retries = 0usize;
+    // The most recent rejection per tool, kept so a failure can be *quoted back* to the model when
+    // it gives up and answers in prose. A model that ends without its required output has almost
+    // always just had a call rejected; repeating the concrete reason is what turns the nudge from
+    // "try again" into "here is what was wrong".
+    let mut last_rejections: Vec<(String, String)> = Vec::new();
     for step in 0..MAX_STEPS {
         match llm.chat(&messages, &schemas).await? {
             LlmResponse::Message(text) => {
@@ -479,6 +509,7 @@ pub async fn run_llm_loop<L: LlmCapability>(
                             tracing::warn!(
                                 artifact = %key,
                                 retries = output_retries,
+                                rejections = ?last_rejections,
                                 "run_llm_loop: required output still missing after retries — failing stage"
                             );
                             return Err(AgentError::MissingArtifact(key.clone()));
@@ -489,6 +520,7 @@ pub async fn run_llm_loop<L: LlmCapability>(
                             attempt = output_retries,
                             max = MAX_OUTPUT_RETRIES,
                             text_preview = %text.chars().take(120).collect::<String>(),
+                            rejections = ?last_rejections,
                             "run_llm_loop: model ended without its required output — nudging to retry"
                         );
                         // Keep the transcript coherent: record what the model said, then instruct it
@@ -497,12 +529,12 @@ pub async fn run_llm_loop<L: LlmCapability>(
                             content: Some(text),
                             tool_calls: vec![],
                         });
-                        messages.push(LlmMessage::User(format!(
-                            "You have NOT produced the required result yet: the `{key}` artifact is \
-                             missing because no tool call has succeeded. Do not reply with prose or a \
-                             confirmation. You MUST call the required tool now with valid, \
-                             fully-populated arguments — every field present, and nested values as \
-                             real JSON objects/arrays, never as strings."
+                        messages.push(LlmMessage::User(retry_nudge(
+                            key,
+                            tools,
+                            &last_rejections,
+                            output_retries,
+                            MAX_OUTPUT_RETRIES,
                         )));
                         continue;
                     }
@@ -560,7 +592,13 @@ pub async fn run_llm_loop<L: LlmCapability>(
                                 %reason,
                                 "run_llm_loop: tool call REJECTED (fed back for retry)"
                             );
-                            format!("REJECTED: {reason}")
+                            // Remember it: if the model later gives up and answers in prose, the
+                            // nudge quotes this back instead of a generic "call the tool".
+                            last_rejections.retain(|(t, _)| t != &name);
+                            last_rejections.push((name.clone(), reason.clone()));
+                            // The tool is named here, once, so every tool can describe *what* went
+                            // wrong without each repeating *who* it was.
+                            format!("REJECTED — the call to `{name}` did not succeed: {reason}")
                         }
                     };
                     messages.push(LlmMessage::Tool {
@@ -577,20 +615,89 @@ pub async fn run_llm_loop<L: LlmCapability>(
         if !produced.contains_key(key) {
             tracing::warn!(
                 artifact = %key,
+                rejections = ?last_rejections,
                 "run_llm_loop: exhausted max steps without producing required output"
             );
             return Err(AgentError::MissingArtifact(key.clone()));
         }
+        return Ok((String::new(), produced));
     }
-    Err(AgentError::Capability(
-        "tool-use loop exceeded max steps".into(),
-    ))
+    // No required output, but the stage did fetch something before running out of steps (a fetcher
+    // working through a wide grant, say). Failing here would throw away real data and take the
+    // whole pipeline down with it; the downstream stages degrade honestly on a partial map, so
+    // return what was gathered and let the warning carry the anomaly.
+    if !produced.is_empty() {
+        tracing::warn!(
+            steps = MAX_STEPS,
+            produced_keys = ?produced.keys().map(|k| k.to_string()).collect::<Vec<_>>(),
+            rejections = ?last_rejections,
+            "run_llm_loop: exhausted max steps — returning the artifacts produced so far"
+        );
+        return Ok((String::new(), produced));
+    }
+    Err(AgentError::Capability(format!(
+        "tool-use loop exceeded max steps ({MAX_STEPS}) without producing anything"
+    )))
+}
+
+/// Builds the corrective turn sent to a model that ended without its `required` artifact.
+///
+/// This is the whole recovery channel: the model cannot see the artifact map, the tool dispatch, or
+/// why the stage is about to fail — it only sees this message. So it states four things the model
+/// can act on: which artifact is missing, which tool produces it, **what was actually wrong with
+/// its last attempt** (quoted verbatim from the rejection), and how many attempts remain.
+///
+/// # Arguments
+///
+/// - `key`: the artifact the stage must produce.
+/// - `tools`: the stage's granted tools — the one whose `target` is `key` is named explicitly.
+/// - `rejections`: the most recent rejection per tool, newest last.
+/// - `attempt` / `max`: the nudge count, so the model knows how much rope is left.
+fn retry_nudge(
+    key: &ArtifactKey,
+    tools: &[Box<dyn Tool>],
+    rejections: &[(String, String)],
+    attempt: usize,
+    max: usize,
+) -> String {
+    // Name the tool that actually fills the slot, rather than making the model infer it.
+    let required_tool = tools
+        .iter()
+        .find(|t| &t.target() == key)
+        .map(|t| t.schema().name);
+    let tool_clause = match &required_tool {
+        Some(name) => format!("`{name}`"),
+        None => "the required tool".to_string(),
+    };
+
+    let mut nudge = format!(
+        "STOP. You replied with prose, but the `{key}` artifact does not exist yet: no successful \
+         call to {tool_clause} has been recorded this turn, so nothing you wrote has been saved and \
+         the report cannot be produced. A confirmation sentence is not a tool call."
+    );
+
+    // Quote the concrete failure back. Without this the model re-sends the same broken payload.
+    if let Some((tool, reason)) = rejections.last() {
+        nudge.push_str(&format!(
+            "\n\nYour last call to `{tool}` was rejected for this reason:\n{reason}\n\nDo not repeat \
+             that mistake."
+        ));
+    }
+
+    nudge.push_str(&format!(
+        "\n\nCall {tool_clause} NOW, in this turn, with a COMPLETE payload: every required field \
+         present, nested values as real JSON objects/arrays (never JSON-encoded strings), numbers as \
+         plain JSON numbers with no currency symbols, separators or percent signs. Build it from the \
+         Material you were given — do not invent figures, and do not shorten the payload to save \
+         effort. This is attempt {attempt} of {max}; after that the stage fails outright."
+    ));
+    nudge
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     /// An LLM whose responses are scripted, so the loop becomes a deterministic unit.
     struct ScriptedLlm {
@@ -710,6 +817,121 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::MissingArtifact(k) if k == required));
+    }
+
+    /// A tool that always rejects with a fixed reason — stands in for a schema failure.
+    struct AlwaysRejects;
+    #[async_trait]
+    impl Tool for AlwaysRejects {
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "emit_report".into(),
+                description: "emit".into(),
+                parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            }
+        }
+        fn target(&self) -> ArtifactKey {
+            ArtifactKey::report_data()
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<ToolOutcome, AgentError> {
+            Ok(ToolOutcome::Rejected {
+                reason: "at `periods[3].kwh`: invalid type: string".into(),
+            })
+        }
+    }
+
+    /// An LLM that records every message it is handed, so the *content* of the recovery nudge —
+    /// not just the fact that one happened — can be asserted on.
+    struct RecordingLlm {
+        turns: Mutex<Vec<LlmResponse>>,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl LlmCapability for RecordingLlm {
+        async fn chat(
+            &self,
+            messages: &[LlmMessage],
+            _tools: &[ToolSchema],
+        ) -> Result<LlmResponse, AgentError> {
+            if let Some(LlmMessage::User(text)) = messages.last() {
+                self.seen.lock().unwrap().push(text.clone());
+            }
+            Ok(self.turns.lock().unwrap().remove(0))
+        }
+    }
+
+    // The recovery nudge is the model's only channel back: it must name the tool that fills the
+    // slot and QUOTE the concrete rejection, or the model just re-sends the same broken payload.
+    #[tokio::test]
+    async fn the_recovery_nudge_names_the_tool_and_quotes_the_last_rejection() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(AlwaysRejects)];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let llm = RecordingLlm {
+            turns: Mutex::new(vec![
+                // A rejected call…
+                LlmResponse::ToolCalls(vec![ToolCall {
+                    id: "c1".into(),
+                    name: "emit_report".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                // …then the model gives up and confirms in prose. That triggers the nudge.
+                LlmResponse::Message("報告已成功提交。".into()),
+                LlmResponse::Message("報告已成功提交。".into()),
+                LlmResponse::Message("報告已成功提交。".into()),
+                LlmResponse::Message("報告已成功提交。".into()),
+            ]),
+            seen: seen.clone(),
+        };
+        let key = ArtifactKey::report_data();
+        let err = run_llm_loop(&llm, "sys", "go", &tools, Some(&key))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::MissingArtifact(k) if k == key));
+
+        let seen = seen.lock().unwrap();
+        let nudge = seen
+            .iter()
+            .find(|m| m.starts_with("STOP."))
+            .expect("the loop must have nudged the model");
+        // Names the artifact and the tool that fills it…
+        assert!(nudge.contains("report.data"), "nudge: {nudge}");
+        assert!(nudge.contains("`emit_report`"), "nudge: {nudge}");
+        // …quotes the actual failure rather than a generic "call the tool"…
+        assert!(nudge.contains("periods[3].kwh"), "nudge: {nudge}");
+        // …and says how much rope is left.
+        assert!(nudge.contains("attempt 1 of 3"), "nudge: {nudge}");
+    }
+
+    // A stage with no required output that runs out of steps must hand back what it DID fetch. The
+    // report fetcher holds six tools; failing the stage would throw away five good fetches and take
+    // the whole report down with them.
+    #[tokio::test]
+    async fn a_step_capped_stage_with_no_required_output_returns_what_it_gathered() {
+        struct AlwaysCalls;
+        #[async_trait]
+        impl LlmCapability for AlwaysCalls {
+            async fn chat(
+                &self,
+                _messages: &[LlmMessage],
+                _tools: &[ToolSchema],
+            ) -> Result<LlmResponse, AgentError> {
+                Ok(LlmResponse::ToolCalls(vec![ToolCall {
+                    id: "c".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
+                }]))
+            }
+        }
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let (text, produced) = run_llm_loop(&AlwaysCalls, "sys", "go", &tools, None)
+            .await
+            .expect("a step-capped fetch must degrade, not fail");
+        assert!(text.is_empty(), "there is no final message to report");
+        assert_eq!(
+            produced.get(&ArtifactKey::fetcher_records()),
+            Some(&ArtifactValue::Text("echoed".into())),
+            "the artifacts gathered before the cap must survive"
+        );
     }
 
     #[tokio::test]

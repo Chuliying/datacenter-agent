@@ -12,4 +12,5 @@ pub mod llm_normalizer;
 pub mod memory;
 pub mod registry;
 pub mod schema;
+pub mod store;
 pub mod turn;

@@ -1,0 +1,1698 @@
+<!doctype html>
+<html lang="zh-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>星星電力 營運綜合報告</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    /* Design tokens — baked in (edit here to retune the brand palette). */
+    :root {
+      --report-color-surface-page: #f4f4f5;
+      --report-color-surface-panel: #ffffff;
+      --report-color-surface-subtle: #fafafa;
+      --report-color-surface-strong: #e4e4e7;
+      --report-color-content-primary: #18181b;
+      --report-color-content-secondary: #52525b;
+      --report-color-content-muted: #71717a;
+      --report-color-content-inverse: #fafafa;
+      --report-color-border-default: #e4e4e7;
+      --report-color-border-strong: #a1a1aa;
+      --report-color-accent-primary: #167bd9;
+      --report-color-accent-soft: #e8f2fc;
+      --report-color-accent-muted: #78afe3;
+      --report-color-status-positive: #15803d;
+      --report-color-status-positive-soft: #dcfce7;
+      --report-color-status-negative: #b91c1c;
+      --report-color-status-negative-soft: #fee2e2;
+      --report-color-status-caution: #0f5fa8;
+      --report-color-status-caution-soft: #e8f2fc;
+      --report-color-chart-neutral: #8ebce8;
+      --report-color-chart-neutral-dark: #167bd9;
+      --report-color-chart-grid: #d7e8f7;
+      --report-font-body: "Noto Sans TC", "PingFang TC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --report-font-data: Saira, "Arial Narrow", "Noto Sans TC", sans-serif;
+      --report-radius-panel: 12px;
+      --report-radius-control: 8px;
+      --report-shadow-panel: 0 1px 2px rgba(24, 24, 27, 0.05);
+      --report-space-page: clamp(16px, 3vw, 36px);
+      --report-space-panel: clamp(16px, 2vw, 24px);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      background: var(--report-color-surface-page);
+      color: var(--report-color-content-primary);
+      font-family: var(--report-font-body);
+      font-synthesis: none;
+    }
+
+    body {
+      min-width: 320px;
+      margin: 0;
+      background: var(--report-color-surface-page);
+      color: var(--report-color-content-primary);
+      padding: var(--report-space-page);
+    }
+
+    button, input, table {
+      font: inherit;
+    }
+
+    .report-shell {
+      width: min(100%, 1280px);
+      margin-inline: auto;
+    }
+
+    .report-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 24px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--report-color-border-default);
+    }
+
+    .report-organization {
+      margin: 0 0 6px;
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .03em;
+    }
+
+    .report-title {
+      margin: 0;
+      font-size: clamp(26px, 3vw, 38px);
+      font-weight: 650;
+      letter-spacing: -.035em;
+      line-height: 1.15;
+    }
+
+    .report-brand {
+      display: inline-block;
+      margin-left: 8px;
+      color: var(--report-color-content-muted);
+      font-size: .48em;
+      font-weight: 500;
+      letter-spacing: 0;
+      vertical-align: middle;
+    }
+
+    .report-meta {
+      min-width: 240px;
+      margin: 0;
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      line-height: 1.65;
+      text-align: right;
+    }
+
+    .report-meta strong {
+      color: var(--report-color-content-primary);
+      font-weight: 600;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .kpi-card,
+    .panel {
+      border: 1px solid var(--report-color-border-default);
+      border-radius: var(--report-radius-panel);
+      background: var(--report-color-surface-panel);
+      box-shadow: var(--report-shadow-panel);
+    }
+
+    .kpi-card {
+      min-width: 0;
+      padding: 16px;
+    }
+
+    .kpi-label {
+      margin: 0 0 10px;
+      color: var(--report-color-content-muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .kpi-value {
+      min-height: 2.2em;
+      margin: 0;
+      overflow-wrap: anywhere;
+      color: var(--report-color-content-primary);
+      font-family: var(--report-font-data);
+      font-size: clamp(20px, 2.1vw, 28px);
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      letter-spacing: -.025em;
+      line-height: 1.1;
+    }
+
+    .kpi-card[data-kind="name"] .kpi-value {
+      font-family: var(--report-font-body);
+      font-size: clamp(17px, 1.5vw, 21px);
+      letter-spacing: -.015em;
+    }
+
+    .kpi-detail {
+      margin: 8px 0 0;
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .kpi-detail[data-tone="positive"] {
+      color: var(--report-color-status-positive);
+    }
+
+    .kpi-detail[data-tone="negative"] {
+      color: var(--report-color-status-negative);
+    }
+
+    .insight-panel {
+      margin-bottom: 20px;
+    }
+
+    .insight-headline {
+      margin: 0 0 12px;
+      color: var(--report-color-content-primary);
+      font-size: clamp(16px, 1.7vw, 20px);
+      font-weight: 650;
+      line-height: 1.45;
+    }
+
+    .insight-body {
+      display: grid;
+      gap: 10px;
+    }
+
+    .insight-body p {
+      margin: 0;
+      color: var(--report-color-content-secondary);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .panel {
+      min-width: 0;
+      padding: var(--report-space-panel);
+    }
+
+    .panel + .panel-full,
+    .panel-full + .panel-full {
+      margin-top: 16px;
+    }
+
+    .panel-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .panel-title {
+      margin: 0;
+      color: var(--report-color-content-primary);
+      font-size: 16px;
+      font-weight: 650;
+      line-height: 1.4;
+    }
+
+    .panel-context {
+      flex: none;
+      color: var(--report-color-content-muted);
+      font-size: 12px;
+    }
+
+    .chart-frame {
+      position: relative;
+      min-height: 300px;
+    }
+
+    .chart-frame canvas {
+      width: 100%;
+      height: 300px;
+    }
+
+    .chart-fallback {
+      display: grid;
+      min-height: 300px;
+      place-items: center;
+      border-radius: var(--report-radius-control);
+      background: var(--report-color-surface-subtle);
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      text-align: center;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      color: var(--report-color-content-primary);
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    caption {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+      white-space: nowrap;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--report-color-border-default);
+      text-align: left;
+      vertical-align: middle;
+    }
+
+    th {
+      background: var(--report-color-surface-subtle);
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    td[data-align="right"],
+    th[data-align="right"] {
+      text-align: right;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    tbody tr[data-partial="true"] td {
+      background: var(--report-color-status-caution-soft);
+    }
+
+    .rank-marker {
+      display: inline-grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border: 1px solid var(--report-color-border-default);
+      border-radius: 50%;
+      color: var(--report-color-content-secondary);
+      font-family: var(--report-font-data);
+      font-weight: 600;
+    }
+
+    tr[data-rank="1"] .rank-marker {
+      border-color: var(--report-color-accent-muted);
+      background: var(--report-color-accent-soft);
+      color: var(--report-color-accent-primary);
+    }
+
+    .value-positive {
+      color: var(--report-color-status-positive);
+    }
+
+    .value-negative {
+      color: var(--report-color-status-negative);
+    }
+
+    .data-note {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--report-color-border-default);
+      border-radius: var(--report-radius-control);
+      background: var(--report-color-status-caution-soft);
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .data-note-label {
+      color: var(--report-color-status-caution);
+      font-weight: 650;
+    }
+
+    .report-footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 20px;
+      color: var(--report-color-content-muted);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1080px) {
+      .kpi-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 900px) {
+      .chart-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .chart-frame,
+      .chart-frame canvas {
+        min-height: 280px;
+        height: 280px;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .report-header {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+        gap: 12px;
+      }
+
+      .report-brand {
+        display: block;
+        margin: 6px 0 0;
+        font-size: 14px;
+      }
+
+      .report-meta {
+        min-width: 0;
+        text-align: left;
+      }
+
+      .kpi-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .panel-heading {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .table-wrap {
+        overflow: visible;
+      }
+
+      table,
+      tbody,
+      tr,
+      td {
+        display: block;
+        width: 100%;
+      }
+
+      thead {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+      }
+
+      tbody {
+        display: grid;
+        gap: 10px;
+      }
+
+      tbody tr {
+        padding: 8px 12px;
+        border: 1px solid var(--report-color-border-default);
+        border-radius: var(--report-radius-control);
+        background: var(--report-color-surface-panel);
+      }
+
+      tbody tr[data-partial="true"] {
+        background: var(--report-color-status-caution-soft);
+      }
+
+      tbody tr[data-partial="true"] td {
+        background: transparent;
+      }
+
+      td,
+      td[data-align="right"] {
+        display: grid;
+        grid-template-columns: minmax(92px, .8fr) minmax(0, 1.2fr);
+        gap: 12px;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--report-color-border-default);
+        text-align: right;
+      }
+
+      td::before {
+        content: attr(data-label);
+        color: var(--report-color-content-muted);
+        font-size: 12px;
+        font-weight: 500;
+        text-align: left;
+      }
+
+      tbody tr td:last-child {
+        border-bottom: 0;
+      }
+
+      .rank-marker {
+        margin-left: auto;
+      }
+
+      .report-footer {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .kpi-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .kpi-value {
+        min-height: auto;
+      }
+
+      .chart-frame,
+      .chart-frame canvas {
+        min-height: 250px;
+        height: 250px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto;
+        transition-duration: .01ms;
+        animation-duration: .01ms;
+        animation-iteration-count: 1;
+      }
+    }
+
+    @media print {
+      @page {
+        size: A4 landscape;
+        margin: 12mm;
+      }
+
+      html,
+      body {
+        background: var(--report-color-surface-panel);
+      }
+
+      body {
+        padding: 0;
+      }
+
+      .report-shell {
+        width: 100%;
+        max-width: none;
+      }
+
+      .kpi-card,
+      .panel {
+        box-shadow: none;
+        break-inside: avoid;
+      }
+
+      .chart-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 40px;
+      }
+
+      .report-footer {
+        break-before: avoid;
+      }
+    }
+    /* ── 星星電力 additions ───────────────────────────────────────────────────
+       The tokens, panels, tables and KPI cards above are shared verbatim with
+       the starcharger report, so the two read as one design system. What SS
+       needs on top is structural: this report is six independent tool
+       dossiers rather than one monthly series, so it gets a section rule, a
+       two-up split for paired panels (the sell/purchase funnels), a status
+       pill for construction work items, and an inline progress bar.
+       ──────────────────────────────────────────────────────────────────────── */
+
+    .tool-section {
+      margin-top: 28px;
+    }
+
+    .tool-section:first-of-type {
+      margin-top: 20px;
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--report-color-border-strong);
+    }
+
+    .section-title {
+      margin: 0;
+      color: var(--report-color-content-primary);
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: -.02em;
+      line-height: 1.35;
+    }
+
+    .section-title .section-tool {
+      margin-left: 8px;
+      color: var(--report-color-content-muted);
+      font-family: var(--report-font-data);
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    .section-context {
+      flex: none;
+      color: var(--report-color-content-secondary);
+      font-size: 12px;
+    }
+
+    .split-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .split-grid + .panel-full {
+      margin-top: 16px;
+    }
+
+    .status-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--report-color-surface-strong);
+      color: var(--report-color-content-secondary);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .status-pill[data-status="done"] {
+      background: var(--report-color-status-positive-soft);
+      color: var(--report-color-status-positive);
+    }
+
+    .status-pill[data-status="active"] {
+      background: var(--report-color-accent-soft);
+      color: var(--report-color-accent-primary);
+    }
+
+    .status-pill[data-status="pending"] {
+      background: var(--report-color-surface-strong);
+      color: var(--report-color-content-muted);
+    }
+
+    .progress {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      min-width: 116px;
+    }
+
+    .progress-track {
+      height: 6px;
+      border-radius: 999px;
+      background: var(--report-color-surface-strong);
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 999px;
+      background: var(--report-color-accent-primary);
+    }
+
+    .progress-value {
+      color: var(--report-color-content-secondary);
+      font-family: var(--report-font-data);
+      font-size: 12px;
+    }
+
+    .unverified {
+      color: var(--report-color-content-muted);
+      font-size: 11px;
+    }
+
+    .subpanel-title {
+      margin: 20px 0 12px;
+      color: var(--report-color-content-secondary);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .subpanel-title:first-child {
+      margin-top: 0;
+    }
+
+    .empty-note {
+      margin: 0;
+      padding: 14px;
+      border-radius: var(--report-radius-control);
+      background: var(--report-color-surface-subtle);
+      color: var(--report-color-content-muted);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      .split-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    @media (max-width: 720px) {
+      .section-heading {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 4px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="report-shell">
+    <header class="report-header">
+      <div>
+        <p class="report-organization" id="report-organization"></p>
+        <h1 class="report-title">
+          <span id="report-title"></span>
+          <span class="report-brand" id="report-brand"></span>
+        </h1>
+      </div>
+      <p class="report-meta">
+        <strong id="report-period"></strong><br>
+        報告產出 <time id="report-as-of"></time>
+      </p>
+    </header>
+
+    <section class="kpi-grid" id="kpi-grid" aria-label="重點指標"></section>
+
+    <section class="panel panel-full insight-panel" id="insight-panel" aria-labelledby="insight-title" hidden>
+      <div class="panel-heading">
+        <h2 class="panel-title" id="insight-title">營運洞察</h2>
+      </div>
+      <p class="insight-headline" id="insight-headline"></p>
+      <div class="insight-body" id="insight-body"></div>
+    </section>
+
+    <!-- ss_sunshine_hours ------------------------------------------------- -->
+    <section class="tool-section" id="solar-section" aria-labelledby="solar-title" hidden>
+      <div class="section-heading">
+        <h2 class="section-title" id="solar-title">日照資源<span class="section-tool">ss_sunshine_hours</span></h2>
+        <span class="section-context" id="solar-context"></span>
+      </div>
+      <article class="panel panel-full">
+        <div class="panel-heading">
+          <h3 class="panel-title">各站日照時數與去年同季基準</h3>
+          <span class="panel-context">小時</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="solar">
+          <canvas id="solar-chart" role="img" aria-label="各氣象站本季與去年同季日照時數對照長條圖">各站日照時數</canvas>
+        </div>
+      </article>
+      <article class="panel panel-full">
+        <div class="panel-heading">
+          <h3 class="panel-title">測站明細</h3>
+          <span class="panel-context">依本季時數排序</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>各氣象站日照時數</caption>
+            <thead>
+              <tr>
+                <th scope="col">站點</th>
+                <th scope="col">站號</th>
+                <th scope="col" data-align="right">本期時數</th>
+                <th scope="col" data-align="right">去年同期</th>
+                <th scope="col" data-align="right">年增率</th>
+                <th scope="col" data-align="right">前一期</th>
+                <th scope="col" data-align="right">期間變化</th>
+              </tr>
+            </thead>
+            <tbody id="solar-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- ss_energy_storage ------------------------------------------------- -->
+    <section class="tool-section" id="storage-section" aria-labelledby="storage-title" hidden>
+      <div class="section-heading">
+        <h2 class="section-title" id="storage-title">儲能調度與案場收益<span class="section-tool">ss_energy_storage</span></h2>
+        <span class="section-context" id="storage-context"></span>
+      </div>
+      <div class="chart-grid">
+        <article class="panel" id="storage-bid-panel" hidden>
+          <div class="panel-heading">
+            <h3 class="panel-title">投標容量與市場得標率</h3>
+            <span class="panel-context">MW / %</span>
+          </div>
+          <div class="chart-frame" data-chart-frame="storage-bid">
+            <canvas id="storage-bid-chart" role="img" aria-label="各期投標容量與市場得標率組合圖">投標容量與得標率</canvas>
+          </div>
+        </article>
+        <article class="panel" id="storage-income-panel" hidden>
+          <div class="panel-heading">
+            <h3 class="panel-title">案場服務收入估算</h3>
+            <span class="panel-context" id="storage-income-unit"></span>
+          </div>
+          <div class="chart-frame" data-chart-frame="storage-income">
+            <canvas id="storage-income-chart" role="img" aria-label="各案場服務收入估算長條圖">案場服務收入</canvas>
+          </div>
+        </article>
+      </div>
+      <article class="panel panel-full" id="storage-bid-table-panel" hidden>
+        <div class="panel-heading">
+          <h3 class="panel-title">投標統計明細</h3>
+          <span class="panel-context">依期別排序</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>FTM 投標統計</caption>
+            <thead>
+              <tr>
+                <th scope="col">期別</th>
+                <th scope="col" data-align="right">市場供給 MW</th>
+                <th scope="col" data-align="right">市場得標 MW</th>
+                <th scope="col" data-align="right">得標率</th>
+                <th scope="col" data-align="right">本平台投標 MW</th>
+                <th scope="col" data-align="right">未得標 MW</th>
+                <th scope="col" data-align="right">結清價格</th>
+              </tr>
+            </thead>
+            <tbody id="storage-bid-body"></tbody>
+          </table>
+        </div>
+      </article>
+      <article class="panel panel-full" id="storage-case-table-panel" hidden>
+        <div class="panel-heading">
+          <h3 class="panel-title">案場收益明細</h3>
+          <span class="panel-context">依服務收入排序</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>案場收益估算</caption>
+            <thead>
+              <tr>
+                <th scope="col">期別</th>
+                <th scope="col">案場</th>
+                <th scope="col">投資平台 / SPV</th>
+                <th scope="col" data-align="right">容量費</th>
+                <th scope="col" data-align="right">電能服務費</th>
+                <th scope="col" data-align="right">效能服務費</th>
+                <th scope="col" data-align="right">服務收入合計</th>
+              </tr>
+            </thead>
+            <tbody id="storage-case-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- ss_power_wheeling ------------------------------------------------- -->
+    <section class="tool-section" id="wheeling-section" aria-labelledby="wheeling-title" hidden>
+      <div class="section-heading">
+        <h2 class="section-title" id="wheeling-title">綠電轉供與收益<span class="section-tool">ss_power_wheeling</span></h2>
+        <span class="section-context" id="wheeling-context"></span>
+      </div>
+      <article class="panel panel-full">
+        <div class="panel-heading">
+          <h3 class="panel-title">各案場發電量與轉供量</h3>
+          <span class="panel-context">kWh</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="wheeling">
+          <canvas id="wheeling-chart" role="img" aria-label="各案場發電量與轉供量對照長條圖">發電量與轉供量</canvas>
+        </div>
+      </article>
+      <article class="panel panel-full">
+        <div class="panel-heading">
+          <h3 class="panel-title">轉供明細</h3>
+          <span class="panel-context" id="wheeling-rows"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>綠電轉供明細</caption>
+            <thead>
+              <tr>
+                <th scope="col">期別</th>
+                <th scope="col">案場</th>
+                <th scope="col" data-align="right">契約容量 kW</th>
+                <th scope="col" data-align="right">發電量</th>
+                <th scope="col" data-align="right">轉供量</th>
+                <th scope="col" data-align="right">未轉供餘量</th>
+                <th scope="col" data-align="right">轉供率</th>
+                <th scope="col" data-align="right">費用（未稅）</th>
+              </tr>
+            </thead>
+            <tbody id="wheeling-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- ss_power_pipeline ------------------------------------------------- -->
+    <section class="tool-section" id="pipeline-section" aria-labelledby="pipeline-title" hidden>
+      <div class="section-heading">
+        <h2 class="section-title" id="pipeline-title">購售電開發漏斗<span class="section-tool">ss_power_pipeline</span></h2>
+        <span class="section-context" id="pipeline-context"></span>
+      </div>
+      <div class="split-grid">
+        <article class="panel" id="sell-panel" hidden>
+          <div class="panel-heading">
+            <h3 class="panel-title">售電漏斗</h3>
+            <span class="panel-context" id="sell-unit"></span>
+          </div>
+          <div class="chart-frame" data-chart-frame="sell">
+            <canvas id="sell-chart" role="img" aria-label="售電開發漏斗各階段量體橫條圖">售電漏斗</canvas>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <caption>售電漏斗各階段</caption>
+              <thead>
+                <tr>
+                  <th scope="col">階段</th>
+                  <th scope="col" data-align="right">案數</th>
+                  <th scope="col" data-align="right">量體</th>
+                  <th scope="col" data-align="right">佔比</th>
+                </tr>
+              </thead>
+              <tbody id="sell-body"></tbody>
+            </table>
+          </div>
+        </article>
+        <article class="panel" id="purchase-panel" hidden>
+          <div class="panel-heading">
+            <h3 class="panel-title">購電漏斗</h3>
+            <span class="panel-context" id="purchase-unit"></span>
+          </div>
+          <div class="chart-frame" data-chart-frame="purchase">
+            <canvas id="purchase-chart" role="img" aria-label="購電開發漏斗各階段容量橫條圖">購電漏斗</canvas>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <caption>購電漏斗各階段</caption>
+              <thead>
+                <tr>
+                  <th scope="col">階段</th>
+                  <th scope="col" data-align="right">案數</th>
+                  <th scope="col" data-align="right">容量</th>
+                  <th scope="col" data-align="right">佔比</th>
+                </tr>
+              </thead>
+              <tbody id="purchase-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+      <aside class="data-note" aria-label="口徑說明">
+        <span class="data-note-label">口徑</span>
+        <span>售電漏斗以電量（kWh）衡量、購電漏斗以容量（kW）衡量，兩者單位不同，不可直接相加或比較。本節為呼叫當下的階段快照，非期間報表。</span>
+      </aside>
+    </section>
+
+    <!-- ss_btm_projects --------------------------------------------------- -->
+    <section class="tool-section" id="btm-section" aria-labelledby="btm-title" hidden>
+      <div class="section-heading">
+        <h2 class="section-title" id="btm-title">表後（BTM）案源<span class="section-tool">ss_btm_projects</span></h2>
+        <span class="section-context" id="btm-context"></span>
+      </div>
+      <div class="split-grid">
+        <article class="panel" id="btm-potential-panel" hidden>
+          <div class="panel-heading">
+            <h3 class="panel-title">潛在案件</h3>
+            <span class="panel-context">MW</span>
+          </div>
+          <div class="chart-frame" data-chart-frame="btm">
+            <canvas id="btm-chart" role="img" aria-label="表後潛在案件各階段容量橫條圖">潛在案件各階段容量</canvas>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <caption>BTM 潛在案件各階段</caption>
+              <thead>
+                <tr>
+                  <th scope="col">階段</th>
+                  <th scope="col" data-align="right">件數</th>
+                  <th scope="col" data-align="right">容量 MW</th>
+                  <th scope="col" data-align="right">佔比</th>
+                </tr>
+              </thead>
+              <tbody id="btm-potential-body"></tbody>
+            </table>
+          </div>
+        </article>
+        <article class="panel" id="btm-spark-panel" hidden>
+          <div class="panel-heading">
+            <h3 class="panel-title">星展50計畫</h3>
+            <span class="panel-context">件 / 人</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <caption>星展50計畫各階段</caption>
+              <thead>
+                <tr>
+                  <th scope="col">階段</th>
+                  <th scope="col" data-align="right">件數</th>
+                  <th scope="col" data-align="right">人數</th>
+                  <th scope="col" data-align="right">佔比</th>
+                </tr>
+              </thead>
+              <tbody id="btm-spark-body"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ss_ftm_projects --------------------------------------------------- -->
+    <section class="tool-section" id="ftm-section" aria-labelledby="ftm-title" hidden>
+      <div class="section-heading">
+        <h2 class="section-title" id="ftm-title">表前（FTM）建置工程<span class="section-tool">ss_ftm_projects</span></h2>
+        <span class="section-context" id="ftm-context"></span>
+      </div>
+      <article class="panel panel-full">
+        <div class="panel-heading">
+          <h3 class="panel-title">各案整案完成率</h3>
+          <span class="panel-context">%</span>
+        </div>
+        <div class="chart-frame" data-chart-frame="ftm">
+          <canvas id="ftm-chart" role="img" aria-label="各建置案整案完成率橫條圖">各案完成率</canvas>
+        </div>
+      </article>
+      <article class="panel panel-full">
+        <div class="panel-heading">
+          <h3 class="panel-title">案件明細</h3>
+          <span class="panel-context">依容量排序</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>FTM 建置案件</caption>
+            <thead>
+              <tr>
+                <th scope="col">案件</th>
+                <th scope="col">案件編號</th>
+                <th scope="col" data-align="right">容量 MW</th>
+                <th scope="col" data-align="right">整案完成率</th>
+                <th scope="col">預計起訖</th>
+                <th scope="col">案件備註</th>
+              </tr>
+            </thead>
+            <tbody id="ftm-project-body"></tbody>
+          </table>
+        </div>
+      </article>
+      <article class="panel panel-full" id="ftm-stage-panel" hidden>
+        <div class="panel-heading">
+          <h3 class="panel-title">工項進度</h3>
+          <span class="panel-context">依案件分組</span>
+        </div>
+        <div id="ftm-stage-groups"></div>
+      </article>
+      <article class="panel panel-full" id="ftm-receivable-panel" hidden>
+        <div class="panel-heading">
+          <h3 class="panel-title">待收請款</h3>
+          <span class="panel-context" id="ftm-receivable-total"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <caption>待收請款</caption>
+            <thead>
+              <tr>
+                <th scope="col">案件</th>
+                <th scope="col">工項</th>
+                <th scope="col">備註</th>
+                <th scope="col">預計收款日</th>
+                <th scope="col" data-align="right">金額</th>
+              </tr>
+            </thead>
+            <tbody id="ftm-receivable-body"></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel panel-full" aria-labelledby="data-note-title">
+      <div class="panel-heading">
+        <h2 class="panel-title" id="data-note-title">資料說明與限制</h2>
+      </div>
+      <aside class="data-note" aria-label="資料說明">
+        <span class="data-note-label">資料說明</span>
+        <span id="report-data-note"></span>
+      </aside>
+      <aside class="data-note" aria-label="期間口徑">
+        <span class="data-note-label">期間口徑</span>
+        <span id="report-scope-note"></span>
+      </aside>
+    </section>
+
+    <footer class="report-footer">
+      <span id="report-footer-range"></span>
+      <span>由 星星電力 Report Builder 產生</span>
+    </footer>
+  </main>
+
+  <noscript>此報表需要 JavaScript 才能顯示圖表與資料表。</noscript>
+  <script type="application/json" id="report-data">__REPORT_DATA_JSON__</script>
+  <script>
+    (() => {
+      'use strict'
+
+      const data = JSON.parse(document.getElementById('report-data').textContent)
+      const meta = data.report || {}
+      const locale = meta.locale || 'zh-TW'
+
+      // ── formatters ────────────────────────────────────────────────────────
+      const int0 = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 })
+      const dec1 = new Intl.NumberFormat(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+      const dec2 = new Intl.NumberFormat(locale, { maximumFractionDigits: 2 })
+      const compact = new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 })
+      const currencyLabel = meta.currency === 'TWD' ? 'NT$' : (meta.currency || '')
+      const money = (v) => `${currencyLabel} ${int0.format(Number(v) || 0)}`
+      const pct = (v) => `${dec1.format(Number(v) || 0)}%`
+      const signedPct = (v) => {
+        const n = Number(v) || 0
+        return `${n > 0 ? '+' : ''}${dec1.format(n)}%`
+      }
+      const dash = (v) => (v === null || v === undefined || v === '' ? '—' : String(v))
+
+      const setText = (id, value) => {
+        const el = document.getElementById(id)
+        if (el) el.textContent = String(value ?? '')
+      }
+      const show = (id) => {
+        const el = document.getElementById(id)
+        if (el) el.hidden = false
+      }
+      const rows = (section, key) => {
+        const list = ((data[section] || {})[key])
+        return Array.isArray(list) ? list : []
+      }
+      const sum = (list, pick) => list.reduce((acc, item) => acc + (Number(pick(item)) || 0), 0)
+
+      // ── header ────────────────────────────────────────────────────────────
+      document.documentElement.lang = locale
+      document.title = `${meta.organization || ''} ${meta.title || ''}`.trim()
+      setText('report-organization', meta.organization)
+      setText('report-title', meta.title)
+      setText('report-brand', meta.brand)
+      setText('report-period', meta.periodLabel)
+      setText('report-as-of', meta.asOf)
+      setText('report-data-note', meta.dataNote)
+      setText('report-footer-range', `${meta.periodLabel || ''}　·　${meta.snapshotLabel || ''}`)
+      setText(
+        'report-scope-note',
+        `日照、儲能、綠電轉供三節依查詢期間擷取（${meta.periodLabel || '—'}），其中儲能與轉供為年初至該期的累計值；購售電漏斗、BTM 案源與 FTM 工程三節不接受期間參數，為${meta.snapshotLabel || '呼叫當下'}的全量狀態，兩者不可合併為同一個期間敘事。`,
+      )
+      const asOf = document.getElementById('report-as-of')
+      if (asOf && meta.asOf) asOf.dateTime = meta.asOf
+
+      // ── insight ───────────────────────────────────────────────────────────
+      const insight = data.insight || {}
+      const paragraphs = Array.isArray(insight.paragraphs) ? insight.paragraphs : []
+      if (insight.headline || paragraphs.length) {
+        show('insight-panel')
+        setText('insight-headline', insight.headline || '')
+        const body = document.getElementById('insight-body')
+        paragraphs.forEach((text) => {
+          const p = document.createElement('p')
+          p.textContent = String(text)
+          body.append(p)
+        })
+      }
+
+      // ── section data ──────────────────────────────────────────────────────
+      const stations = rows('solar', 'stations')
+      const bids = rows('storage', 'bids')
+      const cases = rows('storage', 'cases')
+      const wheelSites = rows('wheeling', 'sites')
+      const sell = rows('pipeline', 'sell')
+      const purchase = rows('pipeline', 'purchase')
+      const btmPotential = rows('btm', 'potential')
+      const btmSpark = rows('btm', 'starSpark')
+      const ftmProjects = rows('ftm', 'projects')
+      const ftmStages = rows('ftm', 'stages')
+      const ftmReceivables = rows('ftm', 'receivables')
+
+      // ── KPI cards, computed here rather than authored ─────────────────────
+      // Deriving them from the section rows means a KPI can never disagree with the table under
+      // it, and a KPI whose section was not fetched simply never appears.
+      const kpis = []
+      if (stations.length) {
+        const current = sum(stations, (s) => s.currentHours)
+        const prevYear = sum(stations, (s) => s.prevYearHours)
+        const yoy = prevYear === 0 ? 0 : ((current - prevYear) / prevYear) * 100
+        const behind = stations.filter((s) => (Number(s.currentHours) || 0) < (Number(s.prevYearHours) || 0)).length
+        kpis.push({
+          label: `${stations.length} 站日照合計`,
+          value: `${dec1.format(current)} 小時`,
+          detail: `年增率 ${signedPct(yoy)}　·　低於去年同期 ${behind} / ${stations.length} 站`,
+          tone: yoy >= 0 ? 'positive' : 'negative',
+        })
+      }
+      if (cases.length) {
+        const income = sum(cases, (c) => c.serviceIncome)
+        const unverified = cases.filter((c) => c.verified === false).length
+        kpis.push({
+          label: '儲能服務收入合計（估算）',
+          value: money(income),
+          detail: `${data.storage.label || ''} ${cases.length} 筆${unverified ? `　·　未驗證 ${unverified} 筆` : ''}`,
+          tone: 'neutral',
+        })
+      }
+      if (wheelSites.length) {
+        const generation = sum(wheelSites, (s) => s.generationKwh)
+        const wheeled = sum(wheelSites, (s) => s.wheeledKwh)
+        const rate = generation === 0 ? 0 : (wheeled / generation) * 100
+        // The detail table is capped, so this total covers only the rows we actually hold. Saying
+        // "綠電轉供量" unqualified would state a platform-wide figure derived from a subset — the
+        // label has to carry the scope, or the KPI is simply wrong.
+        const wheelTotalRows = Number(data.wheeling.totalRows) || wheelSites.length
+        const capped = wheelTotalRows > wheelSites.length
+        kpis.push({
+          label: capped ? `綠電轉供量（前 ${int0.format(wheelSites.length)} 大案場）` : '綠電轉供量',
+          value: `${int0.format(wheeled)} kWh`,
+          detail: capped
+            ? `轉供率 ${dec2.format(rate)}%　·　僅計已列 ${int0.format(wheelSites.length)} / ${int0.format(wheelTotalRows)} 筆，非全平台合計`
+            : `轉供率 ${dec2.format(rate)}%　·　費用（未稅）${money(sum(wheelSites, (s) => s.feeUntaxed))}`,
+          tone: 'neutral',
+        })
+      }
+      if (purchase.length) {
+        const top = [...purchase].sort((a, b) => (Number(b.quantity) || 0) - (Number(a.quantity) || 0))[0]
+        kpis.push({
+          label: `購電漏斗最大階段（${data.pipeline.purchaseUnit || 'kW'}）`,
+          value: `${dec2.format(Number(top.quantity) || 0)}`,
+          detail: `${top.stage}　·　${int0.format(Number(top.cases) || 0)} 案　·　佔 ${dec2.format(Number(top.sharePct) || 0)}%`,
+          tone: 'neutral',
+          kind: 'name',
+        })
+      }
+      if (btmPotential.length) {
+        kpis.push({
+          label: 'BTM 潛在案源容量',
+          value: `${dec2.format(sum(btmPotential, (s) => s.quantity))} MW`,
+          detail: `${int0.format(sum(btmPotential, (s) => s.cases))} 件　·　${btmPotential.length} 階段`,
+          tone: 'neutral',
+        })
+      }
+      if (ftmProjects.length) {
+        kpis.push({
+          label: 'FTM 在建容量',
+          value: `${dec1.format(sum(ftmProjects, (p) => p.capacityMw))} MW`,
+          detail: `${ftmProjects.length} 案${ftmReceivables.length ? `　·　待收 ${money(sum(ftmReceivables, (r) => r.amount))}` : ''}`,
+          tone: 'neutral',
+        })
+      }
+
+      const kpiGrid = document.getElementById('kpi-grid')
+      kpis.forEach((item) => {
+        const card = document.createElement('article')
+        card.className = 'kpi-card'
+        if (item.kind) card.dataset.kind = item.kind
+        const label = document.createElement('p')
+        label.className = 'kpi-label'
+        label.textContent = item.label
+        const value = document.createElement('p')
+        value.className = 'kpi-value'
+        value.textContent = item.value
+        const detail = document.createElement('p')
+        detail.className = 'kpi-detail'
+        detail.dataset.tone = item.tone
+        detail.textContent = item.detail
+        card.append(label, value, detail)
+        kpiGrid.append(card)
+      })
+
+      // ── table helpers ─────────────────────────────────────────────────────
+      const cell = (label, value, align = 'left') => {
+        const td = document.createElement('td')
+        td.dataset.label = label
+        td.dataset.align = align
+        if (value instanceof Node) td.append(value)
+        else td.textContent = String(value)
+        return td
+      }
+      const toned = (td, positive) => {
+        td.classList.add(positive ? 'value-positive' : 'value-negative')
+        return td
+      }
+      const progress = (percent) => {
+        const wrap = document.createElement('span')
+        wrap.className = 'progress'
+        const track = document.createElement('span')
+        track.className = 'progress-track'
+        const fill = document.createElement('span')
+        fill.className = 'progress-fill'
+        fill.style.width = `${Math.max(0, Math.min(100, Number(percent) || 0))}%`
+        track.append(fill)
+        const value = document.createElement('span')
+        value.className = 'progress-value'
+        value.textContent = `${dec1.format(Number(percent) || 0)}%`
+        wrap.append(track, value)
+        return wrap
+      }
+      const statusPill = (status) => {
+        const pill = document.createElement('span')
+        pill.className = 'status-pill'
+        const text = String(status || '')
+        pill.dataset.status = text.includes('完成') ? 'done' : text.includes('進行') ? 'active' : 'pending'
+        pill.textContent = text || '—'
+        return pill
+      }
+      const fill = (id, list, build) => {
+        const body = document.getElementById(id)
+        if (!body) return
+        list.forEach((item) => body.append(build(item)))
+      }
+
+      // ── ss_sunshine_hours ─────────────────────────────────────────────────
+      if (stations.length) {
+        show('solar-section')
+        setText('solar-context', data.solar.label || meta.periodLabel)
+        fill('solar-body', stations, (s) => {
+          const tr = document.createElement('tr')
+          tr.append(
+            cell('站點', s.name),
+            cell('站號', s.stationId),
+            cell('本期時數', dec1.format(Number(s.currentHours) || 0), 'right'),
+            cell('去年同期', dec1.format(Number(s.prevYearHours) || 0), 'right'),
+            toned(cell('年增率', signedPct(s.yoyPct), 'right'), (Number(s.yoyPct) || 0) >= 0),
+            cell('前一期', dec1.format(Number(s.prevPeriodHours) || 0), 'right'),
+            toned(cell('期間變化', signedPct(s.periodChangePct), 'right'), (Number(s.periodChangePct) || 0) >= 0),
+          )
+          return tr
+        })
+      }
+
+      // ── ss_energy_storage ─────────────────────────────────────────────────
+      if (bids.length || cases.length) {
+        show('storage-section')
+        setText('storage-context', data.storage.label || meta.periodLabel)
+      }
+      if (bids.length) {
+        show('storage-bid-panel')
+        show('storage-bid-table-panel')
+        fill('storage-bid-body', bids, (b) => {
+          const tr = document.createElement('tr')
+          tr.append(
+            cell('期別', b.period),
+            cell('市場供給 MW', dec2.format(Number(b.marketSupplyMw) || 0), 'right'),
+            cell('市場得標 MW', dec2.format(Number(b.marketClearedMw) || 0), 'right'),
+            cell('得標率', pct(b.winRatePct), 'right'),
+            cell('本平台投標 MW', dec2.format(Number(b.platformBidMw) || 0), 'right'),
+            cell('未得標 MW', dec2.format(Number(b.platformLostMw) || 0), 'right'),
+            cell('結清價格', dec2.format(Number(b.clearingPrice) || 0), 'right'),
+          )
+          return tr
+        })
+      }
+      if (cases.length) {
+        show('storage-income-panel')
+        show('storage-case-table-panel')
+        setText('storage-income-unit', currencyLabel)
+        fill('storage-case-body', cases, (c) => {
+          const tr = document.createElement('tr')
+          const nameCell = cell('案場', c.case)
+          if (c.verified === false) {
+            const flag = document.createElement('span')
+            flag.className = 'unverified'
+            flag.textContent = '　未驗證'
+            nameCell.append(flag)
+          }
+          tr.append(
+            cell('期別', c.period),
+            nameCell,
+            cell('投資平台 / SPV', c.platform),
+            cell('容量費', money(c.capacityFee), 'right'),
+            cell('電能服務費', money(c.energyFee), 'right'),
+            cell('效能服務費', money(c.performanceFee), 'right'),
+            cell('服務收入合計', money(c.serviceIncome), 'right'),
+          )
+          return tr
+        })
+      }
+
+      // ── ss_power_wheeling ─────────────────────────────────────────────────
+      if (wheelSites.length) {
+        show('wheeling-section')
+        setText('wheeling-context', data.wheeling.label || meta.periodLabel)
+        // Disclose a capped table. `ss_power_wheeling` multiplies sites by periods, so the detail
+        // table is capped by design — but a reader must be able to see that it was.
+        const wheelTotal = Number(data.wheeling.totalRows) || wheelSites.length
+        setText(
+          'wheeling-rows',
+          wheelTotal > wheelSites.length
+            ? `依發電量排序，顯示前 ${int0.format(wheelSites.length)} 筆，共 ${int0.format(wheelTotal)} 筆`
+            : `依發電量排序，共 ${int0.format(wheelSites.length)} 筆`,
+        )
+        fill('wheeling-body', wheelSites, (s) => {
+          const tr = document.createElement('tr')
+          tr.append(
+            cell('期別', s.period),
+            cell('案場', s.site),
+            cell('契約容量 kW', dec2.format(Number(s.contractKw) || 0), 'right'),
+            cell('發電量', int0.format(Number(s.generationKwh) || 0), 'right'),
+            cell('轉供量', int0.format(Number(s.wheeledKwh) || 0), 'right'),
+            cell('未轉供餘量', int0.format(Number(s.retainedKwh) || 0), 'right'),
+            cell('轉供率', `${dec2.format(Number(s.wheelingRatePct) || 0)}%`, 'right'),
+            cell('費用（未稅）', money(s.feeUntaxed), 'right'),
+          )
+          return tr
+        })
+      }
+
+      // ── ss_power_pipeline ─────────────────────────────────────────────────
+      const funnelRow = (stage, unit, quantityFormat) => {
+        const tr = document.createElement('tr')
+        tr.append(
+          cell('階段', stage.stage),
+          cell('案數', int0.format(Number(stage.cases) || 0), 'right'),
+          cell(unit, quantityFormat(Number(stage.quantity) || 0), 'right'),
+          cell('佔比', `${dec2.format(Number(stage.sharePct) || 0)}%`, 'right'),
+        )
+        return tr
+      }
+      if (sell.length || purchase.length) {
+        show('pipeline-section')
+        setText('pipeline-context', data.pipeline.label || meta.snapshotLabel)
+      }
+      if (sell.length) {
+        show('sell-panel')
+        setText('sell-unit', data.pipeline.sellUnit || 'kWh')
+        fill('sell-body', sell, (s) => funnelRow(s, '量體', (v) => int0.format(v)))
+      }
+      if (purchase.length) {
+        show('purchase-panel')
+        setText('purchase-unit', data.pipeline.purchaseUnit || 'kW')
+        fill('purchase-body', purchase, (s) => funnelRow(s, '容量', (v) => dec2.format(v)))
+      }
+
+      // ── ss_btm_projects ───────────────────────────────────────────────────
+      if (btmPotential.length || btmSpark.length) {
+        show('btm-section')
+        setText('btm-context', data.btm.label || meta.snapshotLabel)
+      }
+      if (btmPotential.length) {
+        show('btm-potential-panel')
+        fill('btm-potential-body', btmPotential, (s) => funnelRow(s, '容量 MW', (v) => dec2.format(v)))
+      }
+      if (btmSpark.length) {
+        show('btm-spark-panel')
+        fill('btm-spark-body', btmSpark, (s) => funnelRow(s, '人數', (v) => int0.format(v)))
+      }
+
+      // ── ss_ftm_projects ───────────────────────────────────────────────────
+      if (ftmProjects.length) {
+        show('ftm-section')
+        setText('ftm-context', data.ftm.label || meta.snapshotLabel)
+        fill('ftm-project-body', ftmProjects, (p) => {
+          const tr = document.createElement('tr')
+          tr.append(
+            cell('案件', p.name),
+            cell('案件編號', p.code),
+            cell('容量 MW', dec1.format(Number(p.capacityMw) || 0), 'right'),
+            cell('整案完成率', progress(p.completionPct), 'right'),
+            cell('預計起訖', `${dash(p.plannedFrom)} → ${dash(p.plannedTo)}`),
+            cell('案件備註', dash(p.note)),
+          )
+          return tr
+        })
+      }
+      if (ftmStages.length) {
+        show('ftm-stage-panel')
+        const groups = document.getElementById('ftm-stage-groups')
+        // Group the flat stage rows back under their project. A stage naming a project that is not
+        // in `projects` still gets its own heading rather than being dropped — an orphan row is
+        // data the composer sent, and silently discarding it would hide the inconsistency.
+        const order = ftmProjects.map((p) => p.name)
+        const seen = [...new Set(ftmStages.map((s) => s.project))]
+        const ordered = [...order.filter((n) => seen.includes(n)), ...seen.filter((n) => !order.includes(n))]
+        ordered.forEach((project) => {
+          const title = document.createElement('h4')
+          title.className = 'subpanel-title'
+          title.textContent = project || '（未指定案件）'
+          const wrap = document.createElement('div')
+          wrap.className = 'table-wrap'
+          const table = document.createElement('table')
+          const caption = document.createElement('caption')
+          caption.textContent = `${project} 工項進度`
+          const thead = document.createElement('thead')
+          const headRow = document.createElement('tr')
+          ;[['工項', 'left'], ['狀態', 'left'], ['完成率', 'right'], ['預計完成', 'left'], ['備註', 'left']].forEach(([text, align]) => {
+            const th = document.createElement('th')
+            th.scope = 'col'
+            th.textContent = text
+            if (align === 'right') th.dataset.align = 'right'
+            headRow.append(th)
+          })
+          thead.append(headRow)
+          const tbody = document.createElement('tbody')
+          ftmStages.filter((s) => s.project === project).forEach((s) => {
+            const tr = document.createElement('tr')
+            tr.append(
+              cell('工項', s.stage),
+              cell('狀態', statusPill(s.status)),
+              cell('完成率', progress(s.completionPct), 'right'),
+              cell('預計完成', dash(s.plannedFinish)),
+              cell('備註', dash(s.note)),
+            )
+            tbody.append(tr)
+          })
+          table.append(caption, thead, tbody)
+          wrap.append(table)
+          groups.append(title, wrap)
+        })
+      }
+      if (ftmReceivables.length) {
+        show('ftm-receivable-panel')
+        setText('ftm-receivable-total', `合計 ${money(sum(ftmReceivables, (r) => r.amount))}`)
+        fill('ftm-receivable-body', ftmReceivables, (r) => {
+          const tr = document.createElement('tr')
+          tr.append(
+            cell('案件', r.project),
+            cell('工項', r.stage),
+            cell('備註', dash(r.note)),
+            cell('預計收款日', dash(r.expectedDate)),
+            cell('金額', money(r.amount), 'right'),
+          )
+          return tr
+        })
+      }
+
+      // ── charts ────────────────────────────────────────────────────────────
+      if (!window.Chart) {
+        document.querySelectorAll('[data-chart-frame]').forEach((frame) => {
+          frame.replaceChildren()
+          const fallback = document.createElement('p')
+          fallback.className = 'chart-fallback'
+          fallback.textContent = '圖表元件載入失敗，請檢查網路後重新開啟報表。'
+          frame.append(fallback)
+        })
+        return
+      }
+
+      const token = (path) => getComputedStyle(document.documentElement)
+        .getPropertyValue(`--report-${path}`)
+        .trim()
+
+      Chart.defaults.animation = false
+      Chart.defaults.color = token('color-content-secondary')
+      Chart.defaults.font.family = token('font-body')
+      Chart.defaults.font.size = 11
+
+      const accent = token('color-accent-primary')
+      const accentMuted = token('color-accent-muted')
+      const neutral = token('color-chart-neutral')
+      const neutralDark = token('color-chart-neutral-dark')
+      const grid = token('color-chart-grid')
+
+      const plugins = {
+        legend: {
+          position: 'top',
+          align: 'center',
+          labels: { boxWidth: 9, boxHeight: 9, padding: 10, usePointStyle: true },
+        },
+        tooltip: {
+          backgroundColor: token('color-content-primary'),
+          titleColor: token('color-content-inverse'),
+          bodyColor: token('color-content-inverse'),
+          padding: 10,
+        },
+      }
+      const verticalScales = {
+        x: { grid: { display: false }, border: { color: grid }, ticks: { maxRotation: 0, autoSkip: true } },
+        y: { beginAtZero: true, grid: { color: grid }, border: { display: false } },
+      }
+      const horizontalScales = {
+        x: { beginAtZero: true, grid: { color: grid }, border: { display: false }, ticks: { callback: (v) => compact.format(v) } },
+        y: { grid: { display: false }, border: { color: grid } },
+      }
+      const draw = (id, config) => {
+        const canvas = document.getElementById(id)
+        if (canvas) new Chart(canvas, config)
+      }
+      const base = { responsive: true, maintainAspectRatio: false }
+
+      if (stations.length) {
+        draw('solar-chart', {
+          type: 'bar',
+          data: {
+            labels: stations.map((s) => s.name),
+            datasets: [
+              { label: '本期時數', data: stations.map((s) => s.currentHours), backgroundColor: accent, borderWidth: 0, borderRadius: 4, maxBarThickness: 30 },
+              { label: '去年同期', data: stations.map((s) => s.prevYearHours), backgroundColor: neutral, borderWidth: 0, borderRadius: 4, maxBarThickness: 30 },
+            ],
+          },
+          options: { ...base, plugins, scales: verticalScales },
+        })
+      }
+
+      if (bids.length) {
+        draw('storage-bid-chart', {
+          type: 'bar',
+          data: {
+            labels: bids.map((b) => b.period),
+            datasets: [
+              { label: '本平台投標 MW', data: bids.map((b) => b.platformBidMw), backgroundColor: accentMuted, borderWidth: 0, borderRadius: 4, maxBarThickness: 42, yAxisID: 'y' },
+              { label: '未得標 MW', data: bids.map((b) => b.platformLostMw), backgroundColor: neutral, borderWidth: 0, borderRadius: 4, maxBarThickness: 42, yAxisID: 'y' },
+              { label: '市場得標率 %', type: 'line', data: bids.map((b) => b.winRatePct), borderColor: neutralDark, backgroundColor: neutralDark, pointRadius: 3, tension: .25, yAxisID: 'y1' },
+            ],
+          },
+          options: {
+            ...base,
+            plugins,
+            scales: {
+              ...verticalScales,
+              y1: { beginAtZero: true, position: 'right', grid: { drawOnChartArea: false }, border: { display: false }, ticks: { callback: (v) => `${v}%` } },
+            },
+          },
+        })
+      }
+
+      if (cases.length) {
+        // One bar per case, energy and performance fees stacked: the two estimated components are
+        // what actually vary, and stacking keeps the total readable beside them.
+        const byCase = new Map()
+        cases.forEach((c) => {
+          const key = String(c.case || '—')
+          const acc = byCase.get(key) || { energy: 0, performance: 0, capacity: 0 }
+          acc.energy += Number(c.energyFee) || 0
+          acc.performance += Number(c.performanceFee) || 0
+          acc.capacity += Number(c.capacityFee) || 0
+          byCase.set(key, acc)
+        })
+        const entries = [...byCase.entries()].sort(
+          (a, b) => (b[1].energy + b[1].performance + b[1].capacity) - (a[1].energy + a[1].performance + a[1].capacity),
+        )
+        draw('storage-income-chart', {
+          type: 'bar',
+          data: {
+            labels: entries.map(([name]) => name),
+            datasets: [
+              { label: '電能服務費', data: entries.map(([, v]) => v.energy), backgroundColor: accent, borderWidth: 0, maxBarThickness: 26, stack: 'income' },
+              { label: '效能服務費', data: entries.map(([, v]) => v.performance), backgroundColor: accentMuted, borderWidth: 0, maxBarThickness: 26, stack: 'income' },
+              { label: '容量費', data: entries.map(([, v]) => v.capacity), backgroundColor: neutral, borderWidth: 0, maxBarThickness: 26, stack: 'income' },
+            ],
+          },
+          options: {
+            ...base,
+            indexAxis: 'y',
+            plugins,
+            scales: { x: { ...horizontalScales.x, stacked: true }, y: { ...horizontalScales.y, stacked: true } },
+          },
+        })
+      }
+
+      if (wheelSites.length) {
+        // Aggregate across periods so one bar is one site; the table keeps the per-period rows.
+        const bySite = new Map()
+        wheelSites.forEach((s) => {
+          const key = String(s.site || '—')
+          const acc = bySite.get(key) || { generation: 0, wheeled: 0 }
+          acc.generation += Number(s.generationKwh) || 0
+          acc.wheeled += Number(s.wheeledKwh) || 0
+          bySite.set(key, acc)
+        })
+        const entries = [...bySite.entries()].sort((a, b) => b[1].generation - a[1].generation).slice(0, 15)
+        draw('wheeling-chart', {
+          type: 'bar',
+          data: {
+            labels: entries.map(([name]) => name),
+            datasets: [
+              { label: '發電量 kWh', data: entries.map(([, v]) => v.generation), backgroundColor: neutral, borderWidth: 0, borderRadius: 4, maxBarThickness: 24 },
+              { label: '轉供量 kWh', data: entries.map(([, v]) => v.wheeled), backgroundColor: accent, borderWidth: 0, borderRadius: 4, maxBarThickness: 24 },
+            ],
+          },
+          options: { ...base, indexAxis: 'y', plugins, scales: horizontalScales },
+        })
+      }
+
+      const funnelChart = (id, list, label, color) => {
+        if (!list.length) return
+        draw(id, {
+          type: 'bar',
+          data: {
+            labels: list.map((s) => s.stage),
+            datasets: [{ label, data: list.map((s) => s.quantity), backgroundColor: color, borderWidth: 0, borderRadius: 4, maxBarThickness: 26 }],
+          },
+          options: { ...base, indexAxis: 'y', plugins: { ...plugins, legend: { display: false } }, scales: horizontalScales },
+        })
+      }
+      funnelChart('sell-chart', sell, `售電量體 ${data.pipeline?.sellUnit || 'kWh'}`, accent)
+      funnelChart('purchase-chart', purchase, `購電容量 ${data.pipeline?.purchaseUnit || 'kW'}`, accentMuted)
+      funnelChart('btm-chart', btmPotential, 'BTM 容量 MW', accent)
+
+      if (ftmProjects.length) {
+        draw('ftm-chart', {
+          type: 'bar',
+          data: {
+            labels: ftmProjects.map((p) => p.name),
+            datasets: [{ label: '整案完成率 %', data: ftmProjects.map((p) => p.completionPct), backgroundColor: accent, borderWidth: 0, borderRadius: 4, maxBarThickness: 26 }],
+          },
+          options: {
+            ...base,
+            indexAxis: 'y',
+            plugins: { ...plugins, legend: { display: false } },
+            scales: { x: { beginAtZero: true, max: 100, grid: { color: grid }, border: { display: false }, ticks: { callback: (v) => `${v}%` } }, y: horizontalScales.y },
+          },
+        })
+      }
+    })()
+  </script>
+</body>
+</html>

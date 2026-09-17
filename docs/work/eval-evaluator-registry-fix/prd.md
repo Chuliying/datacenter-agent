@@ -51,7 +51,7 @@
 | 高風險：Registry 換了實作但 runner 未呼叫 | `PipelineDeterministicEvaluator` 建立後，runner 仍使用手寫比對邏輯。 | AC-002 要求 spy evaluator 跨 registry builder、runner、report 三層驗證。 |
 | 中風險：Rubric v1 被誤解為 citation-level grounding | `must_include` / `must_not_include` 只是 heuristic。 | 文件與程式註解必須標注 v1 grounding 是 heuristic，Evidence Pack 完成後再升級。 |
 | 中風險：CI negative self-test 變成恆真測試 | negative test 只呼叫原本就會失敗的路徑。 | AC-003 要求 intentional-failing fixture 先能造成真實 regression exit 1。 |
-| Evidence | `docs/agent-runtime-rust-port/spec/spec-06-eval.md`、`docs/reference/modules/runtime-eval.md`、`src/runtime/eval/**`、`src/runtime/registry.rs`。 | Repo evidence sufficient；未新增外部研究，沿用既有 PRD 搜尋紀錄。 |
+| Evidence | `git show 817418c:docs/agent-runtime-rust-port/spec/spec-06-eval.md`（歷史 spec，已自 worktree 移除）、`docs/reference/modules/runtime-eval.md`、`src/runtime/eval/**`、`src/runtime/registry.rs`。 | Repo evidence sufficient；未新增外部研究，沿用既有 PRD 搜尋紀錄。 |
 
 ---
 
@@ -115,7 +115,7 @@ flowchart TD
 |-------|-------|
 | `EvalOutcome` | 包含 `case_id`、`passed`、`scores`、`latency_ms`、`tokens`、`failures`。 |
 
-**Data source**: `docs/agent-runtime-rust-port/spec/spec-06-eval.md` 定義型別方向；`PipelineFixture` 來自 `config/runtime/evals/inputs.json`。
+**Data source**: `git show 817418c:docs/agent-runtime-rust-port/spec/spec-06-eval.md`（歷史 spec）定義型別方向；`PipelineFixture` 來自 `config/runtime/evals/inputs.json`。
 
 **Permissions / Visibility**: 內部 Rust module，無使用者可見性議題。
 
@@ -400,7 +400,7 @@ UI: N/A (has_ui=false)，因為本 story 是 Rust 後端 CLI/library 內部機�
 |----------|------|
 | Target PRD | `docs/reference/prd.md` FR-010 / AC-009 |
 | Plan | `.agent/artifacts/plan/2026-06-29-runtime-correctness/implementation.md` I06 |
-| Legacy eval spec | `docs/agent-runtime-rust-port/spec/spec-06-eval.md` |
+| Legacy eval spec | `git show 817418c:docs/agent-runtime-rust-port/spec/spec-06-eval.md` |
 | Runtime eval module | `docs/reference/modules/runtime-eval.md` |
 | Paired work item | `docs/work/evidence-pack-skillpackage-finalllmport/prd.md` |
 

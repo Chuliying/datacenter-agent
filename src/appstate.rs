@@ -16,6 +16,7 @@
 //!
 //! This module also process ENV variables for the LLM and MCP server.
 
+use std::env::VarError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,9 @@ use async_openai::types::chat::ChatCompletionTool;
 use reqwest::Client;
 use tokio::sync::Mutex;
 
-use crate::config::AppConfig;
+use crate::config::{
+    AppConfig, AuthzConfig, IdentityConfig, ReportGrants, ResolvedIdentityConfig, SsReportGrants,
+};
 use crate::mcp_client::McpHandle;
 use crate::model::{GenerationConfig, History};
 use crate::runtime::audit::{AuditFailurePolicy, AuditSink};
@@ -34,6 +37,7 @@ use crate::runtime::input::pipeline::InputPipeline;
 use crate::runtime::llm_normalizer::LlmInputNormalizer;
 use crate::runtime::memory::store::SessionMemoryStore;
 use crate::runtime::registry::BuiltinRegistry;
+use crate::server::falcon::{normalize_base_url, FalconHosts};
 
 /// Helper to parse optional env vars with a fallback.
 fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -41,6 +45,126 @@ fn get_env_with_default<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// Both rate-limit layers are prerequisites of the identity layer, not preferences (AC-021,
+/// ERR-009).
+///
+/// The outer global bucket is the only thing bounding traffic whose identity never resolves —
+/// `ERR-002`/`ERR-003`/`ERR-004`/`ERR-008` all finish before the inner layer is reached — so a
+/// deployment with it switched off would let a caller cycling invalid tokens hammer Falcon
+/// unthrottled. Refusing to boot is the same treatment a missing pepper gets: a misconfiguration
+/// that silently removes a protection is worse than one that stops the service.
+///
+/// Extracted from the boot path so it can be tested without standing up MCP, the LLM client and
+/// the runtime.
+///
+/// # Errors
+///
+/// Returns `Err` when the outer limiter is disabled, or when the inner per-actor policy is absent.
+pub(crate) fn require_rate_limit_for_identity(
+    rate_limit: &crate::config::RateLimitConfig,
+) -> Result<()> {
+    if !rate_limit.enabled {
+        anyhow::bail!(
+            "config_error: [server.rate_limit].enabled must be true when the identity layer is enabled (ERR-009)"
+        );
+    }
+    if rate_limit.per_actor.is_none() {
+        anyhow::bail!(
+            "config_error: [server.rate_limit.per_actor] section is required when the identity layer is enabled"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the Falcon base URL: `FALCON_API_BASE_URL` env wins, else `[identity].base_url` from
+/// config, else boot fails. There is no checked-in default host (finding #1) — a forgotten
+/// override must stop the service, never silently point production tokens at the wrong Falcon.
+fn resolve_identity_config(config: &IdentityConfig) -> Result<ResolvedIdentityConfig> {
+    let env = read_env_utf8("FALCON_API_BASE_URL")?;
+    let env_allowed = read_env_utf8("FALCON_API_ALLOWED_BASE_URLS")?;
+    let base_url = resolve_identity_base_url(env.as_deref(), config.base_url.as_deref())?;
+    let (base_url, allowed_base_urls) =
+        resolve_identity_hosts(&base_url, env_allowed.as_deref(), &config.allowed_base_urls)?;
+    Ok(ResolvedIdentityConfig {
+        base_url,
+        allowed_base_urls,
+        positive_ttl_ms: config.positive_ttl_ms,
+        negative_ttl_ms: config.negative_ttl_ms,
+        request_timeout_ms: config.request_timeout_ms,
+    })
+}
+
+fn read_env_utf8(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(VarError::NotUnicode(_)) => anyhow::bail!("env_error: {name} is not valid UTF-8"),
+        Err(VarError::NotPresent) => Ok(None),
+    }
+}
+
+/// Pure seam for the per-request Falcon host allowlist: normalize the default host, then the
+/// list — `FALCON_API_ALLOWED_BASE_URLS` (comma-separated) replaces `[identity].allowed_base_urls`
+/// when set, and a set-but-blank env value is a deliberate mistake (error). The default host is
+/// always allowed and comes first; duplicates after normalization collapse. Every entry must be
+/// a well-formed base URL, so a typo stops the boot instead of silently shrinking the allowlist.
+fn resolve_identity_hosts(
+    default_base_url: &str,
+    env_allowed: Option<&str>,
+    config_allowed: &[String],
+) -> Result<(String, Vec<String>)> {
+    let default = normalize_base_url(default_base_url).context(
+        "config_error: Falcon base URL (FALCON_API_BASE_URL / [identity].base_url) is not a valid base URL",
+    )?;
+    let raw: Vec<String> = match env_allowed {
+        Some(value) => {
+            let entries: Vec<String> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect();
+            if entries.is_empty() {
+                anyhow::bail!(
+                    "env_error: FALCON_API_ALLOWED_BASE_URLS is set but names no host (blank or only separators)"
+                );
+            }
+            entries
+        }
+        None => config_allowed.to_vec(),
+    };
+    let mut allowed = vec![default.clone()];
+    for entry in raw {
+        let normalized = normalize_base_url(&entry).with_context(|| {
+            format!("config_error: allowed Falcon base URL {entry:?} is not a valid base URL")
+        })?;
+        if !allowed.contains(&normalized) {
+            allowed.push(normalized);
+        }
+    }
+    Ok((default, allowed))
+}
+
+/// Pure resolution seam for the Falcon base URL, split out so the precedence can be unit-tested
+/// without touching the process environment: the env override wins, else `[identity].base_url`,
+/// else boot fails. A set-but-empty env override is a deliberate mistake (error), while an empty
+/// config value is treated as absent (falls through). There is no checked-in default host — a
+/// forgotten override must stop the service, never silently point production tokens at the wrong
+/// Falcon.
+fn resolve_identity_base_url(env: Option<&str>, config: Option<&str>) -> Result<String> {
+    if let Some(value) = env {
+        if value.trim().is_empty() {
+            anyhow::bail!("env_error: FALCON_API_BASE_URL is empty");
+        }
+        return Ok(value.to_string());
+    }
+    match config {
+        Some(value) if !value.trim().is_empty() => Ok(value.to_string()),
+        _ => anyhow::bail!(
+            "config_error: Falcon base URL is required — set FALCON_API_BASE_URL or [identity].base_url; there is no default host, so production tokens are never sent to an unintended Falcon"
+        ),
+    }
 }
 
 /// LLM defaults sourced from the environment at startup.
@@ -111,9 +235,9 @@ impl LlmDefaults {
 /// cost up to kilobytes!).
 #[derive(Debug)]
 pub struct PromptBank {
-    /// Legacy monolith analytics system prompt. The live `/insight` + `/insight/stream`
-    /// endpoints now drive the sub-agent pipeline (with its own per-stage prompts under
-    /// `config/prompt_guide/`); this prompt still backs the eval baseline runner.
+    /// Legacy monolith analytics system prompt. The live `/agent/stream` +
+    /// `/v1/chat/completions` endpoints drive the sub-agent pipeline (with its own per-stage
+    /// prompts under `config/prompt_guide/`); this prompt still backs the eval baseline runner.
     pub agent_system: String,
     /// Greeting pipeline — the data-fetch stage's system prompt.
     pub greeting_fetcher_system: String,
@@ -131,6 +255,17 @@ pub struct PromptBank {
     pub report_analyst_system: String,
     /// `/report` pipeline — the composer stage's system prompt (maps data into `emit_report`).
     pub report_composer_system: String,
+    /// `/ss-chat` pipeline — the 星星電力 data-fetch stage's system prompt (the six `ss_*` tools).
+    pub ss_fetcher_system: String,
+    /// `/ss-chat` pipeline — the analyst stage's system prompt (writes the management answer).
+    pub ss_analyst_system: String,
+    /// `/ss-chat` pipeline — the charter stage's system prompt (decides 0–2 charts).
+    pub ss_charter_system: String,
+    /// `/ss-report` pipeline — the analyst stage's system prompt (writes the insight narrative).
+    pub ss_report_analyst_system: String,
+    /// `/ss-report` pipeline — the composer stage's system prompt (maps data into
+    /// `emit_ss_report`).
+    pub ss_report_composer_system: String,
 }
 
 impl PromptBank {
@@ -140,7 +275,9 @@ impl PromptBank {
     ///
     /// Returns `Err` if any required prompt id — `agent_system`, the `greeting_*` ids, or the
     /// `/insight` + `/report` stage prompts (`fetcher_system`, `analyst_system`, `charter_system`,
-    /// `report_analyst_system`, `report_composer_system`) — is missing from the loaded config.
+    /// `report_analyst_system`, `report_composer_system`), or the `/ss-chat` stage prompts
+    /// (`ss_fetcher_system`, `ss_analyst_system`, `ss_charter_system`) — is missing from the
+    /// loaded config.
     pub fn from_app_config(cfg: &AppConfig) -> Result<Self> {
         Ok(Self {
             agent_system: cfg.get_prompt_by_id("agent_system")?.to_string(),
@@ -152,6 +289,15 @@ impl PromptBank {
             charter_system: cfg.get_prompt_by_id("charter_system")?.to_string(),
             report_analyst_system: cfg.get_prompt_by_id("report_analyst_system")?.to_string(),
             report_composer_system: cfg.get_prompt_by_id("report_composer_system")?.to_string(),
+            ss_fetcher_system: cfg.get_prompt_by_id("ss_fetcher_system")?.to_string(),
+            ss_analyst_system: cfg.get_prompt_by_id("ss_analyst_system")?.to_string(),
+            ss_charter_system: cfg.get_prompt_by_id("ss_charter_system")?.to_string(),
+            ss_report_analyst_system: cfg
+                .get_prompt_by_id("ss_report_analyst_system")?
+                .to_string(),
+            ss_report_composer_system: cfg
+                .get_prompt_by_id("ss_report_composer_system")?
+                .to_string(),
         })
     }
 }
@@ -183,19 +329,44 @@ pub struct AppState {
     ///
     /// Loaded once from `GLOBAL_TOKEN` at startup, never logged, and should rotate periodically (e.g. weekly).
     pub auth_token: Arc<String>,
+    /// HMAC pepper used to derive opaque actor keys from Falcon user ids.
+    pub actor_key_pepper: Arc<Vec<u8>>,
+    /// Falcon hosts this runtime may verify end-user tokens against, one permissions provider
+    /// (and one bounded positive/negative cache) per host. The identity middleware picks the
+    /// host from `X-Falcon-Api-Base-Url`, defaulting to the resolved `base_url`; tests replace
+    /// the providers with in-process ones without changing the router seam.
+    pub falcon_hosts: Arc<FalconHosts>,
     /// Pre-generated greeting strings populated by background tasks at boot.
     ///
     /// `GET /greeting` picks one at random.
     pub greetings: Arc<Mutex<Vec<String>>>,
-    /// Runtime wiring. Active by default (cutover); `RUNTIME_ENABLED=false`
-    /// rolls a request back to the legacy direct path.
+    /// Runtime wiring. Active by default (cutover). `RUNTIME_ENABLED=false` leaves only
+    /// `/health`, `/ready` and `/greeting` serviceable — both prompt endpoints require the
+    /// runtime and return `503` — so the flag no longer selects an alternative path.
     pub runtime: Option<Arc<AppRuntime>>,
-    /// Resolved `/insight` pipeline tool grants (from `[insight.grants]`), validated against the
+    /// Resolved insight-pipeline tool grants (from `[insight.grants]`), validated against the
     /// discovered MCP tool set at boot.
     pub insight_grants: crate::config::InsightGrants,
+    /// Resolved `/ss-chat` pipeline tool grants (from `[ss_chat.grants]`), validated against the
+    /// discovered MCP tool set at boot. Explicit `ss_*` names, not the `["*"]` wildcard — the same
+    /// server also advertises the EV-charging tools.
+    pub ss_chat_grants: crate::config::SsChatGrants,
     /// The `/report` HTML template body (from `[report].template`), shared read-only. Its
     /// `__REPORT_DATA_JSON__` placeholder is validated present at boot; the `renderer` fills it.
     pub report_template: Arc<String>,
+    /// Resolved `[server.rate_limit]` policy. Disabled by default; when
+    /// enabled, `build_router` attaches the global burst limiter to the
+    /// expensive routes (S-RUNTIME-SEC-01 FR-005).
+    pub rate_limit: crate::config::RateLimitConfig,
+    /// Boot-validated permission-to-tool and intent-to-tool mappings.
+    pub authz: AuthzConfig,
+    /// Boot-validated report-specific data grant.
+    pub report_grants: ReportGrants,
+    /// The boot-loaded `/ss-report` HTML template, shared read-only. Contains the
+    /// `__REPORT_DATA_JSON__` placeholder the SS renderer fills.
+    pub ss_report_template: Arc<String>,
+    /// The `/ss-report` pipeline's tool ceiling (`[ss_report.grants]`).
+    pub ss_report_grants: SsReportGrants,
 }
 
 /// Runtime dependencies assembled at boot.
@@ -228,11 +399,52 @@ impl AppState {
         prompts: Arc<PromptBank>,
         auth_token: String,
     ) -> Result<Self> {
+        let actor_key_pepper = Arc::new(crate::server::actor::load_actor_key_pepper()?);
+        let identity_config = app_config
+            .identity
+            .as_ref()
+            .context("config_error: [identity] section is required")?;
+        let identity_config = resolve_identity_config(identity_config)?;
+        let falcon_hosts = Arc::new(
+            FalconHosts::from_config(&identity_config)
+                .context("build Falcon permissions providers")?,
+        );
+        tracing::info!(
+            default_host = %falcon_hosts.default_host(),
+            allowed_hosts = ?identity_config.allowed_base_urls,
+            "identity: Falcon host allowlist"
+        );
         let http = Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .context("build /ready probe http client")?;
         let runtime = build_runtime(app_config)?;
+
+        require_rate_limit_for_identity(&app_config.rate_limit)?;
+        let authz = app_config
+            .authz
+            .clone()
+            .context("config_error: [authz] section is required")?;
+        let report_grants = app_config
+            .report_grants
+            .clone()
+            .context("config_error: [report.grants] section is required")?;
+        let advertised: Vec<String> = tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        report_grants
+            .validate(&advertised)
+            .context("validate /report tool grants")?;
+        authz
+            .validate(
+                runtime
+                    .as_ref()
+                    .map(|runtime| runtime.config.intent_allowlist.as_slice())
+                    .unwrap_or(&[]),
+                &advertised,
+            )
+            .context("validate authorization mappings")?;
 
         // Fail fast at boot if a configured /insight tool grant names a tool the datacenter server
         // did not advertise (or an unknown built-in) — never a deferred first-request failure.
@@ -243,17 +455,42 @@ impl AppState {
         )
         .context("validate /insight tool grants")?;
 
-        // Fail fast at boot if the /report template can never be filled — a template without the
+        // The insight ceiling and the intent table are two independent lists that must agree:
+        // a strict intent requiring a tool the ceiling omits is a permanent, user-visible
+        // "權限不足" for everyone, not a narrowing. Catch that drift at boot.
+        authz
+            .validate_intent_reachability(&app_config.insight_grants.fetcher, &advertised)
+            .context("validate intent reachability under the insight grant")?;
+
+        // The same fail-fast for the /ss-chat grants: a typo, or an `ss_*` tool this MCP server
+        // build does not advertise, aborts startup rather than failing the first SS request.
+        crate::agent::wiring::validate_ss_chat_grants(
+            &tools,
+            &app_config.ss_chat_grants.fetcher,
+            &app_config.ss_chat_grants.charter,
+        )
+        .context("validate /ss-chat tool grants")?;
+
+        // Fail fast at boot if either report template can never be filled — a template without the
         // data placeholder would render an empty report on every request.
-        if !app_config
-            .report_template
-            .contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER)
-        {
-            anyhow::bail!(
-                "report template is missing the `{}` placeholder — the renderer would have nothing to fill",
-                crate::agent::pipeline::REPORT_DATA_PLACEHOLDER
-            );
+        for (what, template) in [
+            ("report", &app_config.report_template),
+            ("ss report", &app_config.ss_report_template),
+        ] {
+            if !template.contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER) {
+                anyhow::bail!(
+                    "{what} template is missing the `{}` placeholder — the renderer would have nothing to fill",
+                    crate::agent::pipeline::REPORT_DATA_PLACEHOLDER
+                );
+            }
         }
+
+        // The /ss-report ceiling, validated against the advertised set exactly as the other grants
+        // are: a typo here would otherwise become a permanently, invisibly missing report section.
+        app_config
+            .ss_report_grants
+            .validate(&advertised)
+            .context("validate /ss-report tool grants")?;
 
         Ok(Self {
             mcp,
@@ -263,10 +500,18 @@ impl AppState {
             prompts,
             http,
             auth_token: Arc::new(auth_token),
+            actor_key_pepper,
+            falcon_hosts,
             greetings: Arc::new(Mutex::new(Vec::new())),
             runtime,
             insight_grants: app_config.insight_grants.clone(),
+            ss_chat_grants: app_config.ss_chat_grants.clone(),
             report_template: Arc::new(app_config.report_template.clone()),
+            ss_report_template: Arc::new(app_config.ss_report_template.clone()),
+            ss_report_grants: app_config.ss_report_grants.clone(),
+            rate_limit: app_config.rate_limit.clone(),
+            authz,
+            report_grants,
         })
     }
 
@@ -416,7 +661,152 @@ pub fn load_mcp_url() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// AC-021: with the identity layer present, a disabled outer limiter must stop the boot
+    /// rather than quietly ship a deployment where identity-failing traffic is unthrottled.
+    #[test]
+    /// S-RUNTIME-SEC-02 AC-021
+    fn ac021_identity_layer_requires_both_rate_limit_layers() {
+        use crate::config::{PerActorRateLimitConfig, RateLimitConfig};
+        use std::num::{NonZeroU32, NonZeroU64};
+
+        let per_actor = PerActorRateLimitConfig {
+            burst_size: NonZeroU32::new(5).unwrap(),
+            refill_period_ms: NonZeroU64::new(1000).unwrap(),
+            max_tracked_actors: NonZeroU32::new(64).unwrap(),
+        };
+
+        // Both layers configured: boots.
+        let ok = RateLimitConfig {
+            enabled: true,
+            burst_size: NonZeroU32::new(20).unwrap(),
+            refill_period_ms: NonZeroU64::new(250).unwrap(),
+            per_actor: Some(per_actor.clone()),
+        };
+        require_rate_limit_for_identity(&ok).expect("a fully configured policy must boot");
+
+        // Outer disabled: refuses, and says which key is wrong.
+        let outer_off = RateLimitConfig {
+            enabled: false,
+            ..ok.clone()
+        };
+        let err = require_rate_limit_for_identity(&outer_off)
+            .expect_err("a disabled outer limiter must stop the boot");
+        assert!(
+            err.to_string().contains("[server.rate_limit].enabled"),
+            "the error must name the offending key, got: {err}"
+        );
+
+        // Inner absent: refuses too. Present-but-empty is not a valid state for the inner layer,
+        // because it has no opt-out.
+        let inner_missing = RateLimitConfig {
+            per_actor: None,
+            ..ok
+        };
+        let err = require_rate_limit_for_identity(&inner_missing)
+            .expect_err("a missing per-actor policy must stop the boot");
+        assert!(
+            err.to_string().contains("per_actor"),
+            "the error must name the offending section, got: {err}"
+        );
+    }
     use super::*;
+
+    #[test]
+    fn resolve_identity_hosts_normalizes_and_always_includes_the_default_first() {
+        let config_list = vec![
+            "https://dev.hdre-eomc.com/".to_string(),
+            "HTTPS://Stage.hdre-eomc.com".to_string(),
+            "https://hdre-eomc.com".to_string(), // duplicate of the default
+        ];
+        let (default, allowed) =
+            resolve_identity_hosts("https://HDRE-eomc.com/", None, &config_list)
+                .expect("config list should resolve");
+        assert_eq!(default, "https://hdre-eomc.com");
+        assert_eq!(
+            allowed,
+            [
+                "https://hdre-eomc.com",
+                "https://dev.hdre-eomc.com",
+                "https://stage.hdre-eomc.com",
+            ]
+        );
+
+        // Env list replaces the config list entirely.
+        let (_, allowed) = resolve_identity_hosts(
+            "http://127.0.0.1:8787",
+            Some(" https://dev.hdre-eomc.com , ,https://qa.example/ "),
+            &config_list,
+        )
+        .expect("env list should resolve");
+        assert_eq!(
+            allowed,
+            [
+                "http://127.0.0.1:8787",
+                "https://dev.hdre-eomc.com",
+                "https://qa.example",
+            ]
+        );
+
+        // No list at all: the default alone is the allowlist (pre-header consumers keep working).
+        let (_, allowed) =
+            resolve_identity_hosts("https://hdre-eomc.com", None, &[]).expect("default only");
+        assert_eq!(allowed, ["https://hdre-eomc.com"]);
+
+        // A set-but-blank env list (blank, or only separators) and a malformed entry all stop
+        // the boot — an env override that names no host must not silently shrink the allowlist.
+        for blank in ["  ", ",", " , , "] {
+            assert!(
+                resolve_identity_hosts("https://hdre-eomc.com", Some(blank), &[])
+                    .expect_err("env list naming no host must fail")
+                    .to_string()
+                    .contains("FALCON_API_ALLOWED_BASE_URLS"),
+                "{blank:?}"
+            );
+        }
+        let err = resolve_identity_hosts(
+            "https://hdre-eomc.com",
+            None,
+            &["dev.hdre-eomc.com".to_string()],
+        )
+        .expect_err("a schemeless entry must fail");
+        assert!(err.to_string().contains("dev.hdre-eomc.com"), "{err}");
+        assert!(resolve_identity_hosts("not a url", None, &[]).is_err());
+    }
+
+    #[test]
+    fn resolve_identity_base_url_prefers_env_then_config_then_fails() {
+        // Env override wins over config.
+        assert_eq!(
+            resolve_identity_base_url(Some("https://env.example"), Some("https://config.example"))
+                .expect("env should resolve"),
+            "https://env.example"
+        );
+        // Env absent: config is used.
+        assert_eq!(
+            resolve_identity_base_url(None, Some("https://config.example"))
+                .expect("config should resolve"),
+            "https://config.example"
+        );
+        // Both absent: boot fails, and the message points at both knobs.
+        let err = resolve_identity_base_url(None, None)
+            .expect_err("a missing base URL must stop the boot");
+        assert!(
+            err.to_string().contains("FALCON_API_BASE_URL")
+                && err.to_string().contains("[identity].base_url"),
+            "the error must name both override knobs, got: {err}"
+        );
+        // A set-but-empty env override is a deliberate mistake, not a fallback to config.
+        let err = resolve_identity_base_url(Some("   "), Some("https://config.example"))
+            .expect_err("an empty env override must stop the boot");
+        assert!(
+            err.to_string().contains("empty"),
+            "the empty-env error must say so, got: {err}"
+        );
+        // An empty config value is treated as absent, so both-absent still fails (no default host).
+        resolve_identity_base_url(None, Some("  "))
+            .expect_err("an empty config value must not resolve to a host");
+    }
 
     #[test]
     fn runtime_enabled_env_defaults_on_with_explicit_rollback() {

@@ -14,8 +14,10 @@
 
 //! Bearer-token gate.
 //!
-//! Every request must carry `Authorization: Bearer <GLOBAL_TOKEN>`.
-//! Anything else would be rejected with `418 I'm a teapot` message.
+//! Every request must carry `Authorization: Bearer <GLOBAL_TOKEN>`. Two middlewares share the
+//! same constant-time check but reject differently: [`require_bearer`] (the standard routes)
+//! answers `418 I'm a teapot`, while [`require_bearer_openai`] (`/v1/chat/completions`) answers
+//! `401` with the OpenAI error envelope so OpenAI-compatible clients recognise the failure.
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
@@ -25,6 +27,7 @@ use axum::Json;
 use constant_time_eq::constant_time_eq;
 use tracing::debug;
 
+use super::codes::AUTH_SERVICE_TOKEN_INVALID;
 use super::error::ErrorBody;
 use super::openai::{OpenAiErrorBody, ERR_INVALID_REQUEST};
 use super::AppState;
@@ -54,7 +57,10 @@ pub async fn require_bearer(State(state): State<AppState>, req: Request, next: N
         // Reject with 418 I'm a teapot and teapot message
         (
             StatusCode::IM_A_TEAPOT,
-            Json(ErrorBody::new(TEAPOT_MESSAGE)),
+            Json(ErrorBody::with_code(
+                AUTH_SERVICE_TOKEN_INVALID,
+                TEAPOT_MESSAGE,
+            )),
         )
             .into_response()
     }
@@ -65,7 +71,7 @@ pub async fn require_bearer(State(state): State<AppState>, req: Request, next: N
 /// The token check is identical to [`require_bearer`] (same constant-time compare against
 /// `GLOBAL_TOKEN`), but a rejection is `401 Unauthorized` carrying the OpenAI error envelope —
 /// what an OpenAI client / agentgateway expects — instead of the host's `418` teapot. The shared
-/// [`require_bearer`] middleware (and its D6 `418` contract for the other seven endpoints) is
+/// [`require_bearer`] middleware (and its D6 `418` contract for the other standard endpoints) is
 /// deliberately left untouched.
 ///
 /// ## Note
@@ -92,7 +98,8 @@ pub async fn require_bearer_openai(
 fn openai_unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(OpenAiErrorBody::new(
+        Json(OpenAiErrorBody::with_code(
+            AUTH_SERVICE_TOKEN_INVALID,
             ERR_INVALID_REQUEST,
             "missing or invalid bearer token",
         )),
@@ -114,9 +121,11 @@ fn check(state: &AppState, req: &Request) -> bool {
 
     // `Bearer ` is case-insensitive on the scheme name per RFC 6750.
     let Some(token) = raw.strip_prefix("Bearer ").or_else(|| {
-        if raw.len() >= 7 && raw[..6].eq_ignore_ascii_case("Bearer") && raw.as_bytes()[6] == b' ' {
-            // Crop "Bearer " (7 characters) from the raw header value
-            Some(&raw[7..])
+        let bytes = raw.as_bytes();
+        if bytes.len() >= 7 && bytes[..6].eq_ignore_ascii_case(b"Bearer") && bytes[6] == b' ' {
+            // Crop "Bearer " (7 bytes) from the raw header value. Header values are UTF-8 here,
+            // but byte checks avoid slicing at a non-character boundary for malformed input.
+            raw.get(7..)
         } else {
             None
         }
@@ -144,6 +153,7 @@ mod tests {
             .expect("read body");
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
         assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], AUTH_SERVICE_TOKEN_INVALID);
         assert!(
             v["error"]["message"].is_string(),
             "envelope must carry a message"

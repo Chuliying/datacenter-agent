@@ -8,6 +8,12 @@ composition rules); this plan covers the *how*, the items the contracts deferred
 payload §6, tool §6), and the concrete migration of **today's monolithic endpoints into
 sub-agent pipelines**.
 
+> **狀態（2026-08-20 校訂）**：本頁是契約落地**之前**寫的計畫，保留當時的視角，不是現況
+> 描述。其中 §「Renames」的 `runtime::orchestrator → runtime::turn` 已完成，檔案現在是
+> [`src/runtime/turn.rs`](../../src/runtime/turn.rs)；本頁提到 `orchestrator.rs` 的地方一律
+> 指它。現況以 [`docs/reference/`](../../docs/reference/index.md) 為準，現行型別契約見
+> [`../contract/`](../contract/sub_agent/Contract.md)。
+
 Sequenced so each step compiles and is testable on its own. Nothing here changes the
 normative payload or sub-agent contracts.
 
@@ -31,7 +37,7 @@ exist in the tree. The real starting point:
   full tool set into the *same* streaming tool-loop
   ([`llm_connector::agent_stream`](../../src/llm_connector/agent.rs)).
 - **A pre-existing `runtime/` turn-orchestrator — NOT the contract's orchestrator.**
-  [`runtime/orchestrator.rs`](../../src/runtime/orchestrator.rs) owns `run_agent_turn`, an
+  [`runtime/orchestrator.rs`（現 `turn.rs`）](../../src/runtime/turn.rs) owns `run_agent_turn`, an
   `AgentPort` trait, and an *input* "pipeline" (normalize → guard → intent → slots) plus
   answer-policy, memory, and audit. Its `LlmAgentPort` wraps the single streaming loop. `/agent`
   routes through this (default `RUNTIME_ENABLED=on`); `/report` **bypasses it** on the legacy
@@ -622,7 +628,7 @@ The sub-agent pipeline becomes the **agent transport** the existing runtime turn
 expects — guardrails, intent, memory, and audit are untouched.
 
 - **`PipelineAgentPort`** (`src/agent/port.rs`) implements
-  [`runtime::turn::AgentPort`](../../src/runtime/orchestrator.rs) (the module renamed in §2):
+  [`runtime::turn::AgentPort`](../../src/runtime/turn.rs) (the module renamed in §2):
   `stream_turn(input) -> BoxStream<AgentTurnFrame>`. It:
   1. builds the `Initial` payload from `input.prompt` + `input.history`, stamping the boundary
      `now` from a `Clock` the port holds (`InitialPrompt.now = clock.now()`, a `SystemClock` in

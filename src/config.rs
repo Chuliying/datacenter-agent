@@ -27,8 +27,12 @@
 //! ```ignore
 //! use datacenter_agent::config::AppConfig;
 //!
+//! # fn main() -> anyhow::Result<()> {
 //! let app = AppConfig::load("config/config.toml")?;
 //! let agent_prompt = app.get_prompt_by_id("agent_system")?;
+//! # let _ = agent_prompt;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::collections::BTreeMap;
@@ -128,9 +132,239 @@ struct Manifest {
     /// Optional `/insight` pipeline tool grants (defaults applied when absent).
     #[serde(default)]
     insight: Option<InsightManifest>,
+    /// Optional `/ss-chat` pipeline tool grants (defaults applied when absent).
+    #[serde(default)]
+    ss_chat: Option<SsChatManifest>,
     /// Optional `/report` pipeline assets (the HTML template; default path applied when absent).
     #[serde(default)]
     report: Option<ReportManifest>,
+    /// Optional `/ss-report` pipeline assets (the SS HTML template + its own tool ceiling).
+    #[serde(default)]
+    ss_report: Option<SsReportManifest>,
+    /// Optional `[server]` section (ingress policy; defaults applied when absent).
+    #[serde(default)]
+    server: Option<ServerManifest>,
+    /// Optional `[identity]` section (Falcon permissions endpoint policy).
+    #[serde(default)]
+    identity: Option<IdentityConfig>,
+    /// Optional `[authz]` section (permission and intent mapping tables).
+    #[serde(default)]
+    authz: Option<AuthzConfig>,
+}
+
+/// `[authz]`: the two mapping tables the authorization gate intersects
+/// (S-RUNTIME-SEC-02 FR-003).
+///
+/// The gate is `boot grant ∩ permission grant ∩ intent required tools`. Intersecting all
+/// three matters: a finance-only user asking a member question still holds a non-empty
+/// narrowed set (their finance tools), so a "is the narrowed set non-empty" rule would
+/// wave them through. Anything either table fails to cover is denied, and an uncovered
+/// intent is a *startup* failure rather than a runtime surprise.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzConfig {
+    /// Falcon permission code to the MCP data tools it unlocks. A code mapped to an empty
+    /// list grants nothing (e.g. `engproj`, which has no MCP endpoint yet).
+    pub permission_tools: BTreeMap<String, Vec<String>>,
+    /// Runtime intent to the tools that intent *requires*. Must cover the runtime's whole
+    /// intent allowlist, `unknown` included.
+    pub intent_tools: BTreeMap<String, Vec<String>>,
+    /// Falcon permission codes any one of which unlocks the SS chat pipeline's full grant.
+    ///
+    /// The SS route cannot use the intent-based gate: it deliberately disables intent filtering
+    /// (every SS question resolves to `unknown` under the EV-charging intent pack), so its
+    /// authorization keys off these codes instead. Empty means deny-all — fail-safe for a config
+    /// that predates the SS route.
+    #[serde(default)]
+    pub ss_chat_permissions: Vec<String>,
+}
+
+impl AuthzConfig {
+    /// Boot-time validation of both tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the intent allowlist is not fully covered, or when either table
+    /// names a tool the MCP server does not advertise.
+    pub fn validate(&self, intent_allowlist: &[String], advertised: &[String]) -> Result<()> {
+        for intent in intent_allowlist {
+            if !self.intent_tools.contains_key(intent) {
+                anyhow::bail!(
+                    "config_error: intent `{intent}` has no row in [authz.intent_tools]; \
+                     every intent in the runtime allowlist needs one, so a gap fails boot \
+                     instead of becoming a silent default-deny at request time"
+                );
+            }
+        }
+        for (intent, tools) in &self.intent_tools {
+            reject_unadvertised(tools, advertised, &format!("[authz.intent_tools].{intent}"))?;
+        }
+        for (code, tools) in &self.permission_tools {
+            reject_unadvertised(
+                tools,
+                advertised,
+                &format!("[authz.permission_tools].{code}"),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Boot-time check that the insight ceiling can actually satisfy every strict intent.
+    ///
+    /// The per-request gate is `boot ∩ permission ∩ intent required`, and every intent except
+    /// `report` is strict: it needs *all* of its required tools. So a required tool missing from
+    /// `[insight.grants].fetcher` is not a narrowing — it is a permanent refusal for that intent,
+    /// for every user, regardless of what Falcon grants them, and it surfaces to the user as
+    /// "權限不足". That is exactly what a permission bug looks like from the outside, which is why
+    /// it belongs at boot rather than in a support ticket. `report` is excluded: its gate is the
+    /// partial-grant exception, so an uncovered tool there degrades the report instead of denying.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` naming the first intent and tool the ceiling fails to cover.
+    pub fn validate_intent_reachability(
+        &self,
+        insight_fetcher_grant: &[String],
+        advertised: &[String],
+    ) -> Result<()> {
+        let ceiling = crate::agent::wiring::expand_grant(insight_fetcher_grant, advertised);
+        for (intent, tools) in &self.intent_tools {
+            if intent == "report" {
+                continue;
+            }
+            for tool in crate::agent::wiring::expand_grant(tools, advertised) {
+                if !ceiling.contains(&tool) {
+                    anyhow::bail!(
+                        "config_error: intent `{intent}` requires tool `{tool}`, but \
+                         [insight.grants].fetcher does not grant it; the strict intent gate \
+                         would deny every request for this intent regardless of the caller's \
+                         Falcon permissions. Add it to [insight.grants].fetcher, or drop it \
+                         from [authz.intent_tools].{intent}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `[identity]`: how the runtime reaches Falcon's permissions endpoint
+/// (S-RUNTIME-SEC-02 FR-001).
+///
+/// There is deliberately **no** `enabled` switch. D3 forbids a feature flag, so the
+/// identity layer is unconditional in the delivered binary (spec D-011); forward
+/// compatibility during rollout is provided by the *previous* binary, which ignores the
+/// unknown header. `deny_unknown_fields` therefore rejects `enabled = ...` outright
+/// rather than letting a default-config deploy silently ship with RBAC off.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    /// Base URL of the Falcon API, e.g. `https://falcon.example.com`. The runtime only
+    /// ever appends `/api/auth/me/permissions` to it.
+    ///
+    /// Deliberately **optional and without a checked-in default**: a shipped default would let a
+    /// deployment that forgets `FALCON_API_BASE_URL` silently verify production users' tokens
+    /// against whatever host the repo happened to carry. It must be supplied by config here or by
+    /// the `FALCON_API_BASE_URL` env var; absence is a boot failure (finding #1), the same
+    /// treatment a missing pepper gets.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Every Falcon host a request may select through `X-Falcon-Api-Base-Url`, as base URLs.
+    ///
+    /// One runtime serves several Falcon environments (dev / stage / prod front-ends call the
+    /// same agent), and a token only verifies against the Falcon that issued it. This list is
+    /// the allowlist the header is checked against; the resolved default `base_url` is always
+    /// allowed as well. `FALCON_API_ALLOWED_BASE_URLS` (comma-separated) replaces this list at
+    /// boot. Entries are normalized at boot (scheme/host lowercased, trailing slash dropped).
+    #[serde(default)]
+    pub allowed_base_urls: Vec<String>,
+    /// How long a successful permission lookup is reused, in milliseconds. Also the upper
+    /// bound on how long a Falcon-side permission revocation takes to take effect.
+    pub positive_ttl_ms: std::num::NonZeroU64,
+    /// How long a failed lookup is replayed from cache, in milliseconds. Bounds the
+    /// amplification from a consumer stuck resending one dead token.
+    pub negative_ttl_ms: std::num::NonZeroU64,
+    /// Per-request timeout for the permissions call, in milliseconds.
+    pub request_timeout_ms: std::num::NonZeroU64,
+}
+
+/// `IdentityConfig` after boot resolution: `base_url` is guaranteed present (env or config,
+/// else boot already failed), so nothing downstream has to handle its absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentityConfig {
+    /// Resolved default Falcon API base URL, normalized.
+    pub base_url: String,
+    /// Normalized allowlist of Falcon base URLs, `base_url` included and first, deduplicated.
+    pub allowed_base_urls: Vec<String>,
+    /// See [`IdentityConfig::positive_ttl_ms`].
+    pub positive_ttl_ms: std::num::NonZeroU64,
+    /// See [`IdentityConfig::negative_ttl_ms`].
+    pub negative_ttl_ms: std::num::NonZeroU64,
+    /// See [`IdentityConfig::request_timeout_ms`].
+    pub request_timeout_ms: std::num::NonZeroU64,
+}
+
+/// Optional `[server]` section: HTTP ingress policy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerManifest {
+    /// Optional `[server.rate_limit]` global burst-admission policy.
+    #[serde(default)]
+    rate_limit: Option<RateLimitConfig>,
+}
+
+/// `[server.rate_limit]`: opt-in process-local global burst limiter for the
+/// expensive routes (S-RUNTIME-SEC-01 FR-005). Disabled unless the section is
+/// present and `enabled = true`; when the section is present, the policy must
+/// be explicit — there is no undocumented crate preset (FR-004).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Whether the limiter is attached at all. Default: disabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Token-bucket burst size (admissions available at once).
+    pub burst_size: std::num::NonZeroU32,
+    /// One admission token refills every this many milliseconds.
+    pub refill_period_ms: std::num::NonZeroU64,
+    /// `[server.rate_limit.per_actor]`: the inner, identity-keyed layer
+    /// (S-RUNTIME-SEC-02 FR-005). Absent until the identity layer ships.
+    #[serde(default)]
+    pub per_actor: Option<PerActorRateLimitConfig>,
+}
+
+/// `[server.rate_limit.per_actor]`: the inner token bucket, keyed by `actor_key`.
+///
+/// Sits *inside* the outer global bucket and *after* identity resolution, because it
+/// needs the `actor_key`. The outer layer therefore stays where it is — it is the only
+/// thing bounding traffic whose identity never resolves (ERR-002/003/004/008 all finish
+/// before this layer is reached).
+///
+/// Like the outer policy, every value is explicit: there is no crate preset, and there is
+/// no `enabled` switch — an opt-out here would be a bypass of D3.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PerActorRateLimitConfig {
+    /// Token-bucket burst size per actor.
+    pub burst_size: std::num::NonZeroU32,
+    /// One admission token refills every this many milliseconds, per actor.
+    pub refill_period_ms: std::num::NonZeroU64,
+    /// Upper bound on tracked actors. Reaching it evicts the least recently used bucket;
+    /// eviction only returns that actor to a full allowance and never widens the outer cap.
+    pub max_tracked_actors: std::num::NonZeroU32,
+}
+
+impl Default for RateLimitConfig {
+    /// The absent-section shape: disabled, with placeholder policy values
+    /// that are never consulted while `enabled` is false.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            burst_size: std::num::NonZeroU32::MIN,
+            refill_period_ms: std::num::NonZeroU64::new(1000).expect("1000 is non-zero"),
+            per_actor: None,
+        }
+    }
 }
 
 /// Optional `[report]` section: assets for the `/report` HTML pipeline.
@@ -141,6 +375,143 @@ struct ReportManifest {
     /// directory, or absolute). Must contain the `__REPORT_DATA_JSON__` placeholder.
     #[serde(default = "default_report_template")]
     template: PathBuf,
+    /// Optional `[report.grants]`: the report pipeline's own tool ceiling
+    /// (S-RUNTIME-SEC-02 D-010). Absent means the legacy behavior of sharing
+    /// `[insight.grants].fetcher`.
+    #[serde(default)]
+    grants: Option<ReportGrants>,
+}
+
+/// `[report.grants]`: the report pipeline's own tool ceiling.
+///
+/// Separate from `[insight.grants].fetcher` on purpose: the report gate is the partial-grant
+/// exception (a non-empty intersection is enough) while every other intent is strict, so the
+/// two ceilings must be able to move independently. They happen to list the same six tools
+/// today — `[insight.grants].fetcher` had to gain `bill_member_analysis` as well, because
+/// under per-turn narrowing its absence default-denied the `member` intent outright.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReportGrants {
+    /// The report fetcher's granted data tools, by MCP wire name.
+    pub fetcher: Vec<String>,
+}
+
+impl ReportGrants {
+    /// Boot-time validation that every granted name is actually advertised.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` naming the first tool the MCP server does not advertise.
+    pub fn validate(&self, advertised: &[String]) -> Result<()> {
+        reject_unadvertised(&self.fetcher, advertised, "[report.grants].fetcher")
+    }
+}
+
+/// Optional `[ss_report]` section: assets for the `/ss-report` HTML pipeline.
+///
+/// Separate from `[report]` because the two pipelines render **different templates from different
+/// payload schemas** — the SS report is section-shaped, one section per `ss_*` tool. Sharing one
+/// section would make it impossible to retune one report's brand without touching the other.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsReportManifest {
+    /// Path to the SS HTML report template (relative to the manifest's parent directory, or
+    /// absolute). Must contain the `__REPORT_DATA_JSON__` placeholder.
+    #[serde(default = "default_ss_report_template")]
+    template: PathBuf,
+    /// Optional `[ss_report.grants]`: the SS report pipeline's own tool ceiling. Absent defaults to
+    /// the six `ss_*` tools.
+    #[serde(default)]
+    grants: Option<SsReportGrants>,
+}
+
+/// `[ss_report.grants]`: the `/ss-report` pipeline's tool ceiling.
+///
+/// Separate from `[ss_chat.grants].fetcher` for the same reason `[report.grants]` is separate from
+/// `[insight.grants].fetcher`: a report may draw on the full tool set without widening what a chat
+/// turn can reach. It is a ceiling, not a guarantee — per-request narrowing intersects it with the
+/// caller's Falcon permissions, and a report covering only some business lines degrades (its
+/// unfetched sections are simply absent) rather than refusing.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SsReportGrants {
+    /// The SS report fetcher's granted data tools, by MCP wire name.
+    pub fetcher: Vec<String>,
+}
+
+impl SsReportGrants {
+    /// Boot-time validation that every granted name is actually advertised.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` naming the first tool the MCP server does not advertise.
+    pub fn validate(&self, advertised: &[String]) -> Result<()> {
+        reject_unadvertised(&self.fetcher, advertised, "[ss_report.grants].fetcher")
+    }
+}
+
+impl Default for SsReportGrants {
+    /// The six `ss_*` investor-platform tools — the whole SS surface.
+    ///
+    /// An explicit list rather than the `"*"` wildcard: the MCP server advertises the starcharger
+    /// tools alongside the SS ones, so a wildcard default would hand the SS report fetcher six
+    /// EV-charging tools its prompt and its template say nothing about.
+    fn default() -> Self {
+        Self {
+            fetcher: [
+                "ss_sunshine_hours",
+                "ss_energy_storage",
+                "ss_power_wheeling",
+                "ss_power_pipeline",
+                "ss_btm_projects",
+                "ss_ftm_projects",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        }
+    }
+}
+
+/// The default SS report template path, relative to the config root.
+fn default_ss_report_template() -> PathBuf {
+    PathBuf::from("report_template/ss_report.html")
+}
+
+/// Resolves `[ss_report].template` (or [`default_ss_report_template`] when the section is absent)
+/// against the config root and loads it.
+fn load_ss_report_template(root: &Path, manifest: Option<&SsReportManifest>) -> Result<String> {
+    let relative = manifest
+        .map(|m| m.template.clone())
+        .unwrap_or_else(default_ss_report_template);
+    let path = if relative.is_absolute() {
+        relative
+    } else {
+        root.join(relative)
+    };
+    std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "config_error: cannot read ss report template {}",
+            path.display()
+        )
+    })
+}
+
+/// Fail on the first granted name the MCP server does not advertise.
+///
+/// A typo here would otherwise become a permanent, invisible default-deny for that topic:
+/// the tool simply never resolves, and the user is told they lack permission.
+fn reject_unadvertised(tools: &[String], advertised: &[String], where_: &str) -> Result<()> {
+    for tool in tools {
+        if !advertised.iter().any(|name| name == tool) {
+            anyhow::bail!(
+                "config_error: {where_} names `{tool}`, which the MCP server does not \
+                 advertise; advertised tools are: {}",
+                advertised.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The default report template path, used when `[report]` (or its `template`) is omitted.
@@ -180,6 +551,50 @@ fn default_charter_grant() -> Vec<String> {
 fn default_insight_grants() -> InsightGrantsManifest {
     InsightGrantsManifest {
         fetcher: default_fetcher_grant(),
+        charter: default_charter_grant(),
+    }
+}
+
+/// Optional `[ss_chat]` section: per-sub-agent tool grants for the `/ss-chat` pipeline.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsChatManifest {
+    #[serde(default = "default_ss_chat_grants")]
+    grants: SsChatGrantsManifest,
+}
+
+/// `[ss_chat.grants]`: the tools each `/ss-chat` sub-agent exposes to its LLM, by wire name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SsChatGrantsManifest {
+    #[serde(default = "default_ss_fetcher_grant")]
+    fetcher: Vec<String>,
+    #[serde(default = "default_charter_grant")]
+    charter: Vec<String>,
+}
+
+/// The six `ss_*` investor-platform tools, the SS fetcher's default grant.
+///
+/// Unlike the `/insight` fetcher this is an **explicit list, never `["*"]`**: the same MCP server
+/// advertises the EV-charging tools too, and a wildcard would hand the SS fetcher tools its prompt
+/// never describes. A new `ss_*` tool is therefore a one-line config edit, by design.
+const SS_FETCHER_TOOLS: [&str; 6] = [
+    "ss_sunshine_hours",
+    "ss_energy_storage",
+    "ss_power_wheeling",
+    "ss_power_pipeline",
+    "ss_btm_projects",
+    "ss_ftm_projects",
+];
+
+/// The SS fetcher's default grant: the six `ss_*` tools ([`SS_FETCHER_TOOLS`]).
+fn default_ss_fetcher_grant() -> Vec<String> {
+    SS_FETCHER_TOOLS.iter().map(|t| (*t).to_string()).collect()
+}
+
+fn default_ss_chat_grants() -> SsChatGrantsManifest {
+    SsChatGrantsManifest {
+        fetcher: default_ss_fetcher_grant(),
         charter: default_charter_grant(),
     }
 }
@@ -306,9 +721,24 @@ pub struct AppConfig {
     pub runtime: Option<RuntimeRefs>,
     /// Resolved `/insight` pipeline tool grants (defaults when `[insight]` is absent).
     pub insight_grants: InsightGrants,
+    /// Resolved `/ss-chat` pipeline tool grants (defaults when `[ss_chat]` is absent).
+    pub ss_chat_grants: SsChatGrants,
     /// The `/report` HTML template body, read at load from `[report].template` (or its default
     /// path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
     pub report_template: String,
+    /// Resolved `[server.rate_limit]` policy (disabled default when absent).
+    pub rate_limit: RateLimitConfig,
+    /// Resolved `[identity]` policy. `None` when the section is absent.
+    pub identity: Option<IdentityConfig>,
+    /// Resolved `[authz]` mapping tables. `None` when the section is absent.
+    pub authz: Option<AuthzConfig>,
+    /// Resolved `[report.grants]` ceiling. `None` when absent (legacy shared-grant behavior).
+    pub report_grants: Option<ReportGrants>,
+    /// The `/ss-report` HTML template body, read at load from `[ss_report].template` (or its
+    /// default path). Holds the `__REPORT_DATA_JSON__` placeholder the `renderer` fills.
+    pub ss_report_template: String,
+    /// Resolved `[ss_report.grants]` ceiling — the six `ss_*` tools when the section is absent.
+    pub ss_report_grants: SsReportGrants,
 }
 
 /// Resolved `/insight` pipeline tool grants — which tools each sub-agent exposes to its LLM.
@@ -328,6 +758,29 @@ impl Default for InsightGrants {
     fn default() -> Self {
         Self {
             fetcher: default_fetcher_grant(),
+            charter: default_charter_grant(),
+        }
+    }
+}
+
+/// Resolved `/ss-chat` pipeline tool grants — which tools each 星星電力 sub-agent exposes to its
+/// LLM.
+///
+/// Resolved and boot-validated exactly like [`InsightGrants`]; only the defaults differ. The
+/// fetcher's default is the six `ss_*` investor-platform tools ([`SS_FETCHER_TOOLS`]) rather than
+/// the `["*"]` wildcard, because the same MCP server also advertises the EV-charging tools.
+#[derive(Debug, Clone)]
+pub struct SsChatGrants {
+    /// The SS fetcher's granted data tools (MCP wire names; normally the six `ss_*` tools).
+    pub fetcher: Vec<String>,
+    /// The SS charter's granted tools (normally the built-in `emit_chart` sink).
+    pub charter: Vec<String>,
+}
+
+impl Default for SsChatGrants {
+    fn default() -> Self {
+        Self {
+            fetcher: default_ss_fetcher_grant(),
             charter: default_charter_grant(),
         }
     }
@@ -456,7 +909,33 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        let ss_chat_grants = manifest
+            .ss_chat
+            .map(|ss_chat| SsChatGrants {
+                fetcher: ss_chat.grants.fetcher,
+                charter: ss_chat.grants.charter,
+            })
+            .unwrap_or_default();
+
         let report_template = load_report_template(&root, manifest.report.as_ref())?;
+
+        let report_grants = manifest.report.as_ref().and_then(|r| r.grants.clone());
+
+        let ss_report_template = load_ss_report_template(&root, manifest.ss_report.as_ref())?;
+        let ss_report_grants = manifest
+            .ss_report
+            .as_ref()
+            .and_then(|r| r.grants.clone())
+            .unwrap_or_default();
+
+        let rate_limit = manifest
+            .server
+            .and_then(|server| server.rate_limit)
+            .unwrap_or_default();
+
+        let identity = manifest.identity;
+
+        let authz = manifest.authz;
 
         // Log the loaded config
         info!(
@@ -470,7 +949,14 @@ impl AppConfig {
             prompts,
             runtime,
             insight_grants,
+            ss_chat_grants,
             report_template,
+            rate_limit,
+            identity,
+            authz,
+            report_grants,
+            ss_report_template,
+            ss_report_grants,
         })
     }
 
@@ -545,6 +1031,7 @@ mod tests {
                 "member_analysis",
                 "business_metrics",
                 "station_revenue_ranking",
+                "bill_member_analysis",
             ]
         );
         assert_eq!(cfg.insight_grants.charter, ["emit_chart"]);
@@ -559,11 +1046,544 @@ mod tests {
         assert!(!cfg.report_template.contains("__REPORT_TOKENS__"));
     }
 
+    /// T02 / spec S1: the `[identity]` section carries the Falcon permissions
+    /// endpoint policy. It deliberately has **no** `enabled` switch — D3 forbids a
+    /// feature flag, so the identity layer is unconditional in this binary (D-011).
+    #[test]
+    fn identity_section_parses_its_policy_and_rejects_an_enabled_switch() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+version = 1
+
+[identity]
+base_url = "https://falcon.example.com"
+positive_ttl_ms = 60000
+negative_ttl_ms = 10000
+request_timeout_ms = 5000
+"#,
+        )
+        .expect("identity section should parse");
+
+        let identity = manifest
+            .identity
+            .expect("inline manifest declares the section");
+        assert_eq!(
+            identity.base_url.as_deref(),
+            Some("https://falcon.example.com")
+        );
+        assert_eq!(identity.positive_ttl_ms.get(), 60_000);
+        assert_eq!(identity.negative_ttl_ms.get(), 10_000);
+        assert_eq!(identity.request_timeout_ms.get(), 5_000);
+
+        // D-011: an `enabled` key is not part of the schema, so `deny_unknown_fields`
+        // rejects it rather than silently letting a deploy ship RBAC turned off.
+        let with_switch = toml::from_str::<Manifest>(
+            r#"
+version = 1
+
+[identity]
+enabled = false
+base_url = "https://falcon.example.com"
+positive_ttl_ms = 60000
+negative_ttl_ms = 10000
+request_timeout_ms = 5000
+"#,
+        );
+        assert!(
+            with_switch.is_err(),
+            "`[identity].enabled` must be rejected: D3 forbids a feature flag"
+        );
+    }
+
+    #[test]
+    fn identity_allowed_base_urls_is_optional_and_parses_as_a_list() {
+        let without: Manifest = toml::from_str(
+            r#"
+version = 1
+
+[identity]
+positive_ttl_ms = 60000
+negative_ttl_ms = 10000
+request_timeout_ms = 5000
+"#,
+        )
+        .expect("identity section should parse without an allowlist");
+        assert!(without
+            .identity
+            .expect("section")
+            .allowed_base_urls
+            .is_empty());
+
+        let with: Manifest = toml::from_str(
+            r#"
+version = 1
+
+[identity]
+allowed_base_urls = ["https://dev.example", "https://prod.example/"]
+positive_ttl_ms = 60000
+negative_ttl_ms = 10000
+request_timeout_ms = 5000
+"#,
+        )
+        .expect("identity section should parse with an allowlist");
+        assert_eq!(
+            with.identity.expect("section").allowed_base_urls,
+            ["https://dev.example", "https://prod.example/"]
+        );
+    }
+
+    /// T02 / spec S1: the shipped `config/config.toml` must declare `[identity]`, and its
+    /// values are the ones the spec pins (60s positive TTL, 10s negative TTL, 5s timeout).
+    #[test]
+    fn shipped_config_declares_the_identity_policy() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let identity = cfg
+            .identity
+            .expect("config/config.toml must declare an [identity] section");
+
+        // No checked-in default (finding #1): base_url comes from FALCON_API_BASE_URL at boot.
+        assert_eq!(identity.base_url, None);
+        // The per-request allowlist IS checked in: it is the auditable list of Falcon
+        // environments a consumer may name in `X-Falcon-Api-Base-Url`.
+        assert_eq!(
+            identity.allowed_base_urls,
+            [
+                "https://dev.hdre-eomc.com",
+                "https://stage.hdre-eomc.com",
+                "https://hdre-eomc.com",
+            ]
+        );
+        assert_eq!(identity.positive_ttl_ms.get(), 60_000);
+        assert_eq!(identity.negative_ttl_ms.get(), 10_000);
+        assert_eq!(identity.request_timeout_ms.get(), 5_000);
+    }
+
+    /// T02 / spec S1: the shipped config must enable the outer limiter and declare an
+    /// explicit inner per-actor policy. ERR-009 makes the outer limiter a *required*
+    /// deployment prerequisite once the identity layer exists, and the inner layer has no
+    /// opt-out (an opt-out would be a bypass of D3).
+    #[test]
+    fn shipped_config_enables_both_rate_limit_layers_explicitly() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+
+        assert!(
+            cfg.rate_limit.enabled,
+            "the outer global limiter is a prerequisite of the identity layer (ERR-009)"
+        );
+
+        let per_actor = cfg
+            .rate_limit
+            .per_actor
+            .expect("[server.rate_limit.per_actor] must be declared explicitly");
+        assert!(per_actor.burst_size.get() >= 1);
+        assert!(per_actor.refill_period_ms.get() >= 1);
+        assert!(
+            per_actor.max_tracked_actors.get() >= 1,
+            "per-actor buckets need a cardinality bound with LRU eviction"
+        );
+    }
+
+    /// T02 / spec S1 + FR-003: the two authorization mapping tables. `permission_tools`
+    /// maps a Falcon permission code to the MCP data tools it unlocks; `intent_tools` maps
+    /// a runtime intent to the tools it *requires*. The gate is the three-way intersection
+    /// of boot grant, permission grant, and intent requirement — checking merely that the
+    /// narrowed set is non-empty would let a finance-only user's member question through.
+    /// Falcon's `/api/auth/me/permissions` returns `code` in colon form
+    /// (`hdrenewables:elecsvc:starcharger:opperf`), and `authorize_pipeline` matches codes
+    /// by exact string. A slash-form key here silently denies every user (`authz.insufficient`),
+    /// which is exactly what shipped on 2026-09-07. Pin the format so it cannot drift back.
+    #[test]
+    fn shipped_config_permission_codes_use_falcon_colon_form() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg
+            .authz
+            .expect("config/config.toml must declare an [authz] section");
+        let codes = authz
+            .permission_tools
+            .keys()
+            .cloned()
+            .chain(authz.ss_chat_permissions.iter().cloned())
+            .collect::<Vec<_>>();
+        assert!(!codes.is_empty());
+        for code in codes {
+            assert!(
+                code.starts_with("hdrenewables:") && !code.contains('/'),
+                "permission code must be Falcon colon form, got {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_config_declares_both_authorization_mapping_tables() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg
+            .authz
+            .expect("config/config.toml must declare an [authz] section");
+
+        // Permission side: the four starcharger sub-pages. engproj maps to nothing —
+        // no MCP endpoint serves engineering-project data yet (PRD FU-003).
+        let finance = authz
+            .permission_tools
+            .get("hdrenewables:elecsvc:starcharger:finance")
+            .expect("finance permission must be mapped");
+        assert!(finance.contains(&"bill_revenue".to_string()));
+        assert_eq!(
+            authz
+                .permission_tools
+                .get("hdrenewables:elecsvc:starcharger:engproj")
+                .map(Vec::len),
+            Some(0),
+            "engproj has no corresponding MCP endpoint yet (FU-003)"
+        );
+
+        // Intent side: every intent in the runtime allowlist needs a row, including
+        // `unknown`, so an unmapped intent is a startup failure rather than a runtime
+        // default-deny discovered in production.
+        for intent in [
+            "unknown",
+            "revenue",
+            "charging",
+            "member",
+            "site-build",
+            "report",
+        ] {
+            assert!(
+                authz.intent_tools.contains_key(intent),
+                "intent `{intent}` must have a required-tools row"
+            );
+        }
+        assert_eq!(authz.intent_tools["unknown"].len(), 0);
+        assert_eq!(
+            authz.intent_tools["site-build"],
+            vec!["business_metrics".to_string()]
+        );
+        assert_eq!(
+            authz.intent_tools["report"].len(),
+            6,
+            "a full report spans every data tool"
+        );
+    }
+
+    /// T02 / spec S1 + D-010: the report pipeline gets its own grant ceiling instead of
+    /// sharing `[insight.grants].fetcher`. The shared one lists five tools and its comment
+    /// deliberately excludes `bill_member_analysis`, while the report prompt asks the model
+    /// to call six — so the sixth was never advertised to it. That pre-existing mismatch is
+    /// what this row fixes.
+    #[test]
+    fn shipped_config_gives_report_its_own_six_tool_grant() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+
+        let report_grant = cfg
+            .report_grants
+            .expect("config/config.toml must declare [report.grants]");
+        assert_eq!(report_grant.fetcher.len(), 6);
+        assert!(
+            report_grant
+                .fetcher
+                .contains(&"bill_member_analysis".to_string()),
+            "the report grant must cover every topic the report prompt asks for"
+        );
+
+        // Both ceilings now list the same six tools. They stay separate declarations because
+        // the report gate is the partial-grant exception and the insight gate is strict, so a
+        // future narrowing of one must not silently narrow the other.
+        assert_eq!(cfg.insight_grants.fetcher.len(), 6);
+        assert!(cfg
+            .insight_grants
+            .fetcher
+            .contains(&"bill_member_analysis".to_string()));
+    }
+
+    /// The shipped ceiling must satisfy every strict intent; if it stops doing so, boot fails
+    /// rather than turning into a per-user "權限不足" that looks like a permission bug.
+    #[test]
+    fn shipped_insight_ceiling_covers_every_strict_intent() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg.authz.expect("shipped config declares authz");
+
+        authz
+            .validate_intent_reachability(&cfg.insight_grants.fetcher, &advertised_fixture())
+            .expect("shipped insight ceiling must cover every strict intent");
+    }
+
+    #[test]
+    fn intent_requiring_a_tool_outside_the_insight_ceiling_fails_boot() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg.authz.expect("shipped config declares authz");
+        // The ceiling as it shipped before this fix: `member` needs a sixth tool it lacks.
+        let narrowed: Vec<String> = cfg
+            .insight_grants
+            .fetcher
+            .iter()
+            .filter(|tool| *tool != "bill_member_analysis")
+            .cloned()
+            .collect();
+
+        let err = authz
+            .validate_intent_reachability(&narrowed, &advertised_fixture())
+            .expect_err("an unreachable strict intent must fail boot");
+        let message = format!("{err}");
+
+        assert!(
+            message.contains("member"),
+            "message names the intent: {message}"
+        );
+        assert!(
+            message.contains("bill_member_analysis"),
+            "message names the tool: {message}"
+        );
+    }
+
+    /// `report` is the partial-grant exception: an uncovered tool degrades the report rather
+    /// than denying it, so the reachability check must not fail boot over it.
+    #[test]
+    fn report_intent_is_exempt_from_the_reachability_check() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        let authz = cfg.authz.expect("shipped config declares authz");
+        let revenue_only = vec!["bill_revenue".to_string()];
+
+        let err = authz
+            .validate_intent_reachability(&revenue_only, &advertised_fixture())
+            .expect_err("a strict intent is still unreachable under this ceiling");
+        assert!(
+            !format!("{err}").contains("intent `report`"),
+            "report must not be the intent that fails boot: {err}"
+        );
+    }
+
+    fn advertised_fixture() -> Vec<String> {
+        [
+            "bill_revenue",
+            "station_revenue_ranking",
+            "bill_charge",
+            "business_metrics",
+            "member_analysis",
+            "bill_member_analysis",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn authz_fixture() -> AuthzConfig {
+        AppConfig::load("config/config.toml")
+            .expect("config should load")
+            .authz
+            .expect("shipped config declares [authz]")
+    }
+
+    /// T02 / spec S1 + FR-003: both mapping tables are validated at boot, not at request
+    /// time. A gap discovered on a live request would surface as a silent default-deny —
+    /// a user simply told "no" — which is far harder to diagnose than a refused startup.
+    #[test]
+    fn authz_validation_rejects_an_uncovered_intent_at_boot() {
+        let authz = authz_fixture();
+        let advertised: Vec<String> = ADVERTISED.iter().map(|t| t.to_string()).collect();
+
+        // The runtime's real allowlist is covered.
+        let allowlist: Vec<String> = [
+            "unknown",
+            "revenue",
+            "charging",
+            "member",
+            "site-build",
+            "report",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        authz
+            .validate(&allowlist, &advertised)
+            .expect("the shipped tables must cover the shipped allowlist");
+
+        // A new intent with no row fails startup, naming the intent.
+        let mut extended = allowlist.clone();
+        extended.push("forecast".to_string());
+        let err = authz
+            .validate(&extended, &advertised)
+            .expect_err("an uncovered intent must fail startup");
+        assert!(
+            err.to_string().contains("forecast"),
+            "the error must name the uncovered intent, got: {err}"
+        );
+    }
+
+    /// A mapped tool the MCP server never advertises is a typo that would otherwise become
+    /// a permanent, invisible default-deny for that topic.
+    #[test]
+    fn authz_validation_rejects_a_tool_the_server_never_advertises() {
+        let mut authz = authz_fixture();
+        authz
+            .intent_tools
+            .insert("revenue".to_string(), vec!["bil_revenue".to_string()]);
+
+        let advertised: Vec<String> = ADVERTISED.iter().map(|t| t.to_string()).collect();
+        let allowlist: Vec<String> = [
+            "unknown",
+            "revenue",
+            "charging",
+            "member",
+            "site-build",
+            "report",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let err = authz
+            .validate(&allowlist, &advertised)
+            .expect_err("an unadvertised tool must fail startup");
+        assert!(
+            err.to_string().contains("bil_revenue"),
+            "the error must name the offending tool, got: {err}"
+        );
+    }
+
+    /// The report ceiling gets the same treatment.
+    #[test]
+    fn report_grant_validation_rejects_an_unadvertised_tool() {
+        let advertised: Vec<String> = ADVERTISED.iter().map(|t| t.to_string()).collect();
+
+        let good = AppConfig::load("config/config.toml")
+            .expect("config should load")
+            .report_grants
+            .expect("shipped config declares [report.grants]");
+        good.validate(&advertised)
+            .expect("the shipped report grant must only name advertised tools");
+
+        let bad = ReportGrants {
+            fetcher: vec!["nope".to_string()],
+        };
+        let err = bad
+            .validate(&advertised)
+            .expect_err("an unadvertised tool must fail startup");
+        assert!(err.to_string().contains("nope"), "got: {err}");
+    }
+
+    /// The six datacenter tools `config/mcp-config.toml` maps.
+    const ADVERTISED: [&str; 6] = [
+        "bill_revenue",
+        "station_revenue_ranking",
+        "bill_charge",
+        "business_metrics",
+        "member_analysis",
+        "bill_member_analysis",
+    ];
+
     #[test]
     fn insight_grants_default_to_wildcard_when_section_absent() {
         // The in-code default (no `[insight]` section) still grants the fetcher every discovered
         // MCP tool, so a minimal config keeps working.
         assert_eq!(InsightGrants::default().fetcher, ["*"]);
         assert_eq!(InsightGrants::default().charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn config_loads_ss_chat_grants() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        assert_eq!(cfg.ss_chat_grants.fetcher, SS_FETCHER_TOOLS);
+        assert_eq!(cfg.ss_chat_grants.charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn ss_chat_fetcher_grant_never_uses_the_wildcard() {
+        // The invariant that keeps the two chat pipelines apart: one MCP server advertises BOTH
+        // the EV-charging tools and the `ss_*` ones, so a `"*"` here would hand the SS fetcher
+        // datacenter tools its prompt never describes — and the SS analyst would then be asked to
+        // reason over EV-charging rows under 星星電力 branding. Checked on the shipped config and
+        // on the in-code default, since either could reintroduce it.
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        for (source, grant) in [
+            ("config/config.toml", &cfg.ss_chat_grants.fetcher),
+            ("SsChatGrants::default()", &SsChatGrants::default().fetcher),
+        ] {
+            assert!(
+                !grant.iter().any(|name| name == "*"),
+                "{source} grants the SS fetcher the `*` wildcard, which would expose the \
+                 EV-charging tools to the 星星電力 pipeline"
+            );
+            assert!(
+                grant.iter().all(|name| name.starts_with("ss_")),
+                "{source} grants the SS fetcher a non-`ss_` tool: {grant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_report_fetcher_grant_never_uses_the_wildcard() {
+        // Same invariant as the SS chat grant above, and it matters more here: the SS report
+        // template has one section per `ss_*` tool, so an EV-charging tool leaking into this grant
+        // would be fetched, paid for, and then have nowhere to render — while the section it was
+        // mistaken for stays empty.
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        for (source, grant) in [
+            ("config/config.toml", &cfg.ss_report_grants.fetcher),
+            (
+                "SsReportGrants::default()",
+                &SsReportGrants::default().fetcher,
+            ),
+        ] {
+            assert!(
+                !grant.iter().any(|name| name == "*"),
+                "{source} grants the SS report fetcher the `*` wildcard, which would expose the \
+                 EV-charging tools to the 星星電力 report pipeline"
+            );
+            assert!(
+                grant.iter().all(|name| name.starts_with("ss_")),
+                "{source} grants the SS report fetcher a non-`ss_` tool: {grant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ss_report_grants_default_to_the_six_ss_tools_when_section_absent() {
+        // The report ceiling and the chat ceiling happen to list the same six tools today, but they
+        // are separate settings on purpose — a report may widen without widening chat.
+        let mut report = SsReportGrants::default().fetcher;
+        let mut chat = SS_FETCHER_TOOLS.to_vec();
+        report.sort();
+        chat.sort();
+        assert_eq!(report, chat);
+    }
+
+    #[test]
+    fn config_loads_the_ss_report_template_with_the_data_placeholder() {
+        // The renderer replaces exactly this token; a template without it would render an empty
+        // report on every request, which is why `AppState::new` refuses to boot without it.
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        assert!(
+            cfg.ss_report_template
+                .contains(crate::agent::pipeline::REPORT_DATA_PLACEHOLDER),
+            "the shipped SS report template must carry the data placeholder"
+        );
+        // …and it must be a different document from the starcharger one: the two payload schemas
+        // are incompatible, so sharing a template would render one report from the other's data.
+        assert_ne!(
+            cfg.ss_report_template, cfg.report_template,
+            "the SS report must not be pointed at the starcharger template"
+        );
+    }
+
+    #[test]
+    fn ss_chat_grants_default_to_the_six_ss_tools_when_section_absent() {
+        assert_eq!(SsChatGrants::default().fetcher, SS_FETCHER_TOOLS);
+        assert_eq!(SsChatGrants::default().charter, ["emit_chart"]);
+    }
+
+    #[test]
+    fn config_loads_the_ss_stage_prompts() {
+        let cfg = AppConfig::load("config/config.toml").expect("config should load");
+        // Every id `PromptBank::from_app_config` requires for the /ss-chat pipeline must resolve,
+        // or boot fails — pin them here so a renamed file is caught without booting.
+        for id in [
+            "ss_fetcher_system",
+            "ss_analyst_system",
+            "ss_charter_system",
+        ] {
+            let body = cfg
+                .get_prompt_by_id(id)
+                .unwrap_or_else(|e| panic!("prompt `{id}` should load: {e}"));
+            assert!(!body.trim().is_empty(), "prompt `{id}` is empty");
+        }
     }
 }

@@ -1,0 +1,3 @@
+[submodule ".agent/skills/_shared"]
+	path = .agent/skills/_shared
+	url = https://github.com/Chuliying/skill-commons.git

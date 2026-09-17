@@ -46,8 +46,15 @@ fn stream_frame_serialization_stays_compatible() {
         (
             StreamFrame::Error {
                 data: "boom".to_string(),
+                code: "upstream.error".to_string(),
             },
-            serde_json::json!({"event": "error", "data": "boom"}),
+            serde_json::json!({"event": "error", "data": "boom", "code": "upstream.error"}),
+        ),
+        (
+            StreamFrame::Refusal {
+                code: "authz.insufficient".to_string(),
+            },
+            serde_json::json!({"event": "refusal", "code": "authz.insufficient"}),
         ),
         (StreamFrame::Clear, serde_json::json!({"event": "clear"})),
     ];
